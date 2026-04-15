@@ -74,18 +74,6 @@ static inline int64_t compute_frame_delay(const int64_t left_pts, const int64_t 
   return std::max(left_pts, right_pts);
 }
 
-static inline int64_t time_ms_to_av_time(const double time_ms) {
-  return time_ms * MILLISEC_TO_AV_TIME;
-}
-
-static inline int64_t calculate_dynamic_time_shift(const AVRational& multiplier, const int64_t original_pts, const bool inverse) {
-  // Calculate the time shift as the difference between original and scaled PTS
-  const int64_t time_shift =
-      inverse ? (original_pts - av_rescale_q(original_pts, AVRational{multiplier.den, multiplier.num}, AVRational{1, 1})) : (av_rescale_q(original_pts, AVRational{multiplier.num, multiplier.den}, AVRational{1, 1}) - original_pts);
-
-  return time_shift;
-}
-
 static inline std::pair<size_t, size_t> calculate_max_dest_dimensions(const std::map<Side, std::unique_ptr<VideoFilterer>>& video_filterers) {
   size_t max_w = 0;
   size_t max_h = 0;
@@ -108,7 +96,7 @@ static inline double calculate_shortest_duration_seconds(const std::map<Side, st
   return shortest;
 }
 
-static const int64_t NEAR_ZERO_TIME_SHIFT_THRESHOLD = time_ms_to_av_time(0.5);
+static const int64_t NEAR_ZERO_TIME_SHIFT_THRESHOLD = static_cast<int64_t>(0.5 * MILLISEC_TO_AV_TIME);
 
 static bool compare_av_dictionaries(AVDictionary* dict1, AVDictionary* dict2) {
   if (av_dict_count(dict1) != av_dict_count(dict2)) {
@@ -161,15 +149,12 @@ static void sleep_for_ms(const uint32_t ms) {
 VideoCompare::~VideoCompare() = default;
 
 VideoCompare::VideoCompare(const VideoCompareConfig& config)
-    : config_(config),
-      same_decoded_video_both_sides_(produces_same_decoded_video(config)),
-      auto_loop_mode_(config.auto_loop_mode),
-      frame_buffer_size_(config.frame_buffer_size),
-      time_shift_(config.time_shift),
-      time_shift_offset_av_time_(time_ms_to_av_time(static_cast<double>(config.time_shift.offset_ms))) {
+    : config_(config), same_decoded_video_both_sides_(produces_same_decoded_video(config)), auto_loop_mode_(config.auto_loop_mode), frame_buffer_size_(config.frame_buffer_size), time_shifter_(config.time_shift) {
   auto install_processor = [&](auto& processor_map, const ReadyToSeek::ProcessorThread thread, const Side& side, auto processor) {
     processor_map[side] = std::move(processor);
     ready_to_seek_.init(thread, side);
+    // Default-construct the per-side seeking flag to false (idempotent)
+    seeking_per_side_[side];
   };
 
   // Initialize all right videos
@@ -333,7 +318,10 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
 
   left_video_metadata_ = collect_metadata(LEFT);
 
-  update_decoder_mode(time_shift_offset_av_time_);
+  // Sticky single-decoder mode: enabled iff same-file, multiplier 1:1, and -t offset
+  // is below the near-zero threshold. Once disabled (by the first frame shift / scrub
+  // / crop / filter change in the session), it never re-enables.
+  single_decoder_mode_.init(same_decoded_video_both_sides_ && (av_q2d(time_shifter_.multiplier()) == 1.0) && (std::abs(time_shifter_.offset_av_time()) < NEAR_ZERO_TIME_SHIFT_THRESHOLD));
 
   const Side active_right = Side::Right(active_right_index_);
   const auto right_it = right_video_info_.find(active_right);
@@ -397,14 +385,14 @@ void VideoCompare::demultiplex(const Side& side) {
   try {
     while (keep_running()) {
       // Wait for decoder to drain
-      if (seeking_ && ready_to_seek_.get(ReadyToSeek::ProcessorThread::Decoder, side)) {
+      if (is_seeking(side) && ready_to_seek_.get(ReadyToSeek::ProcessorThread::Decoder, side)) {
         ready_to_seek_.set(ReadyToSeek::ProcessorThread::Demultiplexer, side);
 
         sleep_for_ms(SLEEP_PERIOD_MS);
         continue;
       }
       // Sleep if we are finished for now
-      if (packet_queues_[side]->is_stopped() || (side.is_right() && single_decoder_mode_)) {
+      if (packet_queues_[side]->is_stopped() || (side.is_right() && single_decoder_mode_.enabled())) {
         sleep_for_ms(SLEEP_PERIOD_MS);
         continue;
       }
@@ -438,8 +426,8 @@ void VideoCompare::decode_video(const Side& side) {
   try {
     while (keep_running()) {
       // Sleep if we are finished for now
-      if (decoded_frame_queues_[side]->is_stopped() || (side.is_right() && single_decoder_mode_)) {
-        if (seeking_) {
+      if (decoded_frame_queues_[side]->is_stopped() || (side.is_right() && single_decoder_mode_.enabled())) {
+        if (is_seeking(side)) {
           // Flush the decoder
           video_decoders_[side]->flush();
 
@@ -462,7 +450,7 @@ void VideoCompare::decode_video(const Side& side) {
 
         // Enter wait state
         decoded_frame_queues_[side]->stop();
-        if (single_decoder_mode_) {
+        if (single_decoder_mode_.enabled()) {
           for (auto& pair : decoded_frame_queues_) {
             if (pair.first.is_right()) {
               pair.second->stop();
@@ -473,7 +461,7 @@ void VideoCompare::decode_video(const Side& side) {
       }
 
       // If the packet didn't send, receive more frames and try again
-      while (!seeking_ && !process_packet(side, packet.get())) {
+      while (!is_seeking(side) && !process_packet(side, packet.get())) {
         ;
       }
     }
@@ -518,7 +506,7 @@ bool VideoCompare::process_packet(const Side& side, AVPacket* packet) {
     note_decoded_frame(side, frame_for_filtering->pts);
 
     // Send the decoded frame to all right filterers when a single decoder drives all sides.
-    if (single_decoder_mode_ && side.is_left()) {
+    if (single_decoder_mode_.enabled() && side.is_left()) {
       for (auto& pair : decoded_frame_queues_) {
         if (pair.first.is_right()) {
           pair.second->push(frame_for_filtering);
@@ -559,7 +547,7 @@ void VideoCompare::filter_video(const Side& side) {
   try {
     while (keep_running()) {
       if (filtered_frame_queues_[side]->is_stopped()) {
-        if (seeking_) {
+        if (is_seeking(side)) {
           ready_to_seek_.set(ReadyToSeek::ProcessorThread::Filterer, side);
         }
 
@@ -571,7 +559,7 @@ void VideoCompare::filter_video(const Side& side) {
 
       if (decoded_frame_queues_[side]->pop(frame_to_filter)) {
         filter_decoded_frame(side, frame_to_filter);
-      } else if (decoded_frame_queues_[side]->is_stopped() || seeking_) {
+      } else if (decoded_frame_queues_[side]->is_stopped() || is_seeking(side)) {
         // Close the filter source
         video_filterers_[side]->close_src();
 
@@ -594,7 +582,7 @@ void VideoCompare::format_convert_video(const Side& side) {
   try {
     while (keep_running()) {
       if (converted_frame_queues_[side]->is_stopped()) {
-        if (seeking_) {
+        if (is_seeking(side)) {
           ready_to_seek_.set(ReadyToSeek::ProcessorThread::Converter, side);
         }
 
@@ -617,7 +605,7 @@ void VideoCompare::format_convert_video(const Side& side) {
         (*format_converters_[side])(frame_filtered.get(), frame_converted.get());
 
         converted_frame_queues_[side]->push(std::move(frame_converted));
-      } else if (filtered_frame_queues_[side]->is_stopped() || seeking_) {
+      } else if (filtered_frame_queues_[side]->is_stopped() || is_seeking(side)) {
         // Stop filtering
         converted_frame_queues_[side]->stop();
       }
@@ -641,10 +629,6 @@ void VideoCompare::quit_all_queues() {
     decoded_frame_queues_[side]->quit();
     packet_queues_[side]->quit();
   }
-}
-
-void VideoCompare::update_decoder_mode(const int right_time_shift) {
-  single_decoder_mode_ = same_decoded_video_both_sides_ && (av_q2d(time_shift_.multiplier) == 1.0) && (abs(right_time_shift) < NEAR_ZERO_TIME_SHIFT_THRESHOLD);
 }
 
 void VideoCompare::note_decoded_frame(const Side& side, const int64_t pts) {
@@ -778,23 +762,13 @@ bool VideoCompare::handle_pending_crop_request(const Side& active_right) {
   return true;
 }
 
-std::vector<Side> VideoCompare::consume_filter_changes() {
-  std::vector<Side> changed_sides;
-  for (const auto& pair : video_filterers_) {
-    if (pair.second->consume_filter_change()) {
-      changed_sides.push_back(pair.first);
-    }
-  }
-  return changed_sides;
-}
-
 void VideoCompare::dump_debug_info(const int frame_number, const int64_t effective_right_time_shift, const int average_refresh_time) {
   std::cout << "FRAME: " << frame_number << std::endl;
   std::cout << "keep_running()=" << keep_running() << std::endl;
   std::cout << "has_exception()=" << exception_holder_.has_exception() << std::endl;
-  std::cout << "seeking=" << seeking_ << std::endl;
+  std::cout << "seeking=" << any_seeking() << std::endl;
   std::cout << "effective_right_time_shift=" << effective_right_time_shift << std::endl;
-  std::cout << "single_decoder_mode=" << single_decoder_mode_ << std::endl;
+  std::cout << "single_decoder_mode=" << single_decoder_mode_.enabled() << std::endl;
   std::cout << "average_refresh_time=" << average_refresh_time << std::endl;
   std::cout << "active_right_index=" << active_right_index_ << std::endl;
 
@@ -821,7 +795,7 @@ void VideoCompare::dump_debug_info(const int frame_number, const int64_t effecti
 }
 
 struct SideState {
-  SideState(const Side& side, const Demuxer* demuxer) : side_(side), start_time_(demuxer->start_time() * AV_TIME_TO_SEC), frame_duration_deque_(8) {
+  SideState(const Side& side, const Demuxer* demuxer, size_t ring_capacity) : side_(side), start_time_(demuxer->start_time() * AV_TIME_TO_SEC), ring(ring_capacity, ring_capacity), frame_duration_deque_(8) {
     if (start_time_ > 0) {
       sa_log_info(side, string_sprintf("Video has a start time of %s - timestamps will be shifted so they start at zero!", format_position(start_time_, true).c_str()));
     }
@@ -831,8 +805,9 @@ struct SideState {
 
   const float start_time_;
 
-  std::deque<AVFrameUniquePtr> frames_;
-  AVFrameUniquePtr frame_{nullptr, avframe_deleter};
+  // Symmetric history / current / prefetch display buffer. Populated from the pipeline
+  // via intake_prefetch() every main-loop iteration.
+  FrameRing ring;
 
   int64_t first_pts_ = INT64_MIN;
   int64_t pts_ = 0;
@@ -853,13 +828,14 @@ void VideoCompare::compare() {
     std::string previous_state;
 #endif
 
-    // Create SideState for all videos
+    // Create SideState for all videos. Each side's FrameRing uses frame_buffer_size_
+    // for both history and prefetch capacities, so `+N` and `-N` have symmetric depth.
     std::map<Side, SideState> side_states;
     for (const auto& pair : demuxers_) {
       const Side& side = pair.first;
       const auto& demuxer = pair.second;
 
-      side_states.emplace(std::piecewise_construct, std::forward_as_tuple(side), std::forward_as_tuple(side, demuxer.get()));
+      side_states.emplace(std::piecewise_construct, std::forward_as_tuple(side), std::forward_as_tuple(side, demuxer.get(), frame_buffer_size_));
     }
 
     SideState& left = side_states.at(LEFT);
@@ -869,7 +845,6 @@ void VideoCompare::compare() {
 
     int frame_offset = 0;
 
-    int64_t static_right_time_shift = time_shift_offset_av_time_;
     int total_right_time_shifted = 0;
 
     int forward_navigate_frames = 0;
@@ -1002,6 +977,28 @@ void VideoCompare::compare() {
 
       bool skip_update = false;
 
+      // Drain the pipeline's converted frame output into each ring's prefetch tail.
+      // Non-blocking: whatever the converter has produced so far lands in the ring,
+      // and the rest is collected next iteration. Running this BEFORE the seek-block
+      // dispatch lets a forward `+N` pivot see prefetched frames that arrived since
+      // the previous iteration, so the pivot ceiling matches prefetch_capacity rather
+      // than the raw converter queue depth.
+      auto intake_prefetch = [&]() {
+        for (auto& pair : side_states) {
+          SideState& ss = pair.second;
+          while (!ss.ring.prefetch_full()) {
+            AVFrameUniquePtr frame{nullptr, avframe_deleter};
+            if (!converted_frame_queues_[ss.side_]->try_pop(frame) || frame == nullptr) {
+              break;
+            }
+            if (!ss.ring.push_prefetch(std::move(frame))) {
+              break;
+            }
+          }
+        }
+      };
+      intake_prefetch();
+
       // handle pending crop request
       const bool force_seek_current_position = handle_pending_crop_request(active_right);
 
@@ -1009,233 +1006,385 @@ void VideoCompare::compare() {
 
       // if seeking is required, drain packet and frame queues
       if ((seek_relative != 0.0F) || (shift_right_frames != 0) || force_seek_current_position) {
-        // update total right time shifted
+        // Any activity entering the seek block permanently disables sticky single-
+        // decoder mode: once the right side has diverged from the left (in PTS, crop,
+        // or filter), it can't silently re-converge without the user explicitly resetting
+        // state. Removing the dynamic re-enable path removes the single-decoder boundary
+        // transitions that used to deadlock the pivot fast paths.
+        single_decoder_mode_.disable_sticky();
+
+        // update total right time shifted and recompute the static shift in TimeShifter
         if (shift_right_frames != 0) {
           total_right_time_shifted += shift_right_frames;
         }
+        time_shifter_.set_frame_shift_accumulator(total_right_time_shifted, right_delta);
 
-        // compute effective time shift
-        static_right_time_shift = time_shift_offset_av_time_ + total_right_time_shifted * right_delta;
+        // A "pure right frame shift" is a `+`/`-` keypress with no scrub and no crop
+        // pending. In that case the left side's position does not change, so we skip
+        // flushing/seeking its pipeline entirely. Only right sides participate. Note
+        // that the sticky disable above guarantees single-decoder mode is off here, so
+        // there is no boundary-crossing risk.
+        const bool pure_right_frame_shift = (seek_relative == 0.0F) && (shift_right_frames != 0) && !force_seek_current_position;
 
-        ready_to_seek_.reset_all();
-        seeking_ = true;
+        // Fast path: pivot the FrameRing cursor instead of seeking.
+        //
+        // Each right side's `FrameRing` holds up to `frame_buffer_size_` frames of
+        // history and the same of prefetch around a single `current` slot. The prefetch
+        // is replenished each iteration from `converted_frame_queues_`, so `+N` pivots
+        // extend to the full prefetch capacity — not just the raw converter queue
+        // depth. Backward pivots preserve the stepped-over frames in prefetch, so a
+        // subsequent forward pivot replays them without re-decoding.
+        //
+        // `pure_right_frame_shift` already excludes cases where a pivot would leave the
+        // pipeline in an inconsistent state (sticky single-decoder mode off, no crop
+        // change, no scrub). Either direction: no pipeline drain, no `ReadyToSeek`
+        // barrier, no filter reinit, no demuxer seek, no re-decode.
+        bool backward_pivot_possible = pure_right_frame_shift && shift_right_frames < 0;
+        bool forward_pivot_possible = pure_right_frame_shift && shift_right_frames > 0;
 
-        // drain packet and frame queues
-        for (auto& pair : packet_queues_) {
-          pair.second->stop();
-          pair.second->empty();
-        }
-
-        auto empty_frame_queues = [&]() {
-          for (auto& pair : decoded_frame_queues_) {
-            pair.second->empty();
+        if (backward_pivot_possible) {
+          const size_t n = static_cast<size_t>(-shift_right_frames);
+          for (const auto& pair : side_states) {
+            if (!pair.first.is_right()) {
+              continue;
+            }
+            const SideState& right_state = pair.second;
+            if (static_cast<size_t>(n) > static_cast<size_t>(right_state.ring.history_size()) || right_state.delta_pts_ <= 0) {
+              backward_pivot_possible = false;
+              break;
+            }
           }
-          for (auto& pair : filtered_frame_queues_) {
-            pair.second->empty();
+        }
+
+        if (forward_pivot_possible) {
+          const size_t n = static_cast<size_t>(shift_right_frames);
+          for (const auto& pair : side_states) {
+            if (!pair.first.is_right()) {
+              continue;
+            }
+            const SideState& right_state = pair.second;
+            if (right_state.delta_pts_ <= 0) {
+              forward_pivot_possible = false;
+              break;
+            }
+            // Pre-check: every right side's prefetch must already hold N frames. The
+            // prefetch is topped up from `converted_frame_queues_` at the top of every
+            // iteration, so forward `+N` pivots scale up to `prefetch_capacity`, not
+            // just the raw converter queue depth.
+            if (static_cast<size_t>(right_state.ring.prefetch_size()) < n) {
+              forward_pivot_possible = false;
+              break;
+            }
           }
-          for (auto& pair : converted_frame_queues_) {
-            pair.second->empty();
-          }
-        };
-
-        while (!ready_to_seek_.all_are_idle()) {
-          empty_frame_queues();
-          sleep_for_ms(SLEEP_PERIOD_MS);
-#ifdef _DEBUG
-          dump_debug_info(frame_number, right_ptr->effective_time_shift_, refresh_time_deque.average());
-#endif
         }
 
-        // empty the frame queues one last time
-        empty_frame_queues();
-
-        // update decoder mode
-        update_decoder_mode(static_right_time_shift);
-
-        // consume filter changes
-        consume_filter_changes();
-
-        // reinit filter graphs
-        for (auto& pair : video_filterers_) {
-          pair.second->reinit();
-        }
-
-        // recalculate max dimensions
-        const auto dims = calculate_max_dest_dimensions(video_filterers_);
-        const bool dims_changed = (dims.first != max_width_) || (dims.second != max_height_);
-        max_width_ = dims.first;
-        max_height_ = dims.second;
-
-        // if dimensions changed, recreate format converters and reinitialize video dimensions
-        if (dims_changed) {
-          recreate_format_converters(format_conversion_sws_flags);
-          display_->reinitialize_video_dimensions(static_cast<unsigned>(max_width_), static_cast<unsigned>(max_height_));
-        }
-
-        float next_left_position;
-
-        // the left video is the "master"
-        const float min_left_position = (left.first_pts_ > INT64_MIN) ? (left.first_pts_ * AV_TIME_TO_SEC + left.start_time_) : left.start_time_;
-        const float left_position = left.pts_ * AV_TIME_TO_SEC + left.start_time_;
-        const bool left_is_single_frame = media_frame_detection_states_.at(LEFT).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame;
-
-        if (seek_from_start && !left_is_single_frame) {
-          // seek from start based on the shortest stream duration in seconds
-          next_left_position = shortest_duration_ * seek_relative + left.start_time_;
-        } else {
-          if (left_is_single_frame) {
-            // force state transition for single frame media files
-            seek_relative = left.delta_pts_ * AV_TIME_TO_SEC;
-          }
-
-          next_left_position = left_position + seek_relative;
-        }
-
-        // Clamp seeks so we never go before the first decoded PTS.
-        next_left_position = std::max(next_left_position, min_left_position);
-
-        // determine if the seek is backward or forward
-        const auto all_media_are_multi_frame = [&]() -> bool {
-          return std::all_of(media_frame_detection_states_.cbegin(), media_frame_detection_states_.cend(), [](const auto& kv) { return kv.second.cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::MultiFrame; });
-        };
-        const bool backward = (seek_relative < 0.0F) || (shift_right_frames != 0) || (force_seek_current_position && all_media_are_multi_frame());
-
-        auto compute_right_position = [&](const SideState& right_state) -> float { return left.pts_ * AV_TIME_TO_SEC + right_state.start_time_; };
-
-        // Seek all right videos and track failures
-        bool seek_failed = false;
-
-        for (auto& pair : side_states) {
-          const Side& side = pair.first;
-
-          if (side.is_right()) {
+        if (backward_pivot_possible) {
+          const int n = -shift_right_frames;
+          for (auto& pair : side_states) {
+            if (!pair.first.is_right()) {
+              continue;
+            }
             SideState& right_state = pair.second;
 
-            float next_right_position;
+            // Pivot the cursor n steps back. `current` + front-of-history slide into
+            // prefetch (so a subsequent `+N` restores them without re-decoding), and
+            // `current` is set to what used to be `history[n-1]`.
+            right_state.ring.pivot_backward(n);
 
-            const float min_right_position = (right_state.first_pts_ > INT64_MIN) ? (right_state.first_pts_ * AV_TIME_TO_SEC + right_state.start_time_) : right_state.start_time_;
-            const float right_position = compute_right_position(right_state);
-            const bool right_is_single_frame = media_frame_detection_states_.at(side).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame;
+            const AVFrame* new_current = right_state.ring.current_frame();
 
-            if (seek_from_start && !right_is_single_frame) {
-              // seek from start based on the shortest stream duration in seconds
-              next_right_position = shortest_duration_ * seek_relative + right_state.start_time_;
-            } else {
-              if (right_is_single_frame) {
-                // force state transition for single frame media files
-                seek_relative = right_state.delta_pts_ * AV_TIME_TO_SEC;
+            right_state.effective_time_shift_ = time_shifter_.effective_shift(new_current->pts);
+            right_state.pts_ = new_current->pts - right_state.effective_time_shift_;
+            right_state.previous_decoded_picture_number_ = -1;
+            right_state.decoded_picture_number_ = 1;
+          }
+
+          // Don't sync until the next iteration (consistent with the full-seek path).
+          skip_update = true;
+        } else if (forward_pivot_possible) {
+          const int n = shift_right_frames;
+          for (auto& pair : side_states) {
+            if (!pair.first.is_right()) {
+              continue;
+            }
+            SideState& right_state = pair.second;
+
+            // Pivot the cursor n steps forward. `current` + n-1 front-of-prefetch
+            // entries slide into history (so a subsequent `-N` can restore them).
+            right_state.ring.pivot_forward(n);
+
+            const AVFrame* new_current = right_state.ring.current_frame();
+
+            right_state.effective_time_shift_ = time_shifter_.effective_shift(new_current->pts);
+            right_state.pts_ = new_current->pts - right_state.effective_time_shift_;
+            right_state.previous_decoded_picture_number_ = -1;
+            right_state.decoded_picture_number_ = 1;
+          }
+
+          // Don't sync until the next iteration (consistent with the full-seek path).
+          skip_update = true;
+        } else {
+          // Predicate: does this side participate in this seek?
+          const auto should_seek = [pure_right_frame_shift](const Side& s) -> bool { return !pure_right_frame_shift || s.is_right(); };
+
+          ready_to_seek_.reset_all();
+          // Mark per-side seeking for the sides that will participate. Left workers
+          // see their own flag stay false during a pure right frame shift and keep
+          // running normally.
+          for (auto& pair : seeking_per_side_) {
+            pair.second.store(should_seek(pair.first), std::memory_order_relaxed);
+          }
+
+          // drain packet and frame queues on seeking side
+          for (auto& pair : packet_queues_) {
+            if (!should_seek(pair.first)) {
+              continue;
+            }
+            pair.second->stop();
+            pair.second->empty();
+          }
+
+          auto empty_frame_queues = [&]() {
+            for (auto& pair : decoded_frame_queues_) {
+              if (should_seek(pair.first)) {
+                pair.second->empty();
               }
+            }
+            for (auto& pair : filtered_frame_queues_) {
+              if (should_seek(pair.first)) {
+                pair.second->empty();
+              }
+            }
+            for (auto& pair : converted_frame_queues_) {
+              if (should_seek(pair.first)) {
+                pair.second->empty();
+              }
+            }
+          };
 
-              next_right_position = right_position + seek_relative;
+          while (!ready_to_seek_.all_are_idle_where(should_seek)) {
+            empty_frame_queues();
+            sleep_for_ms(SLEEP_PERIOD_MS);
+#ifdef _DEBUG
+            dump_debug_info(frame_number, right_ptr->effective_time_shift_, refresh_time_deque.average());
+#endif
+          }
+
+          // empty the frame queues one last time
+          empty_frame_queues();
+
+          // consume filter changes on seeking side. Others keep their pending changes
+          // so they get applied on the next full seek.
+          for (const auto& pair : video_filterers_) {
+            if (should_seek(pair.first)) {
+              pair.second->consume_filter_change();
+            }
+          }
+
+          // reinit filter graphs on seeking side (reinit'ing a live filterer would
+          // race with its filter_video thread).
+          for (auto& pair : video_filterers_) {
+            if (should_seek(pair.first)) {
+              pair.second->reinit();
+            }
+          }
+
+          // recalculate max dimensions
+          const auto dims = calculate_max_dest_dimensions(video_filterers_);
+          const bool dims_changed = (dims.first != max_width_) || (dims.second != max_height_);
+          max_width_ = dims.first;
+          max_height_ = dims.second;
+
+          // if dimensions changed, recreate format converters and reinitialize video dimensions
+          if (dims_changed) {
+            recreate_format_converters(format_conversion_sws_flags);
+            display_->reinitialize_video_dimensions(static_cast<unsigned>(max_width_), static_cast<unsigned>(max_height_));
+          }
+
+          float next_left_position;
+
+          // the left video is the "master"
+          const float min_left_position = (left.first_pts_ > INT64_MIN) ? (left.first_pts_ * AV_TIME_TO_SEC + left.start_time_) : left.start_time_;
+          const float left_position = left.pts_ * AV_TIME_TO_SEC + left.start_time_;
+          const bool left_is_single_frame = media_frame_detection_states_.at(LEFT).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame;
+
+          if (seek_from_start && !left_is_single_frame) {
+            // seek from start based on the shortest stream duration in seconds
+            next_left_position = shortest_duration_ * seek_relative + left.start_time_;
+          } else {
+            if (left_is_single_frame) {
+              // force state transition for single frame media files
+              seek_relative = left.delta_pts_ * AV_TIME_TO_SEC;
             }
 
-            // Clamp seeks so we never go before the first decoded PTS.
-            next_right_position = std::max(next_right_position, min_right_position);
+            next_left_position = left_position + seek_relative;
+          }
 
-            // Add the dynamic time shift and the delta PTS to the next right position
-            next_right_position += static_right_time_shift * AV_TIME_TO_SEC;
-            next_right_position += static_cast<float>(calculate_dynamic_time_shift(time_shift_.multiplier, (next_right_position - right_state.start_time_) / AV_TIME_TO_SEC, false)) * AV_TIME_TO_SEC;
+          // Clamp seeks so we never go before the first decoded PTS.
+          next_left_position = std::max(next_left_position, min_left_position);
+
+          // determine if the seek is backward or forward
+          const auto all_media_are_multi_frame = [&]() -> bool {
+            return std::all_of(media_frame_detection_states_.cbegin(), media_frame_detection_states_.cend(), [](const auto& kv) { return kv.second.cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::MultiFrame; });
+          };
+          const bool backward = (seek_relative < 0.0F) || (shift_right_frames != 0) || (force_seek_current_position && all_media_are_multi_frame());
+
+          auto compute_right_position = [&](const SideState& right_state) -> float { return left.pts_ * AV_TIME_TO_SEC + right_state.start_time_; };
+
+          // Seek all right videos and track failures
+          bool seek_failed = false;
+
+          for (auto& pair : side_states) {
+            const Side& side = pair.first;
+
+            if (side.is_right()) {
+              SideState& right_state = pair.second;
+
+              float next_right_position;
+
+              const float min_right_position = (right_state.first_pts_ > INT64_MIN) ? (right_state.first_pts_ * AV_TIME_TO_SEC + right_state.start_time_) : right_state.start_time_;
+              const float right_position = compute_right_position(right_state);
+              const bool right_is_single_frame = media_frame_detection_states_.at(side).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame;
+
+              if (seek_from_start && !right_is_single_frame) {
+                // seek from start based on the shortest stream duration in seconds
+                next_right_position = shortest_duration_ * seek_relative + right_state.start_time_;
+              } else {
+                if (right_is_single_frame) {
+                  // force state transition for single frame media files
+                  seek_relative = right_state.delta_pts_ * AV_TIME_TO_SEC;
+                }
+
+                next_right_position = right_position + seek_relative;
+              }
+
+              // Clamp seeks so we never go before the first decoded PTS.
+              next_right_position = std::max(next_right_position, min_right_position);
+
+              // Add the static and dynamic time shifts to the next right position.
+              next_right_position += time_shifter_.static_shift() * AV_TIME_TO_SEC;
+              next_right_position += static_cast<float>(time_shifter_.dynamic_shift(static_cast<int64_t>((next_right_position - right_state.start_time_) / AV_TIME_TO_SEC), false)) * AV_TIME_TO_SEC;
 
 #ifdef _DEBUG
-            std::cout << "SEEK: next_right_position=" << (int)(next_right_position * 1000) << " (side=" << side.to_string() << "), backward=" << backward << std::endl;
+              std::cout << "SEEK: next_right_position=" << (int)(next_right_position * 1000) << " (side=" << side.to_string() << "), backward=" << backward << std::endl;
 #endif
-            const bool right_seek_result = demuxers_[side]->seek(next_right_position, backward);
-            if (!right_seek_result && !backward) {
+              const bool right_seek_result = demuxers_[side]->seek(next_right_position, backward);
+              if (!right_seek_result && !backward) {
+                seek_failed = true;
+              }
+#ifdef _DEBUG
+              std::cout << "Right seek result: " << right_seek_result << " - side: " << side.to_string() << std::endl;
+#endif
+            }
+          }
+
+          if (should_seek(LEFT)) {
+#ifdef _DEBUG
+            std::cout << "SEEK: next_left_position=" << (int)(next_left_position * 1000) << ", backward=" << backward << std::endl;
+#endif
+            const bool left_seek_result = demuxers_[LEFT]->seek(next_left_position, backward);
+            if (!left_seek_result && !backward) {
               seek_failed = true;
             }
 #ifdef _DEBUG
-            std::cout << "Right seek result: " << right_seek_result << " - side: " << side.to_string() << std::endl;
+            std::cout << "Left seek result: " << left_seek_result << " - side: " << LEFT.to_string() << std::endl;
 #endif
           }
-        }
 
+          // Restore all positions if any seek failed on seeking side
+          if (seek_failed) {
+            display_->set_pending_message("Unable to seek past end of file");
+
+            if (should_seek(LEFT)) {
+              demuxers_[LEFT]->seek(left_position, true);
+            }
+
+            for (auto& pair : side_states) {
+              const Side& side = pair.first;
+              if (side.is_right() && should_seek(side)) {
+                SideState& right_state = pair.second;
+                demuxers_[side]->seek(compute_right_position(right_state), true);
+              }
+            }
+          }
+
+          // Clear per-side seeking flags
+          for (auto& pair : seeking_per_side_) {
+            pair.second.store(false, std::memory_order_relaxed);
+          }
+
+          // allow packet and frame queues to receive data again on sides we stopped
+          for (auto& pair : packet_queues_) {
+            if (should_seek(pair.first)) {
+              pair.second->restart();
+            }
+          }
+          for (auto& pair : decoded_frame_queues_) {
+            if (should_seek(pair.first)) {
+              pair.second->restart();
+            }
+          }
+          for (auto& pair : filtered_frame_queues_) {
+            if (should_seek(pair.first)) {
+              pair.second->restart();
+            }
+          }
+          for (auto& pair : converted_frame_queues_) {
+            if (should_seek(pair.first)) {
+              pair.second->restart();
+            }
+          }
+
+          // Pop the first post-seek frame off the converted queue and seed the ring's
+          // current slot with it. The caller clears the ring beforehand so that the
+          // fresh current has no stale history or prefetch alongside it.
+          auto pop_and_reset = [&](SideState& side_state, int64_t* effective_time_shift = nullptr) {
+            AVFrameUniquePtr first_frame{nullptr, avframe_deleter};
+            converted_frame_queues_[side_state.side_]->pop(first_frame);
+
+            if (first_frame != nullptr) {
+              side_state.pts_ = first_frame->pts;
+
+              // if the effective time shift is provided, update it and subtract it from the PTS
+              if (effective_time_shift != nullptr) {
+                *effective_time_shift += time_shifter_.dynamic_shift(first_frame->pts);
+                side_state.pts_ -= *effective_time_shift;
+              }
+
+              side_state.previous_decoded_picture_number_ = -1;
+              side_state.decoded_picture_number_ = 1;
+              side_state.ring.set_current(std::move(first_frame));
+            } else {
 #ifdef _DEBUG
-        std::cout << "SEEK: next_left_position=" << (int)(next_left_position * 1000) << ", backward=" << backward << std::endl;
+              std::cout << "Side state frame is nullptr: " << side_state.side_.to_string() << std::endl;
 #endif
-        const bool left_seek_result = demuxers_[LEFT]->seek(next_left_position, backward);
-        if (!left_seek_result && !backward) {
-          seek_failed = true;
-        }
-#ifdef _DEBUG
-        std::cout << "Left seek result: " << left_seek_result << " - side: " << LEFT.to_string() << std::endl;
-#endif
+            }
+          };
 
-        // Restore all positions if any seek failed
-        if (seek_failed) {
-          display_->set_pending_message("Unable to seek past end of file");
+          if (should_seek(LEFT)) {
+            left.ring.clear();
+            pop_and_reset(left);
+          }
 
-          demuxers_[LEFT]->seek(left_position, true);
+          // Nudge near-zero residual shifts away from zero so the right demuxer lands
+          // on a distinct frame. Exact integer-frame shifts pass through unchanged.
+          time_shifter_.nudge_away_from_zero(right_ptr->delta_pts_);
 
+          // Reset all right videos after seek
           for (auto& pair : side_states) {
             const Side& side = pair.first;
             if (side.is_right()) {
               SideState& right_state = pair.second;
-              demuxers_[side]->seek(compute_right_position(right_state), true);
+
+              right_state.ring.clear();
+              right_state.effective_time_shift_ = time_shifter_.static_shift();
+              pop_and_reset(right_state, &right_state.effective_time_shift_);
             }
           }
-        }
 
-        seeking_ = false;
-
-        // allow packet and frame queues to receive data again
-        for (auto& pair : packet_queues_) {
-          pair.second->restart();
-        }
-        for (auto& pair : decoded_frame_queues_) {
-          pair.second->restart();
-        }
-        for (auto& pair : filtered_frame_queues_) {
-          pair.second->restart();
-        }
-        for (auto& pair : converted_frame_queues_) {
-          pair.second->restart();
-        }
-
-        auto pop_and_reset = [&](SideState& side_state, int64_t* effective_time_shift = nullptr) {
-          converted_frame_queues_[side_state.side_]->pop(side_state.frame_);
-
-          if (side_state.frame_ != nullptr) {
-            side_state.pts_ = side_state.frame_->pts;
-
-            // if the effective time shift is provided, update it and subtract it from the PTS
-            if (effective_time_shift != nullptr) {
-              *effective_time_shift += calculate_dynamic_time_shift(time_shift_.multiplier, side_state.frame_->pts, true);
-              side_state.pts_ -= *effective_time_shift;
-            }
-
-            side_state.previous_decoded_picture_number_ = -1;
-            side_state.decoded_picture_number_ = 1;
-
-            side_state.frames_.clear();
-          } else {
-#ifdef _DEBUG
-            std::cout << "Side state frame is nullptr: " << side_state.side_.to_string() << std::endl;
-#endif
-          }
-        };
-
-        pop_and_reset(left);
-
-        // round away from zero to nearest 2 ms
-        if (static_right_time_shift > 0) {
-          static_right_time_shift = ((static_right_time_shift / 1000) + 2) * 1000;
-        } else if (static_right_time_shift < 0) {
-          static_right_time_shift = ((static_right_time_shift / 1000) - 2) * 1000;
-        }
-
-        // Reset all right videos after seek
-        for (auto& pair : side_states) {
-          const Side& side = pair.first;
-          if (side.is_right()) {
-            SideState& right_state = pair.second;
-
-            right_state.effective_time_shift_ = static_right_time_shift;
-            pop_and_reset(right_state, &right_state.effective_time_shift_);
-          }
-        }
-
-        // don't sync until the next iteration to prevent freezing when comparing a single image
-        skip_update = true;
+          // don't sync until the next iteration to prevent freezing when comparing a single image
+          skip_update = true;
+        }  // end of full-seek branch
       }
 
       bool store_frames = false;
@@ -1251,7 +1400,7 @@ void VideoCompare::compare() {
 
 #ifdef _DEBUG
       const std::string current_state = string_sprintf("left_pts=%5d, left_is_behind=%d, right_pts=%5d, right_is_behind=%d, min_delta=%5d, effective_right_time_shift=%5d", left.pts_ / 1000, is_behind(left.pts_, right_ptr->pts_, min_delta),
-                                                       (right_ptr->pts_ + static_right_time_shift) / 1000, is_behind(right_ptr->pts_, left.pts_, min_delta), min_delta / 1000, right_ptr->effective_time_shift_ / 1000);
+                                                       (right_ptr->pts_ + time_shifter_.static_shift()) / 1000, is_behind(right_ptr->pts_, left.pts_, min_delta), min_delta / 1000, right_ptr->effective_time_shift_ / 1000);
 
       if (current_state != previous_state) {
         std::cout << current_state << std::endl;
@@ -1259,20 +1408,33 @@ void VideoCompare::compare() {
 
       previous_state = current_state;
 #endif
-      auto pop_frame = [&](SideState& side_state) {
-        const bool result = converted_frame_queues_[side_state.side_]->pop(side_state.frame_);
+      // Drain any frames that the converter produced during the seek block (they may
+      // have slipped through between the earlier intake call and now, especially on
+      // the skip-left-flush path where left's pipeline kept running).
+      intake_prefetch();
 
-        if (result) {
-          side_state.decoded_picture_number_++;
+      // Consume one frame from the ring (normal playback step or sync adjustment). If
+      // prefetch is empty, fall back to a blocking pop from the converter queue to keep
+      // pipeline-paced behavior when playback runs ahead of the pipeline.
+      auto advance_ring = [&](SideState& side_state) {
+        if (side_state.ring.prefetch_size() == 0) {
+          AVFrameUniquePtr next{nullptr, avframe_deleter};
+          if (!converted_frame_queues_[side_state.side_]->pop(next) || next == nullptr) {
+            return false;
+          }
+          side_state.ring.push_prefetch(std::move(next));
         }
-
-        return result;
+        if (!side_state.ring.advance()) {
+          return false;
+        }
+        side_state.decoded_picture_number_++;
+        return true;
       };
+
       auto sync_frame_queue = [&](SideState& side_state, const SideState& other_side) {
         if (is_behind(side_state.pts_, other_side.pts_, min_delta)) {
           adjusting = true;
-
-          pop_frame(side_state);
+          advance_ring(side_state);
         }
       };
 
@@ -1288,19 +1450,16 @@ void VideoCompare::compare() {
       // handle regular playback only
       if (!skip_update && display_->get_buffer_play_loop_mode() == Display::Loop::Off) {
         if (!adjusting && fetch_next_frame) {
-          // pop for all videos
-          bool all_popped = true;
-
+          // Advance the cursor on every side.
+          bool all_advanced = true;
           for (auto& pair : side_states) {
-            all_popped = all_popped && pop_frame(pair.second);
+            all_advanced = advance_ring(pair.second) && all_advanced;
           }
 
-          // if any of the videos are not popped, set the frame to nullptr and update the timer
-          if (!all_popped) {
-            for (auto& pair : side_states) {
-              pair.second.frame_ = nullptr;
-            }
-
+          if (!all_advanced) {
+            // Some side is out of prefetched frames and its pipeline is stopped (EOF).
+            // Don't mark store_frames; the ring's current remains the last successfully
+            // decoded frame, so the display just keeps showing it.
             timer_->update();
           } else {
             store_frames = true;
@@ -1308,13 +1467,13 @@ void VideoCompare::compare() {
             for (auto& pair : side_states) {
               if (pair.first.is_right()) {
                 auto& side_state = pair.second;
-                side_state.effective_time_shift_ = static_right_time_shift + calculate_dynamic_time_shift(time_shift_.multiplier, side_state.frame_->pts, true);
+                side_state.effective_time_shift_ = time_shifter_.effective_shift(side_state.ring.current_frame()->pts);
               }
             }
 
             // update timer for regular playback
             if (frame_number > 0) {
-              const int64_t play_frame_delay = compute_frame_delay(left.frame_->pts - left.pts_, right_ptr->frame_->pts - right_ptr->pts_ - right_ptr->effective_time_shift_);
+              const int64_t play_frame_delay = compute_frame_delay(left.ring.current_frame()->pts - left.pts_, right_ptr->ring.current_frame()->pts - right_ptr->pts_ - right_ptr->effective_time_shift_);
 
               const float pace_divisor = display_->get_play() ? display_->get_playback_speed_factor() : 1.0f;
               timer_->shift_target(static_cast<int64_t>(play_frame_delay / pace_divisor));
@@ -1324,8 +1483,8 @@ void VideoCompare::compare() {
 
             // update first PTS for all videos
             for (auto& pair : side_states) {
-              if (pair.second.first_pts_ == INT64_MIN) {
-                pair.second.first_pts_ = pair.second.frame_->pts;
+              if (pair.second.first_pts_ == INT64_MIN && pair.second.ring.current_frame() != nullptr) {
+                pair.second.first_pts_ = pair.second.ring.current_frame()->pts;
               }
             }
           }
@@ -1340,32 +1499,39 @@ void VideoCompare::compare() {
       }
 
       auto update_frame_timing = [](SideState& side_state, const int64_t& time_shift) {
-        if (side_state.frame_ != nullptr) {
-          // determine time-shifted PTS (note: new_pts only differs from frame->pts on the right side)
-          const int64_t new_pts = side_state.frame_->pts - time_shift;
-
-          if ((side_state.decoded_picture_number_ - side_state.previous_decoded_picture_number_) == 1) {
-            // compute the average PTS delta in a rolling-window fashion
-            const int64_t last_duration = new_pts - side_state.pts_;
-            side_state.frame_duration_deque_.push_back(last_duration);
-            side_state.delta_pts_ = side_state.frame_duration_deque_.average();
-          }
-
-          if (side_state.delta_pts_ > 0) {
-            // use the average PTS delta for frame duration
-            ffmpeg::frame_duration(side_state.frame_.get()) = side_state.delta_pts_;
-
-            if (!side_state.frames_.empty() && side_state.frames_.back()->pts == side_state.first_pts_) {
-              // update the duration of the first stored frame once the second frame has been decoded
-              ffmpeg::frame_duration(side_state.frames_.back().get()) = side_state.delta_pts_;
-            }
-          } else {
-            side_state.delta_pts_ = ffmpeg::frame_duration(side_state.frame_.get());
-          }
-
-          side_state.pts_ = new_pts;
-          side_state.previous_decoded_picture_number_ = side_state.decoded_picture_number_;
+        AVFrame* current = side_state.ring.current_frame();
+        if (current == nullptr) {
+          return;
         }
+        // determine time-shifted PTS (note: new_pts only differs from current->pts on the right side)
+        const int64_t new_pts = current->pts - time_shift;
+
+        if ((side_state.decoded_picture_number_ - side_state.previous_decoded_picture_number_) == 1) {
+          // compute the average PTS delta in a rolling-window fashion
+          const int64_t last_duration = new_pts - side_state.pts_;
+          side_state.frame_duration_deque_.push_back(last_duration);
+          side_state.delta_pts_ = side_state.frame_duration_deque_.average();
+        }
+
+        if (side_state.delta_pts_ > 0) {
+          // use the average PTS delta for frame duration
+          ffmpeg::frame_duration(current) = side_state.delta_pts_;
+
+          // If the oldest history entry is the FIRST decoded frame, backfill its
+          // duration now that the second frame has been decoded.
+          const int oldest_idx = side_state.ring.history_size();
+          if (oldest_idx > 0) {
+            AVFrame* oldest = side_state.ring.at(-oldest_idx);
+            if (oldest != nullptr && oldest->pts == side_state.first_pts_) {
+              ffmpeg::frame_duration(oldest) = side_state.delta_pts_;
+            }
+          }
+        } else {
+          side_state.delta_pts_ = ffmpeg::frame_duration(current);
+        }
+
+        side_state.pts_ = new_pts;
+        side_state.previous_decoded_picture_number_ = side_state.decoded_picture_number_;
       };
 
       update_frame_timing(left, 0);
@@ -1378,34 +1544,6 @@ void VideoCompare::compare() {
         }
       }
 
-      auto manage_frame_buffer = [&](SideState& side_state) {
-        auto& frame = side_state.frame_;
-        auto& frames = side_state.frames_;
-
-        if (store_frames) {
-          if (frames.size() >= frame_buffer_size_) {
-            frames.pop_back();
-          }
-          frames.push_front(std::move(frame));
-        } else if (frame != nullptr) {
-          if (!frames.empty()) {
-            frames.front() = std::move(frame);
-          } else {
-            frames.push_front(std::move(frame));
-          }
-        }
-      };
-
-      manage_frame_buffer(left);
-
-      for (auto& pair : side_states) {
-        const Side& side = pair.first;
-        if (side.is_right()) {
-          SideState& right_state = pair.second;
-          manage_frame_buffer(right_state);
-        }
-      }
-
       bool all_stopped = true;
       for (auto& pair : converted_frame_queues_) {
         all_stopped = all_stopped && pair.second->is_stopped();
@@ -1413,14 +1551,17 @@ void VideoCompare::compare() {
 
       const bool no_activity = !skip_update && !adjusting && !store_frames;
       const bool end_of_file = no_activity && all_stopped;
-      const bool buffer_is_full = left.frames_.size() == frame_buffer_size_ && right_ptr->frames_.size() == frame_buffer_size_;
+      const bool buffer_is_full = left.ring.history_plus_current_size() == static_cast<int>(frame_buffer_size_) && right_ptr->ring.history_plus_current_size() == static_cast<int>(frame_buffer_size_);
 
       // If we're frame-stepping and hit EOF, stop trying to fetch more frames.
       if (end_of_file && (forward_navigate_frames > 0) && !display_->get_play()) {
         forward_navigate_frames = 0;
       }
 
-      const int last_common_frame_index = static_cast<int>(std::min(left.frames_.size(), right_ptr->frames_.size()) - 1);
+      // Browse span: user's `frame_offset` walks back through (current + history). The
+      // prefetch side isn't exposed here — pressing `+` on the UI is a cursor advance,
+      // not a browse.
+      const int last_common_frame_index = std::min(left.ring.history_plus_current_size(), right_ptr->ring.history_plus_current_size()) - 1;
 
       auto adjust_frame_offset = [last_common_frame_index](const int frame_offset, const int adjustment) { return std::min(std::max(0, frame_offset + adjustment), last_common_frame_index); };
 
@@ -1428,20 +1569,22 @@ void VideoCompare::compare() {
 
       bool ui_refresh_performed = false;
 
-      if (frame_offset >= 0 && !left.frames_.empty() && !right_ptr->frames_.empty()) {
+      if (frame_offset >= 0 && last_common_frame_index >= 0) {
         const bool is_playback_in_sync = is_in_sync(left.pts_, right_ptr->pts_, left.delta_pts_, right_ptr->delta_pts_);
 
         // reduce refresh rate to 10 Hz for faster re-syncing
         const bool skip_refresh = !is_playback_in_sync && display_refresh_timer.us_until_target() > -RESYNC_UPDATE_RATE_US;
 
         if (!skip_refresh) {
-          const auto& left_frames_ref = !display_->get_swap_left_right() ? left.frames_ : right_ptr->frames_;
-          const auto& right_frames_ref = !display_->get_swap_left_right() ? right_ptr->frames_ : left.frames_;
+          // `frame_offset` of 0 is the current frame; positive values index back into
+          // history (hence the sign flip when calling `ring.at(-frame_offset)`).
+          FrameRing& left_ring = !display_->get_swap_left_right() ? left.ring : right_ptr->ring;
+          FrameRing& right_ring = !display_->get_swap_left_right() ? right_ptr->ring : left.ring;
 
-          const auto left_display_frame = left_frames_ref[frame_offset].get();
-          const auto right_display_frame = right_frames_ref[frame_offset].get();
-          const auto left_state_frame = left.frames_[frame_offset].get();
-          const auto right_state_frame = right_ptr->frames_[frame_offset].get();
+          const auto left_display_frame = left_ring.at(-frame_offset);
+          const auto right_display_frame = right_ring.at(-frame_offset);
+          const auto left_state_frame = left.ring.at(-frame_offset);
+          const auto right_state_frame = right_ptr->ring.at(-frame_offset);
 
           auto refresh_from_frame_if_changed = [&](SideState& side_state, const AVFrame* frame) {
             const int frame_filter_generation = VideoFilterer::get_filter_generation_from_frame(frame);
@@ -1557,7 +1700,7 @@ void VideoCompare::compare() {
             }
 
             // update timer for accurate in-buffer playback
-            const int64_t in_buffer_frame_delay = compute_frame_delay(ffmpeg::frame_duration(left.frames_[frame_offset].get()), ffmpeg::frame_duration(right_ptr->frames_[frame_offset].get()));
+            const int64_t in_buffer_frame_delay = compute_frame_delay(ffmpeg::frame_duration(left.ring.at(-frame_offset)), ffmpeg::frame_duration(right_ptr->ring.at(-frame_offset)));
 
             timer_->shift_target(in_buffer_frame_delay / display_->get_playback_speed_factor());
           }

@@ -28,6 +28,7 @@ class Queue {
   bool push(T&& data);
   bool push(const T& data);
   bool pop(T& data);
+  bool try_pop(T& data);
 
   void restart();
   void stop();
@@ -100,6 +101,23 @@ bool Queue<T>::pop(T& data) {
   return false;
 }
 
+// Non-blocking pop: returns false immediately if the queue is empty. Unlike `pop`,
+// does not wait on the `empty_` condition variable. Used for the main-loop intake
+// drain that moves converter output into each FrameRing's prefetch tail.
+template <class T>
+bool Queue<T>::try_pop(T& data) {
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  if (queue_.empty()) {
+    return false;
+  }
+  data = std::move(queue_.front());
+  queue_.pop();
+
+  full_.notify_all();
+  return true;
+}
+
 template <class T>
 void Queue<T>::restart() {
   std::unique_lock<std::mutex> lock(mutex_);
@@ -154,5 +172,6 @@ void Queue<T>::empty() {
 
 template <class T>
 int Queue<T>::size() {
+  std::unique_lock<std::mutex> lock(mutex_);
   return queue_.size();
 }

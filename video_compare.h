@@ -13,8 +13,11 @@
 #include "demuxer.h"
 #include "display.h"
 #include "format_converter.h"
+#include "frame_ring.h"
 #include "queue.h"
 #include "scope_manager.h"
+#include "single_decoder_mode.h"
+#include "time_shifter.h"
 #include "timer.h"
 #include "video_decoder.h"
 #include "video_filterer.h"
@@ -61,6 +64,20 @@ class ReadyToSeek {
     for (const auto& thread_map : ready_to_seek_) {
       for (const auto& pair : thread_map) {
         if (!load(pair.second)) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  // Like all_are_idle(), but only considers sides for which `side_pred(side)` is true.
+  template <typename Predicate>
+  bool all_are_idle_where(Predicate side_pred) const {
+    for (const auto& thread_map : ready_to_seek_) {
+      for (const auto& pair : thread_map) {
+        if (side_pred(pair.first) && !load(pair.second)) {
           return false;
         }
       }
@@ -143,14 +160,11 @@ class VideoCompare {
   bool keep_running() const;
   void quit_all_queues();
 
-  void update_decoder_mode(const int right_time_shift);
-
   void note_decoded_frame(const Side& side, const int64_t pts);
 
   void refresh_side_filter_metadata(const Side& side, const std::string& filters);
 
   bool handle_pending_crop_request(const Side& active_right);
-  std::vector<Side> consume_filter_changes();
 
   void dump_debug_info(const int frame_number, const int64_t effective_right_time_shift, const int average_refresh_time);
 
@@ -204,8 +218,7 @@ class VideoCompare {
 
   const Display::Loop auto_loop_mode_;
   const size_t frame_buffer_size_;
-  const TimeShiftConfig time_shift_;
-  const int64_t time_shift_offset_av_time_;
+  TimeShifter time_shifter_;
 
   std::map<Side, std::unique_ptr<Demuxer>> demuxers_;
   std::map<Side, std::unique_ptr<VideoDecoder>> video_decoders_;
@@ -239,7 +252,24 @@ class VideoCompare {
 
   ExceptionHolder exception_holder_;
 
-  std::atomic_bool seeking_{false};
-  std::atomic_bool single_decoder_mode_{false};
+  // Per-side "this side's pipeline is currently seeking". Workers check their own
+  // side so that a pure right-side frame shift doesn't disturb the left pipeline.
+  std::map<Side, std::atomic_bool> seeking_per_side_;
+
+  bool is_seeking(const Side& side) const {
+    auto it = seeking_per_side_.find(side);
+    return it != seeking_per_side_.end() && it->second.load(std::memory_order_relaxed);
+  }
+
+  bool any_seeking() const {
+    for (const auto& pair : seeking_per_side_) {
+      if (pair.second.load(std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  SingleDecoderMode single_decoder_mode_;
   ReadyToSeek ready_to_seek_;
 };
