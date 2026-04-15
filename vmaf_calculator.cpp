@@ -146,9 +146,14 @@ void VMAFCalculator::run_libvmaf_filter(const AVFrame* distorted_frame, const AV
     throw std::runtime_error("Error closing reference buffer source");
   }
 
-  AVFrameRAII filtered_frame;
-
-  if (av_buffersink_get_frame(buffersink_ctx, filtered_frame.get()) < 0) {
-    throw std::runtime_error("Error getting filtered frame");
+  while (true) {
+    AVFrameRAII filtered_frame;
+    int ret = av_buffersink_get_frame(buffersink_ctx, filtered_frame.get());
+    if (ret == AVERROR_EOF) {
+      break;
+    }
+    if (ret < 0) {
+      throw std::runtime_error("Error getting filtered frame");
+    }
   }
 }
