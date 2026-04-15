@@ -74,8 +74,8 @@ $(target): $(obj)
 
 -include $(dep)
 
-%.d: %.cpp
-	@$(CXX) $(CXXFLAGS) $< -MM -MT $(@:.d=.o) >$@
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -MMD -MP -MF $(@:.o=.d) -c -o $@ $<
 
 test: $(target)
 	./$(target) -w 800x screenshot_1.jpg screenshot_2.jpg
