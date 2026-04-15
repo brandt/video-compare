@@ -1779,6 +1779,56 @@ void Display::render_metadata_overlay() {
   }
 }
 
+void Display::render_quality_metrics_overlay() {
+  const std::string vmaf_display = (last_vmaf_ == "n/a") ? std::string("n/a (pause to compute)") : last_vmaf_;
+  const std::array<std::string, 3> lines = {
+      std::string("PSNR: ") + last_psnr_ + " dB",
+      std::string("SSIM: ") + last_ssim_,
+      std::string("VMAF: ") + vmaf_display,
+  };
+
+  std::array<SDL_Texture*, 3> textures{{nullptr, nullptr, nullptr}};
+  std::array<int, 3> widths{{0, 0, 0}};
+  std::array<int, 3> heights{{0, 0, 0}};
+  int max_w = 0;
+  int total_h = 0;
+  const int line_spacing = 4;
+
+  for (size_t i = 0; i < lines.size(); i++) {
+    SDL_Surface* surface = TTF_RenderUTF8_Blended(small_font_, lines[i].c_str(), POSITION_COLOR);
+    if (surface == nullptr) {
+      continue;
+    }
+    textures[i] = SDL_CreateTextureFromSurface(renderer_, surface);
+    widths[i] = surface->w;
+    heights[i] = surface->h;
+    max_w = std::max(max_w, surface->w);
+    total_h += surface->h + (i + 1 < lines.size() ? line_spacing : 0);
+    SDL_FreeSurface(surface);
+  }
+
+  const int padding = border_extension_ * 2;
+  const int right_margin = HELP_TEXT_HORIZONTAL_MARGIN;
+  const int top_margin = line2_y_ * 2;
+
+  SDL_Rect bg_rect = {drawable_width_ - right_margin - max_w - padding * 2, top_margin, max_w + padding * 2, total_h + padding * 2};
+
+  SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+  SDL_SetRenderDrawColor(renderer_, 0, 0, 0, BACKGROUND_ALPHA * 2);
+  SDL_RenderFillRect(renderer_, &bg_rect);
+
+  int y = bg_rect.y + padding;
+  for (size_t i = 0; i < lines.size(); i++) {
+    if (textures[i] == nullptr) {
+      continue;
+    }
+    SDL_Rect dst = {bg_rect.x + padding, y, widths[i], heights[i]};
+    SDL_RenderCopy(renderer_, textures[i], nullptr, &dst);
+    SDL_DestroyTexture(textures[i]);
+    y += heights[i] + line_spacing;
+  }
+}
+
 void Display::refresh_display_side_mapping() {
   displayed_left_side_ = swap_left_right_ ? RIGHT : LEFT;
   displayed_right_side_ = swap_left_right_ ? LEFT : RIGHT;
@@ -2386,6 +2436,26 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     print_image_similarity_metrics_ = false;
   }
 
+  // live on-screen quality metrics overlay (toggled by Q key)
+  if (show_quality_metrics_ && left_frame != nullptr && right_frame != nullptr && video_width_ > 0 && video_height_ > 0) {
+    float* left_gray = rgb_to_grayscale(left_frame->data[0], left_frame->linesize[0], video_width_, video_height_);
+    float* right_gray = rgb_to_grayscale(right_frame->data[0], right_frame->linesize[0], video_width_, video_height_);
+
+    last_psnr_ = compute_psnr(left_gray, right_gray, video_width_, video_height_);
+    last_ssim_ = compute_ssim(left_gray, right_gray, video_width_, video_height_);
+
+    delete[] left_gray;
+    delete[] right_gray;
+
+    if (!play_) {
+      if (left_frame->pts != last_vmaf_left_pts_ || right_frame->pts != last_vmaf_right_pts_) {
+        last_vmaf_ = VMAFCalculator::instance().compute(left_frame, right_frame);
+        last_vmaf_left_pts_ = left_frame->pts;
+        last_vmaf_right_pts_ = right_frame->pts;
+      }
+    }
+  }
+
   // clear everything
   SDL_SetRenderDrawColor(renderer_, BACKGROUND_COLOR.r, BACKGROUND_COLOR.g, BACKGROUND_COLOR.b, BACKGROUND_COLOR.a);
   SDL_RenderClear(renderer_);
@@ -2739,6 +2809,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   }
 
   draw_selection_rect();
+
+  if (show_quality_metrics_) {
+    render_quality_metrics_overlay();
+  }
 
   if (show_metadata_) {
     render_metadata_overlay();
@@ -3397,6 +3471,9 @@ void Display::handle_event(const SDL_Event& event) {
           } else {
             print_image_similarity_metrics_ = true;
           }
+          break;
+        case SDLK_q:
+          show_quality_metrics_ = !show_quality_metrics_;
           break;
         case SDLK_4:
         case SDLK_KP_4:

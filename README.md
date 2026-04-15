@@ -226,6 +226,7 @@ see all supported options.
 
 - `P`: Print mouse position and pixel value under cursor to console
 - `M`: Print image similarity metrics to console
+- `Q`: Toggle on-screen quality metrics overlay (PSNR/SSIM live, VMAF on pause)
 - `F`: Save both frames and the on-screen content as PNG images
 - `I`: Toggle fast/high-quality resizing for input alignment
 - `T`: Toggle nearest-neighbor/bilinear video texture filtering

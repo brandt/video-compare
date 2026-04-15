@@ -3,7 +3,9 @@
 #include <SDL2/SDL_ttf.h>
 #include <array>
 #include <chrono>
+#include <climits>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -232,6 +234,13 @@ class Display {
   bool possibly_tick_playback_{false};
   bool show_fps_{false};
 
+  bool show_quality_metrics_{false};
+  std::string last_psnr_{"n/a"};
+  std::string last_ssim_{"n/a"};
+  std::string last_vmaf_{"n/a"};
+  int64_t last_vmaf_left_pts_{INT64_MIN};
+  int64_t last_vmaf_right_pts_{INT64_MIN};
+
   // Subtraction mode settings
   DiffMode diff_mode_{DiffMode::AbsLinear};
   bool diff_luma_only_{false};
@@ -406,6 +415,7 @@ class Display {
 
   void render_help();
   void render_metadata_overlay();
+  void render_quality_metrics_overlay();
   void refresh_display_side_mapping();
   void build_metadata_textures(const VideoMetadata& left, const VideoMetadata& right);
   void update_window_title_with_current_roi();
