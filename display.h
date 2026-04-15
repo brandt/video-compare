@@ -223,6 +223,7 @@ class Display {
   int frame_buffer_offset_delta_{0};
   int frame_navigation_delta_{0};
   int shift_right_frames_{0};
+  bool auto_align_requested_{false};
   bool seek_from_start_{false};
   bool save_image_frames_{false};
   bool print_mouse_position_and_color_{false};
@@ -508,6 +509,8 @@ class Display {
   int get_frame_buffer_offset_delta() const;
   int get_frame_navigation_delta() const;
   int get_shift_right_frames() const;
+  bool get_auto_align_requested() const;
+  float compute_frame_psnr(const AVFrame* left_frame, const AVFrame* right_frame);
   float get_playback_speed_factor() const;
   bool get_tick_playback() const;
   bool get_possibly_tick_playback() const;

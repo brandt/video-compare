@@ -5,6 +5,7 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -3057,6 +3058,7 @@ void Display::begin_input_frame() {
   frame_buffer_offset_delta_ = 0;
   frame_navigation_delta_ = 0;
   shift_right_frames_ = 0;
+  auto_align_requested_ = false;
   tick_playback_ = false;
   possibly_tick_playback_ = false;
   toggle_scope_window_requested_.fill(false);
@@ -3475,6 +3477,9 @@ void Display::handle_event(const SDL_Event& event) {
         case SDLK_q:
           show_quality_metrics_ = !show_quality_metrics_;
           break;
+        case SDLK_BACKQUOTE:
+          auto_align_requested_ = true;
+          break;
         case SDLK_4:
         case SDLK_KP_4:
           update_zoom_factor_and_move_offset(std::min(video_to_window_width_factor_ / drawable_to_window_width_factor_, video_to_window_height_factor_ / drawable_to_window_height_factor_));
@@ -3704,6 +3709,42 @@ int Display::get_frame_navigation_delta() const {
 
 int Display::get_shift_right_frames() const {
   return shift_right_frames_;
+}
+
+bool Display::get_auto_align_requested() const {
+  return auto_align_requested_;
+}
+
+float Display::compute_frame_psnr(const AVFrame* left_frame, const AVFrame* right_frame) {
+  if (left_frame == nullptr || right_frame == nullptr) {
+    return -std::numeric_limits<float>::max();
+  }
+  if (left_frame->width != right_frame->width || left_frame->height != right_frame->height || left_frame->width <= 0 || left_frame->height <= 0) {
+    return -std::numeric_limits<float>::max();
+  }
+
+  const int width = left_frame->width;
+  const int height = left_frame->height;
+
+  float* left_gray = rgb_to_grayscale(left_frame->data[0], left_frame->linesize[0], width, height);
+  float* right_gray = rgb_to_grayscale(right_frame->data[0], right_frame->linesize[0], width, height);
+
+  double mse = 0.0;
+  const float* lp = left_gray;
+  const float* rp = right_gray;
+  for (int i = 0; i < width * height; i++) {
+    const float diff = *(lp++) - *(rp++);
+    mse += static_cast<double>(diff) * static_cast<double>(diff);
+  }
+  mse /= static_cast<double>(width) * static_cast<double>(height);
+
+  delete[] left_gray;
+  delete[] right_gray;
+
+  if (mse == 0.0) {
+    return std::numeric_limits<float>::max();
+  }
+  return -10.f * log10f(static_cast<float>(mse));
 }
 
 float Display::get_playback_speed_factor() const {
