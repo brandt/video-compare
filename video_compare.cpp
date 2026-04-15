@@ -1227,7 +1227,11 @@ void VideoCompare::compare() {
           const auto all_media_are_multi_frame = [&]() -> bool {
             return std::all_of(media_frame_detection_states_.cbegin(), media_frame_detection_states_.cend(), [](const auto& kv) { return kv.second.cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::MultiFrame; });
           };
-          const bool backward = (seek_relative < 0.0F) || (shift_right_frames != 0) || (force_seek_current_position && all_media_are_multi_frame());
+          // Absolute scrubs (timeline click, timestamp jump) must land on the keyframe
+          // at-or-before the target and decode forward; without BACKWARD, av_seek_frame
+          // requires a keyframe at-or-after the target, which fails on inputs with
+          // sparse keyframes (e.g., a single keyframe at PTS 0).
+          const bool backward = seek_from_start || (seek_relative < 0.0F) || (shift_right_frames != 0) || (force_seek_current_position && all_media_are_multi_frame());
 
           auto compute_right_position = [&](const SideState& right_state) -> float { return left.pts_ * AV_TIME_TO_SEC + right_state.start_time_; };
 
