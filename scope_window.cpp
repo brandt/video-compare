@@ -364,6 +364,14 @@ void ScopeWindow::ensure_graph(const AVFrame* left_frame, const AVFrame* right_f
   ffmpeg_check(avfilter_graph_parse_ptr(filter_graph_, filter_description.c_str(), &inputs, &outputs_left, nullptr), "graph parse");
   ffmpeg_check(avfilter_graph_config(filter_graph_, nullptr), "graph config");
 
+  if (std::getenv("VC_DUMP_FILTER_GRAPH") != nullptr) {
+    char* dump = avfilter_graph_dump(filter_graph_, nullptr);
+    if (dump != nullptr) {
+      fprintf(stderr, "=== ScopeWindow graph (input: %s) ===\n%s=== end ScopeWindow graph ===\n", filter_description.c_str(), dump);
+      av_free(dump);
+    }
+  }
+
   avfilter_inout_free(&inputs);
   avfilter_inout_free(&outputs_left);
   // outputs_right is freed via the chained free of outputs_left->next

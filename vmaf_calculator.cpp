@@ -130,6 +130,14 @@ void VMAFCalculator::run_libvmaf_filter(const AVFrame* distorted_frame, const AV
     throw std::runtime_error("Error configuring graph");
   }
 
+  if (std::getenv("VC_DUMP_FILTER_GRAPH") != nullptr) {
+    char* dump = avfilter_graph_dump(filter_graph.get(), nullptr);
+    if (dump != nullptr) {
+      std::cerr << "=== VMAFCalculator graph (input: " << filter_description << ") ===\n" << dump << "=== end VMAFCalculator graph ===" << std::endl;
+      av_free(dump);
+    }
+  }
+
   if (av_buffersrc_add_frame(buffersrc_ctx_dist, const_cast<AVFrame*>(distorted_frame)) < 0) {
     throw std::runtime_error("Error feeding distorted frame");
   }

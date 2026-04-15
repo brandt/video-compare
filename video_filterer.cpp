@@ -321,6 +321,14 @@ int VideoFilterer::init_filters() {
 
     if ((ret = avfilter_graph_parse_ptr(filter_graph_, filters.c_str(), &inputs, &outputs, nullptr)) >= 0) {
       ret = avfilter_graph_config(filter_graph_, nullptr);
+
+      if (ret >= 0 && std::getenv("VC_DUMP_FILTER_GRAPH") != nullptr) {
+        char* dump = avfilter_graph_dump(filter_graph_, nullptr);
+        if (dump != nullptr) {
+          std::cerr << "=== VideoFilterer graph (input: " << filters << ") ===\n" << dump << "=== end VideoFilterer graph ===" << std::endl;
+          av_free(dump);
+        }
+      }
     }
   }
 
