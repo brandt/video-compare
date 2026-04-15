@@ -25,6 +25,15 @@ else
   LDLIBS = -pthread
 endif
 
+# Homebrew stripped down the features built into ffmpeg and created a new
+# "keg-only" package that includes stuff like VMAF. "keg-only" means it
+# doesn't symlink into the usual Homebrew paths. See: `brew info ffmpeg-full`
+ifneq "$(wildcard /opt/homebrew/opt/ffmpeg-full)" ""
+  CXXFLAGS += -I/opt/homebrew/opt/ffmpeg-full/include/
+  LDLIBS += -L/opt/homebrew/opt/ffmpeg-full/lib/
+  PKG_CONFIG_PATH := /opt/homebrew/opt/ffmpeg-full/lib/pkgconfig:$(PKG_CONFIG_PATH)
+endif
+
 ifneq "$(wildcard /opt/homebrew)" ""
   CXXFLAGS += -I/opt/homebrew/include/
   LDLIBS += -L/opt/homebrew/lib/
