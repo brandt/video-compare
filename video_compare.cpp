@@ -214,12 +214,29 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
     video_filter_context.add(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.color_trc);
   }
 
-  // Probe HDR display before constructing filterers — determines whether we can skip tonemapping
+  // Probe HDR display before constructing filterers — determines whether we can skip tonemapping.
+  // HDR passthrough is only active when the display supports HDR AND all video sides have HDR content.
+  // Mixed HDR+SDR comparisons fall back to CPU tonemap (existing behavior) because the shared
+  // texture can only be tagged with one colorspace.
   const bool hdr_display = probe_hdr_display(config.display_number);
-  hdr_passthrough_active_ = hdr_display;
 
   if (hdr_display) {
-    std::cerr << "HDR display detected; HDR content will use native passthrough." << std::endl;
+    auto is_hdr_content = [](const VideoDecoder* decoder, const std::string& custom_trc) {
+      return decoder->infer_dynamic_range(custom_trc) != DynamicRange::Standard;
+    };
+
+    bool all_hdr = is_hdr_content(video_decoders_[LEFT].get(), config.left.color_trc);
+    for (size_t i = 0; i < config.right_videos.size() && all_hdr; ++i) {
+      all_hdr = is_hdr_content(video_decoders_[Side::Right(i)].get(), config.right_videos[i].color_trc);
+    }
+
+    hdr_passthrough_active_ = all_hdr;
+
+    if (all_hdr) {
+      std::cerr << "HDR display detected; all content is HDR — using native passthrough." << std::endl;
+    } else {
+      std::cerr << "HDR display detected, but not all content is HDR — using CPU tonemap." << std::endl;
+    }
   }
 
   // Initialize filterers using VideoFilterContext for consistent auto-filter determination

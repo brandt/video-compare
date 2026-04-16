@@ -252,14 +252,17 @@ VideoFilterer::VideoFilterer(const Side& side,
     }
   }
 
-  // HDR passthrough: for HLG content, convert transfer to PQ for HDR10 display.
-  // PQ content passes through unchanged.
-  if (hdr_passthrough_ && is_hdr_trc && dynamic_range_ == DynamicRange::HLG) {
-    if (avfilter_get_by_name("zscale")) {
-      post_filters.push_back("zscale=t=smpte2084");
-      log_info("HLG content; converting transfer to PQ for HDR10 display passthrough.");
-    } else {
-      log_warning("zscale filter missing; cannot convert HLG to PQ for HDR passthrough.");
+  // HDR passthrough: PQ content passes through unchanged; HLG needs transfer conversion to PQ.
+  if (hdr_passthrough_ && is_hdr_trc) {
+    if (dynamic_range_ == DynamicRange::HLG) {
+      if (avfilter_get_by_name("zscale")) {
+        post_filters.push_back("zscale=t=smpte2084");
+        log_info("HLG content; converting transfer to PQ for HDR10 display passthrough.");
+      } else {
+        log_warning("zscale filter missing; cannot convert HLG to PQ for HDR passthrough.");
+      }
+    } else if (dynamic_range_ == DynamicRange::PQ) {
+      log_info("PQ content; direct HDR10 display passthrough (no conversion needed).");
     }
   }
 
