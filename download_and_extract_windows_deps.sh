@@ -113,14 +113,14 @@ case "$ARG" in
     ffmpeg)
         download_ffmpeg
         ;;
-    sdl2)
-        download_sdl_library "SDL" "SDL2" "$TAG"
+    sdl3)
+        download_sdl_library "SDL" "SDL3" "$TAG"
         ;;
-    sdl2_ttf)
-        download_sdl_library "SDL_ttf" "SDL2_ttf" "$TAG"
+    sdl3_ttf)
+        download_sdl_library "SDL_ttf" "SDL3_ttf" "$TAG"
         ;;
     *)
-        echo "Usage: $0 {ffmpeg|sdl2|sdl2_ttf} [release_tag]"
+        echo "Usage: $0 {ffmpeg|sdl3|sdl3_ttf} [release_tag]"
         exit 1
         ;;
 esac

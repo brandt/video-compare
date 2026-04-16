@@ -44,17 +44,17 @@ jobs:
           set -euxo pipefail
           ./download_and_extract_windows_deps.sh ffmpeg
 
-      - name: Download SDL2
+      - name: Download SDL3
         shell: msys2 {0}
         run: |
           set -euxo pipefail
-          ./download_and_extract_windows_deps.sh sdl2 release-2.32.10
+          ./download_and_extract_windows_deps.sh sdl3 release-3.4.4
 
-      - name: Download SDL2_ttf
+      - name: Download SDL3_ttf
         shell: msys2 {0}
         run: |
           set -euxo pipefail
-          ./download_and_extract_windows_deps.sh sdl2_ttf release-2.24.0
+          ./download_and_extract_windows_deps.sh sdl3_ttf release-3.2.2
 
       - name: Build
         shell: msys2 {0}
@@ -213,8 +213,8 @@ jobs:
             libavutil-dev \
             libswscale-dev \
             libswresample-dev \
-            libsdl2-dev \
-            libsdl2-ttf-dev
+            libsdl3-dev \
+            libsdl3-ttf-dev
 
       - name: Build
         run: make -j$(nproc)
@@ -256,7 +256,7 @@ jobs:
 
       - name: Install dependencies via Homebrew
         run: |
-          brew install ffmpeg sdl2 sdl2_ttf
+          brew install ffmpeg sdl3 sdl3_ttf
 
       - name: Build
         run: make -j$(sysctl -n hw.ncpu)

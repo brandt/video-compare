@@ -1,6 +1,6 @@
 #pragma once
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_ttf.h>
+#include <SDL3/SDL.h>
+#include <SDL3_ttf/SDL_ttf.h>
 #include <array>
 #include <chrono>
 #include <climits>
@@ -314,8 +314,8 @@ class Display {
   SDL_Texture* video_texture_nn_{nullptr};
 
   SDL_Event event_;
-  int mouse_x_;
-  int mouse_y_;
+  float mouse_x_;
+  float mouse_y_;
   float wheel_sensitivity_;
 
   int saved_image_number_{1};

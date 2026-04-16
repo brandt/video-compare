@@ -10,7 +10,7 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
 }
-#include <SDL2/SDL.h>
+#include <SDL3/SDL.h>
 
 namespace {
 constexpr int kFrameThickness = 2;
@@ -65,13 +65,13 @@ static void draw_rect_thickness(SDL_Renderer* renderer, const SDL_Rect& rect, co
   if (!renderer || thickness <= 0) {
     return;
   }
-  SDL_Rect r = rect;
+  SDL_FRect r = {static_cast<float>(rect.x), static_cast<float>(rect.y), static_cast<float>(rect.w), static_cast<float>(rect.h)};
   for (int i = 0; i < thickness; ++i) {
-    SDL_RenderDrawRect(renderer, &r);
+    SDL_RenderRect(renderer, &r);
     r.x += 1;
     r.y += 1;
-    r.w = std::max(0, r.w - 2);
-    r.h = std::max(0, r.h - 2);
+    r.w = std::max(0.0f, r.w - 2);
+    r.h = std::max(0.0f, r.h - 2);
     if (r.w <= 0 || r.h <= 0) {
       break;
     }
@@ -100,18 +100,32 @@ static void draw_left_right_overlay(SDL_Renderer* renderer, const int w, const i
   for (int dx = -kHalfOuterPad; dx <= kHalfOuterPad; ++dx) {
     const int xi = x + dx;
     if (xi >= 0 && xi < w) {
-      SDL_RenderDrawLine(renderer, xi, 0, xi, h - 1);
+      SDL_RenderLine(renderer, xi, 0, xi, h - 1);
     }
   }
   SDL_SetRenderDrawColor(renderer, 255, 255, 255, 220);
   for (int dx = -kHalfDividerThickness; dx <= kHalfDividerThickness; ++dx) {
     const int xi = x + dx;
     if (xi >= 0 && xi < w) {
-      SDL_RenderDrawLine(renderer, xi, 0, xi, h - 1);
+      SDL_RenderLine(renderer, xi, 0, xi, h - 1);
     }
   }
 }
 }  // namespace
+
+static SDL_DisplayID display_id_for_index(int index) {
+  int count = 0;
+  SDL_DisplayID* displays = SDL_GetDisplays(&count);
+  if (!displays || count == 0) {
+    return SDL_GetPrimaryDisplay();
+  }
+  if (index < 0 || index >= count) {
+    index = 0;
+  }
+  SDL_DisplayID id = displays[index];
+  SDL_free(displays);
+  return id;
+}
 
 static void sdl_check_bool(const bool ok, const char* what) {
   if (!ok) {
@@ -137,18 +151,18 @@ ScopeWindow::ScopeWindow(const Type type, const int pane_width, const int pane_h
   const int window_width = pane_width_ * 2;
   const int window_height = pane_height_;
 
-  Uint32 window_flags = SDL_WINDOW_SHOWN;
-  window_flags |= SDL_WINDOW_RESIZABLE;
+  SDL_WindowFlags window_flags = SDL_WINDOW_RESIZABLE;
 
   if (always_on_top_) {
     window_flags |= SDL_WINDOW_ALWAYS_ON_TOP;
   }
 
   // Determine initial position based on display usable bounds and tool type index to avoid overlap.
-  int initial_position_x = SDL_WINDOWPOS_UNDEFINED_DISPLAY(display_number_);
-  int initial_position_y = SDL_WINDOWPOS_UNDEFINED_DISPLAY(display_number_);
+  const SDL_DisplayID scope_display_id = display_id_for_index(display_number_);
+  int initial_position_x = SDL_WINDOWPOS_UNDEFINED;
+  int initial_position_y = SDL_WINDOWPOS_UNDEFINED;
   SDL_Rect usable_bounds;
-  if (SDL_GetDisplayUsableBounds(display_number_, &usable_bounds) == 0) {
+  if (SDL_GetDisplayUsableBounds(scope_display_id, &usable_bounds)) {
     const int margin_pixels = 32;
     const int offset_step_pixels = 64;
     const int tool_type_index = static_cast<int>(ScopeWindow::index(type_));
@@ -166,9 +180,11 @@ ScopeWindow::ScopeWindow(const Type type, const int pane_width, const int pane_h
   base_title_ = window_title;
   last_window_title_ = window_title;
 
-  window_ = static_cast<SDL_Window*>(sdl_check_ptr(SDL_CreateWindow(window_title, initial_position_x, initial_position_y, window_width, window_height, window_flags), "SDL_CreateWindow"));
+  window_ = static_cast<SDL_Window*>(sdl_check_ptr(SDL_CreateWindow(window_title, window_width, window_height, window_flags), "SDL_CreateWindow"));
+  SDL_SetWindowPosition(window_, initial_position_x, initial_position_y);
 
-  renderer_ = static_cast<SDL_Renderer*>(sdl_check_ptr(SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC), "SDL_CreateRenderer"));
+  renderer_ = static_cast<SDL_Renderer*>(sdl_check_ptr(SDL_CreateRenderer(window_, NULL), "SDL_CreateRenderer"));
+  SDL_SetRenderVSync(renderer_, 1);
 
   present_frame(nullptr, false);
 
@@ -393,7 +409,7 @@ void ScopeWindow::present_frame(const AVFrame* filtered_frame, const bool allow_
   }
 
   if ((filtered_frame != nullptr) || (allow_cached && has_valid_texture_)) {
-    sdl_check_bool(SDL_RenderCopy(renderer_, texture_, nullptr, nullptr) == 0, "SDL_RenderCopy");
+    sdl_check_bool(SDL_RenderTexture(renderer_, texture_, nullptr, nullptr) == 0, "SDL_RenderTexture");
   }
 
   draw_left_right_overlay(renderer_, window_width_, window_height_, window_width_ / 2);
@@ -576,35 +592,36 @@ bool ScopeWindow::handle_event(const SDL_Event& event) {
   }
 
   switch (event.type) {
-    case SDL_WINDOWEVENT:
-      if (event.window.event == SDL_WINDOWEVENT_CLOSE) {
-        close_requested_ = true;
-      } else if (event.window.event == SDL_WINDOWEVENT_RESIZED || event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-        // Update internal sizing and reinitialize resources to match
-        const int new_width = event.window.data1;
-        const int new_height = event.window.data2;
+    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+      close_requested_ = true;
+      return true;
+    case SDL_EVENT_WINDOW_RESIZED:
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: {
+      // Update internal sizing and reinitialize resources to match
+      const int new_width = event.window.data1;
+      const int new_height = event.window.data2;
 
-        if (new_width > 0 && new_height > 0) {
-          window_width_ = new_width;
-          window_height_ = new_height;
+      if (new_width > 0 && new_height > 0) {
+        window_width_ = new_width;
+        window_height_ = new_height;
 
-          pane_width_ = std::max(1, window_width_ / 2);
-          pane_height_ = std::max(1, window_height_);
+        pane_width_ = std::max(1, window_width_ / 2);
+        pane_height_ = std::max(1, window_height_);
 
-          // Recreate resources on next cycle to avoid cross-thread SDL calls
-          {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            texture_reset_pending_ = true;
-            graph_reset_pending_ = true;
-          }
-          refresh_requested_.store(true, std::memory_order_relaxed);
+        // Recreate resources on next cycle to avoid cross-thread SDL calls
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          texture_reset_pending_ = true;
+          graph_reset_pending_ = true;
         }
+        refresh_requested_.store(true, std::memory_order_relaxed);
       }
       return true;
-    case SDL_MOUSEBUTTONDOWN:
-    case SDL_MOUSEBUTTONUP:
-    case SDL_MOUSEMOTION:
-    case SDL_MOUSEWHEEL:
+    }
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+    case SDL_EVENT_MOUSE_MOTION:
+    case SDL_EVENT_MOUSE_WHEEL:
       return true;
   }
 
