@@ -163,6 +163,8 @@ class Display {
   const AspectLockMode aspect_lock_mode_;
   AspectViewMode aspect_view_mode_;
   const bool use_10_bpc_;
+  bool hdr_display_available_{false};
+  float hdr_display_headroom_{1.0f};
   bool fast_input_alignment_;
   bool bilinear_texture_filtering_;
   int video_width_;
@@ -357,6 +359,7 @@ class Display {
   void apply_window_size_and_relayout(int target_w, int target_h, bool force_layout_refresh);
   void set_fullscreen(bool fullscreen);
   void resize_window_for_mode_switch();
+  void update_hdr_display_state();
   void handle_window_resize(bool reset_forced_size_guard = false, bool force_layout_refresh = false);
   void recreate_video_textures_for_current_mode();
 
@@ -521,6 +524,9 @@ class Display {
 
   std::pair<SDL_Rect, SDL_Rect> get_visible_rois_in_single_frame_coordinates() const;
   SDL_Rect get_visible_roi_in_single_frame_coordinates() const;
+
+  bool get_hdr_display_available() const;
+  float get_hdr_display_headroom() const;
 
   bool get_toggle_scope_window_requested(const ScopeWindow::Type type) const;
 

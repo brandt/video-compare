@@ -366,8 +366,17 @@ Display::Display(const int display_number,
 
   SDL_DestroySurface(icon_surface);
 
-  renderer_ = check_sdl(SDL_CreateRenderer(window_, NULL), "renderer");
+  {
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_RENDERER_CREATE_WINDOW_POINTER, window_);
+    SDL_SetNumberProperty(props, SDL_PROP_RENDERER_CREATE_OUTPUT_COLORSPACE_NUMBER, SDL_COLORSPACE_SRGB_LINEAR);
+    renderer_ = check_sdl(SDL_CreateRendererWithProperties(props), "renderer");
+    SDL_DestroyProperties(props);
+  }
   SDL_SetRenderVSync(renderer_, 1);
+
+  // Detect HDR display capability
+  update_hdr_display_state();
 
   SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
   SDL_RenderClear(renderer_);
@@ -884,6 +893,24 @@ void Display::update_content_window_layout() {
   const float content_h = static_cast<float>(std::max(1, video_height_)) * ((mode_ == Mode::VStack) ? 2.0F : 1.0F);
   video_to_window_width_factor_ = content_w / static_cast<float>(std::max(1, content_window_.w));
   video_to_window_height_factor_ = content_h / static_cast<float>(std::max(1, content_window_.h));
+}
+
+void Display::update_hdr_display_state() {
+  bool hdr_available = false;
+  float hdr_headroom = 1.0f;
+
+  SDL_PropertiesID window_props = SDL_GetWindowProperties(window_);
+  if (window_props != 0) {
+    hdr_available = SDL_GetBooleanProperty(window_props, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false);
+    hdr_headroom = SDL_GetFloatProperty(window_props, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0f);
+  }
+
+  if (hdr_available != hdr_display_available_) {
+    hdr_display_available_ = hdr_available;
+    hdr_display_headroom_ = hdr_headroom;
+
+    std::cerr << "HDR display " << (hdr_available ? "available" : "not available") << " (headroom: " << hdr_headroom << ")" << std::endl;
+  }
 }
 
 void Display::handle_window_resize(const bool reset_forced_size_guard, const bool force_layout_refresh) {
@@ -3141,6 +3168,9 @@ void Display::handle_event(const SDL_Event& event) {
     case SDL_EVENT_WINDOW_MOUSE_ENTER:
       mouse_is_inside_window_ = true;
       break;
+    case SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
+      update_hdr_display_state();
+      break;
     case SDL_EVENT_WINDOW_SHOWN:
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -3680,6 +3710,14 @@ void Display::handle_event(const SDL_Event& event) {
     default:
       break;
   }
+}
+
+bool Display::get_hdr_display_available() const {
+  return hdr_display_available_;
+}
+
+float Display::get_hdr_display_headroom() const {
+  return hdr_display_headroom_;
 }
 
 bool Display::get_quit() const {

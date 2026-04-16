@@ -141,22 +141,94 @@ The frame ring already stores decoded frames. An additional "tonemapped frame" c
 
 **Risk:** low. Cache invalidation is straightforward — invalidate on filter-graph reinit, npl change, or boost_tone change. No visual impact since the cached result is identical to a fresh computation.
 
-## Optimization #6: GPU-side tone mapping (Metal shader)
+## Optimization #6: SDL3 HDR passthrough (replaces custom GPU tonemap)
 
-**CPU impact: moves entire tonemap cost off CPU (~2.4 cores freed)**
-**Visual impact: depends on shader precision**
+**CPU impact: eliminates entire tonemap cost (~2.4 cores freed)**
+**Visual impact: more faithful HDR rendering — display sees native HDR signal**
 
-Upload the raw yuv420p10le frame to a Metal texture and perform the BT.2020 HLG/PQ -> BT.709 sRGB conversion in a compute or fragment shader. Metal on Apple Silicon has native 16-bit float support and the GPU is otherwise underutilized during playback (profile shows minimal Metal/GPU time). This would eliminate the entire CPU-side tonemap pipeline (zscale, swscale conversions, FormatConverter).
+Instead of writing a custom Metal tonemap shader, leverage SDL3's built-in HDR rendering pipeline. SDL3 3.4.4 (already in use) has full HDR support: HDR-aware renderer, texture colorspace metadata, display HDR detection, and a built-in GPU-side tonemap (Chrome-derived algorithm) for when content headroom exceeds display capability.
 
-**Risk:** high implementation effort. Shader must match zscale's precision for the tool to remain trustworthy — any per-pixel difference between CPU and GPU tonemap would show up as a false diff in the comparison view. Also requires a fallback path for non-Metal platforms (Linux, older macOS). Most invasive option and only justified if the other optimizations are insufficient.
+### Current state (what needs to change)
+
+| component | current | HDR passthrough |
+|---|---|---|
+| renderer | `SDL_CreateRenderer(window_, NULL)` — defaults to `SDL_COLORSPACE_SRGB` | `SDL_CreateRendererWithProperties` with `SDL_COLORSPACE_SRGB_LINEAR` |
+| textures | `SDL_CreateTexture(..., SDL_PIXELFORMAT_ARGB2101010, ...)` — no colorspace | `SDL_CreateTextureWithProperties` with `SDL_COLORSPACE_HDR10`, headroom from MaxCLL |
+| filter chain | always tonemaps HDR → SDR via zscale | skip tonemap when display is HDR; pass PQ/BT.2020 through |
+| format converter | outputs rgb24/rgb48le (SDR) | outputs 10-bit packed (ARGB2101010) retaining HDR metadata |
+| display detection | none | `SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN` + `SDL_EVENT_WINDOW_HDR_STATE_CHANGED` |
+
+### Architecture
+
+```
+HDR display detected?
+  ├─ YES (HDR passthrough):
+  │    decoder(yuv420p10le, PQ/HLG, BT.2020)
+  │      → [HLG only: lightweight zscale=t=smpte2084 to convert HLG→PQ]
+  │      → FormatConverter: yuv420p10le → packed ARGB2101010
+  │      → SDL HDR10 texture (PQ, BT.2020, headroom from MaxCLL)
+  │      → Metal layer: wantsExtendedDynamicRangeContent=YES
+  │      → Display renders natively (GPU handles excess headroom)
+  │
+  └─ NO (existing SDR tonemap, unchanged):
+       decoder(yuv420p10le, PQ/HLG, BT.2020)
+         → VideoFilterer: zscale(p=bt709:t=iec61966-2-1:m=bt709)
+         → FormatConverter: → rgb24/rgb48le
+         → SDL SDR texture
+         → Display renders as SDR
+```
+
+### Implementation plan
+
+**Phase 1: HDR renderer + display detection**
+- Replace `SDL_CreateRenderer` with `SDL_CreateRendererWithProperties` using `SDL_COLORSPACE_SRGB_LINEAR` output colorspace.
+- Query `SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN` after window creation.
+- Handle `SDL_EVENT_WINDOW_HDR_STATE_CHANGED` to track HDR state dynamically.
+- Store `hdr_display_available_` flag in Display class.
+- This phase alone changes nothing visually — it just detects capability.
+
+**Phase 2: HDR texture creation**
+- When HDR display is available AND content is HDR, create textures via `SDL_CreateTextureWithProperties` with:
+  - `SDL_PIXELFORMAT_ARGB2101010` (already used for 10-bit mode)
+  - `SDL_COLORSPACE_HDR10`
+  - `SDL_PROP_TEXTURE_CREATE_HDR_HEADROOM_FLOAT` from MaxCLL/peak luminance
+  - `SDL_PROP_TEXTURE_CREATE_SDR_WHITE_POINT_FLOAT` = 100.0 (standard HDR10)
+- SDR textures remain unchanged.
+- Texture recreation needed when HDR state changes (window moves between displays).
+
+**Phase 3: Skip CPU tonemap**
+- In VideoFilterer: when HDR passthrough is active for this side, skip `must_tonemap` entirely — no zscale, no format conversion, no tonemap filter. Just fps + copy.
+- For HLG content: insert a lightweight `zscale=t=smpte2084` to convert HLG transfer to PQ (required because SDL's HDR10 path expects PQ). This is much cheaper than the full tonemap — no primaries conversion, no matrix change, just a per-pixel transfer curve remap.
+- FormatConverter outputs ARGB2101010 (packed 10-bit) instead of rgb24.
+
+**Phase 4: Dynamic fallback**
+- Handle `SDL_EVENT_WINDOW_HDR_STATE_CHANGED`: when the window moves from an HDR display to SDR (or vice versa), reinitialize the filter chain and textures.
+- This triggers VideoFilterer reinit (adds/removes tonemap), texture recreation, and FormatConverter reinit.
+
+### Design decisions
+
+**Mixed HDR+SDR comparison (one side HDR, other SDR):**
+When comparing an HDR encode vs SDR encode of the same content on an HDR display, the HDR side renders at full headroom while the SDR side renders at SDR white point (1.0 EDR). This is visually accurate — it shows the real dynamic range difference between the two encodes, which is exactly what the tool exists to reveal. No special handling needed; SDL's renderer correctly composites SDR textures at SDR brightness within an HDR compositor.
+
+**HLG content:**
+SDL's HDR10 path expects PQ (SMPTE 2084) transfer. HLG content must be converted to PQ first. A single `zscale=t=smpte2084` does this as a per-pixel LUT operation — fast compared to full tonemap because:
+- No primaries conversion (stays BT.2020)
+- No matrix conversion (stays same YUV encoding)
+- Just transfer curve remap (HLG OOTF → PQ EOTF)
+Profile shows zimg's ToLinearLut + ToGammaLut are the hot functions; this would be roughly half the current zscale cost since we skip primaries/matrix.
+
+**Headroom metadata:**
+`SDL_PROP_TEXTURE_CREATE_HDR_HEADROOM_FLOAT` should be `MaxCLL / SDR_white_point`. If MaxCLL = 1000 nits, headroom = 10.0. SDL's Metal backend compares texture headroom vs display headroom and applies GPU tonemap only when content exceeds display capability. If MaxCLL metadata is absent, use a conservative default (e.g., 10.0 for PQ, 3.0 for HLG).
+
+**Risk:** moderate implementation effort (touches display, filterer, format_converter, and event handling). But no custom shaders — SDL handles the GPU rendering. Visual output is more faithful than CPU tonemap because the display sees the actual HDR signal. Fallback to CPU tonemap on SDR displays preserves existing behavior exactly.
 
 ## Recommended priority
 
-| # | Optimization              | Est. CPU savings | Visual risk          | Effort  | Status
-|---|---------------------------|------------------|----------------------|---------|-------
-| 1 | Drop `format=rgb48`       | ~0.78 core (measured) | none            | trivial | **done**
-| 2 | zscale output format      |        ~0.3 core | low (verify dither)  | small   |
-| 3 | Fix colorspace mismatch   |       negligible | correctness fix      | small   |
-| 4 | Tonemap curve choice      |        ~0.2 core | intentional change   | small (expose CLI flag) |
-| 5 | Cache tonemapped frames   |         variable | none                 | moderate |
-| 6 | GPU tonemap               |       ~2.4 cores | precision-dependent  | large   |
+| # | Optimization              | Est. CPU savings       | Visual risk          | Effort   | Status
+|---|---------------------------|------------------------|----------------------|----------|-------
+| 1 | Drop `format=rgb48`       | ~0.78 core (measured)  | none                 | trivial  | **done**
+| 2 | zscale output format + convert to display format in filter | ~0.9 core (measured) | low (verify dither) | small |
+| 3 | Fix colorspace mismatch   | negligible             | correctness fix      | small    |
+| 4 | Tonemap curve choice      | ~0.2 core              | intentional change   | small (expose CLI flag) |
+| 5 | Cache tonemapped frames   | variable               | none                 | moderate |
+| 6 | SDL3 HDR passthrough      | ~2.4 cores (all tonemap) | more faithful HDR  | moderate |
