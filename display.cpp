@@ -498,7 +498,7 @@ void Display::recreate_video_textures_for_current_mode() {
   const int tex_w = mode_ == Mode::HStack ? video_width_ * 2 : video_width_;
   const int tex_h = mode_ == Mode::VStack ? video_height_ * 2 : video_height_;
   const bool use_hdr_textures = hdr_display_available_ && hdr_passthrough_;
-  const SDL_PixelFormat pixel_format = requires_10_bpc() ? SDL_PIXELFORMAT_ARGB2101010 : SDL_PIXELFORMAT_RGB24;
+  const SDL_PixelFormat pixel_format = (requires_10_bpc() || hdr_passthrough_) ? SDL_PIXELFORMAT_ARGB2101010 : SDL_PIXELFORMAT_RGB24;
 
   auto create_video_texture = [&](SDL_ScaleMode scale_mode, const std::string& label) {
     SDL_Texture* tex;
@@ -2344,7 +2344,7 @@ void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right
   AVFrame* right_selected = create_frame(selection_rect.w, selection_rect.h, right_frame);
   AVFrame* concatenated = create_frame(selection_rect.w * 2, selection_rect.h, left_frame);
 
-  const int pixel_size = requires_10_bpc() ? 3 * sizeof(uint16_t) : 3;
+  const int pixel_size = hdr_passthrough_ ? 4 : (requires_10_bpc() ? 3 * sizeof(uint16_t) : 3);
 
   for (int y = 0; y < selection_rect.h; y++) {
     const int src_y = selection_rect.y + y;
@@ -2591,7 +2591,8 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
             update_texture(&tex_render_quad_right, right_planes_[0] + start_right, pitches_right[0], "right update (10 bpc, subtraction mode)");
           } else {
-            update_texture(&tex_render_quad_right, diff_planes_[0] + start_right * 3, diff_pitches_[0], "right update (subtraction mode)");
+            const int diff_bpp = requires_10_bpc() ? 6 : (hdr_passthrough_ ? 4 : 3);
+            update_texture(&tex_render_quad_right, diff_planes_[0] + start_right * diff_bpp, diff_pitches_[0], "right update (subtraction mode)");
           }
         } else {
           if (requires_10_bpc()) {
@@ -2599,7 +2600,8 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
             update_texture(&tex_render_quad_right, right_planes_[0] + start_right, pitches_right[0], "right update (10 bpc, video mode)");
           } else {
-            update_texture(&tex_render_quad_right, planes_right[0] + start_right * 3, pitches_right[0], "right update (video mode)");
+            const int bpp = hdr_passthrough_ ? 4 : 3;
+            update_texture(&tex_render_quad_right, planes_right[0] + start_right * bpp, pitches_right[0], "right update (video mode)");
           }
         }
       }

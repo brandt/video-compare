@@ -131,7 +131,10 @@ static bool produces_same_decoded_video(const VideoCompareConfig& config) {
 }
 
 static inline AVPixelFormat determine_pixel_format(const VideoCompareConfig& config, const bool hdr_passthrough = false) {
-  return (config.use_10_bpc || hdr_passthrough) ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
+  if (hdr_passthrough) {
+    return AV_PIX_FMT_X2RGB10LE;
+  }
+  return config.use_10_bpc ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
 }
 
 static bool probe_hdr_display(const int display_number) {
@@ -654,6 +657,19 @@ void VideoCompare::format_convert_video(const Side& side) {
           throw std::runtime_error("Allocating converted picture");
         }
         (*format_converters_[side])(frame_filtered.get(), frame_converted.get());
+
+        // X2RGB10LE has 2 unused high bits (= 0 = transparent in ARGB2101010).
+        // Set them to fully opaque for correct SDL rendering.
+        if (hdr_passthrough_active_ && frame_converted->format == AV_PIX_FMT_X2RGB10LE) {
+          uint32_t* pixels = reinterpret_cast<uint32_t*>(frame_converted->data[0]);
+          const int stride = frame_converted->linesize[0] / sizeof(uint32_t);
+          for (int y = 0; y < frame_converted->height; y++) {
+            for (int x = 0; x < frame_converted->width; x++) {
+              pixels[x] |= 0xC0000000u;
+            }
+            pixels += stride;
+          }
+        }
 
         converted_frame_queues_[side]->push(std::move(frame_converted));
       } else if (filtered_frame_queues_[side]->is_stopped() || is_seeking(side)) {

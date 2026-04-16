@@ -227,33 +227,37 @@ Profile shows zimg's ToLinearLut + ToGammaLut are the hot functions; this would 
 Phases 1–3 implemented and functional. HDR content renders on HDR displays via native passthrough. Key findings:
 
 **What was implemented:**
+
 - **Phase 1 (display.cpp):** Renderer created with `SDL_CreateRendererWithProperties` + `SDL_COLORSPACE_SRGB_LINEAR`. HDR display detection via `SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN` and `SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT`. Dynamic tracking via `SDL_EVENT_WINDOW_HDR_STATE_CHANGED`. Public API: `get_hdr_display_available()`, `get_hdr_display_headroom()`, `set_hdr_passthrough()`.
-- **Phase 2 (display.cpp):** HDR textures created with `SDL_CreateTextureWithProperties` using `SDL_COLORSPACE_HDR10`, `SDL_PIXELFORMAT_ARGB2101010`, headroom from display. Buffer reallocation on passthrough state change. All `use_10_bpc_` display paths updated to `requires_10_bpc()` which returns `use_10_bpc_ || hdr_passthrough_`.
-- **Phase 3 (video_compare.cpp, video_filterer.cpp):** `probe_hdr_display()` called before filterer construction. `hdr_passthrough` flag passed to `VideoFilterer` — disables `must_tonemap`. For HLG content, `zscale=t=smpte2084` inserted for HLG→PQ transfer conversion (SDL HDR10 expects PQ). FormatConverter output forced to `AV_PIX_FMT_RGB48LE` when HDR passthrough active.
-- **Bug fix (display.cpp):** ARGB2101010 packing now sets alpha bits to fully opaque (`3u << 30`) — without this, the 2-bit alpha was 0 = transparent, making the texture invisible.
+- **Phase 2 (display.cpp):** HDR textures created with `SDL_CreateTextureWithProperties` using `SDL_COLORSPACE_HDR10`, `SDL_PIXELFORMAT_ARGB2101010`, headroom from display. Buffer reallocation on passthrough state change. `requires_10_bpc()` refactored to mean "needs RGB48LE→ARGB2101010 packing" (true for `--10-bpc` without HDR passthrough); HDR passthrough uses `AV_PIX_FMT_X2RGB10LE` (already packed, direct upload).
+- **Phase 3 (video_compare.cpp, video_filterer.cpp):** `probe_hdr_display()` called before filterer construction. Content-aware activation: HDR passthrough only when display supports HDR AND all video sides have HDR content. `hdr_passthrough` flag passed to `VideoFilterer` — disables `must_tonemap`. For HLG content, `zscale=t=smpte2084` inserted for HLG→PQ transfer conversion. PQ content passes through with no conversion. FormatConverter outputs `AV_PIX_FMT_X2RGB10LE` (4 bytes/pixel packed 10-bit RGB) when HDR passthrough active. Mixed HDR+SDR comparisons fall back to CPU tonemap.
+- **Bug fixes:**
+  - ARGB2101010 packing now sets alpha bits to fully opaque (`3u << 30`) — without this, the 2-bit alpha was 0 = transparent, making the texture invisible.
+  - Right-side byte offsets in split-view upload use correct bytes-per-pixel (4 for X2RGB10LE, not hardcoded 3 for RGB24).
+  - `pixel_size` for screenshot/selection memcpy accounts for X2RGB10LE format.
+  - Alpha bits OR'd into X2RGB10LE frame data in `format_convert_video` (the X bits in X2RGB10LE are 0 by default = transparent in ARGB2101010).
 
 **Measured performance (4K 10-bit HLG BT.2020):**
 
-| run                       | user@5s | user@15s | Δ/10s (steady) | RSS@15s |
-|---------------------------|--------:|---------:|---------------:|--------:|
-| Original (full tonemap)   |   25.86 |    82.27 |     5.64 cores | 4.28 GB |
-| Opt #1 (drop format=rgb48)|   22.22 |    70.78 |     4.86 cores | 4.17 GB |
-| HDR passthrough (HLG)     |   19.68 |    73.87 |     5.42 cores | 7.54 GB |
-| True SDR baseline         |   15.27 |    47.40 |     3.21 cores | 4.07 GB |
+| run                             | user@5s | user@15s | Δ/10s (steady) | RSS@15s |
+|---------------------------------|--------:|---------:|---------------:|--------:|
+| Original (full tonemap)         |   25.86 |    82.27 |     5.64 cores | 4.28 GB |
+| Opt #1 (drop format=rgb48)      |   22.22 |    70.78 |     4.86 cores | 4.17 GB |
+| HDR passthrough (RGB48LE, old)  |   19.68 |    73.87 |     5.42 cores | 7.37 GB |
+| **HDR passthrough (X2RGB10LE)** |   20.07 |    73.61 |     5.35 cores | 4.65 GB |
+| SDR baseline                    |   15.27 |    47.40 |     3.21 cores | 4.07 GB |
 
-**Analysis:** HDR passthrough startup is 24% faster than original (19.68 vs 25.86 at 5s), but steady-state is only 4% better (5.42 vs 5.64 cores). The HLG→PQ `zscale=t=smpte2084` conversion is still a significant CPU cost (~1 core), and the forced 10-bit pipeline (RGB48LE + ARGB2101010 packing) adds overhead vs the 8-bit SDR path. RSS balloons to 7.54 GB because frame rings store 10-bit data for all content (both sides). For **PQ content** (no HLG→PQ step needed), steady-state would be closer to the SDR baseline (~3.2 cores).
+**Analysis:** Switching from RGB48LE to X2RGB10LE saved **2.7 GB RSS** (-37%) with no CPU change — frame rings now store 4 bytes/pixel instead of 6, and `convert_to_packed_10_bpc` is skipped entirely. vs original full tonemap: **-5% CPU** (5.64→5.35 cores), **+9% RSS** (4.28→4.65 GB), with visually faithful HDR output. SDR is unaffected (47.43s = baseline match).
 
-### Remaining work before shippable
+The remaining ~2.1-core steady-state gap vs SDR is the HLG→PQ `zscale=t=smpte2084`. For PQ content (no HLG→PQ step), steady-state would approach the SDR baseline (~3.2 cores).
 
-1. **Per-side HDR passthrough** — currently `hdr_passthrough_active_` is a global flag based on display capability. SDR content is forced through the 10-bit pipeline unnecessarily, inflating RSS and hurting SDR render quality. Should be per-side: only sides with HDR content (is_hdr_trc) use HDR passthrough. SDR sides stay on the 8-bit RGB24 pipeline.
+### Remaining work
 
-2. **SDR texture colorspace tagging** — with the `SDL_COLORSPACE_SRGB_LINEAR` renderer, SDR textures need explicit `SDL_COLORSPACE_SRGB` so SDL applies correct gamma. Currently SDR highlights and saturation are wrong.
+1. **Phase 4: Dynamic fallback** — reinitialize filter chain and textures when `SDL_EVENT_WINDOW_HDR_STATE_CHANGED` fires (window moves between HDR and SDR displays). Currently HDR state is only checked at startup.
 
-3. **PQ content passthrough** — for PQ (SMPTE 2084) content, skip zscale entirely. Currently only HLG gets the special case. PQ content is already in the correct transfer for SDL_COLORSPACE_HDR10. This would bring steady-state down to ~3.2 cores.
+2. **Headroom from content metadata** — currently uses `hdr_display_headroom_` from the display. Should use `MaxCLL / 100.0` from the content when available, so SDL can tone-map content that exceeds display headroom.
 
-4. **Phase 4: Dynamic fallback** — reinitialize filter chain and textures when `SDL_EVENT_WINDOW_HDR_STATE_CHANGED` fires (window moves between HDR and SDR displays). Currently HDR state is only checked at startup.
-
-5. **Headroom from content metadata** — currently uses `hdr_display_headroom_` from the display. Should use `MaxCLL / 100.0` from the content when available, so SDL can tone-map content that exceeds display headroom.
+3. **SDR texture colorspace tagging** — with the `SDL_COLORSPACE_SRGB_LINEAR` renderer, explicitly tag SDR textures with `SDL_COLORSPACE_SRGB` for correct gamma handling.
 
 ## Recommended priority
 
@@ -264,4 +268,4 @@ Phases 1–3 implemented and functional. HDR content renders on HDR displays via
 | 3 | Fix colorspace mismatch   | negligible             | correctness fix      | small    | **done** (m=bt709 in zscale)
 | 4 | Tonemap curve choice      | ~0.2 core              | intentional change   | small (expose CLI flag) |
 | 5 | Cache tonemapped frames   | variable               | none                 | moderate |
-| 6 | SDL3 HDR passthrough      | ~0.2 core HLG (measured), ~2.4 PQ (est.) | more faithful HDR | moderate | **in progress**
+| 6 | SDL3 HDR passthrough      | ~0.3 core HLG (measured), ~2.4 PQ (est.) | more faithful HDR | moderate | **done** (phases 1-3)

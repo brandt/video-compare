@@ -167,8 +167,9 @@ class Display {
   float hdr_display_headroom_{1.0f};
   bool hdr_passthrough_{false};
 
-  // HDR passthrough requires the 10-bit pipeline regardless of --10-bpc flag
-  bool requires_10_bpc() const { return use_10_bpc_ || hdr_passthrough_; }
+  // True when frames arrive as RGB48LE and need convert_to_packed_10_bpc before upload.
+  // HDR passthrough uses X2RGB10LE (already packed 4 bytes/pixel) — no conversion needed.
+  bool requires_10_bpc() const { return use_10_bpc_ && !hdr_passthrough_; }
   bool fast_input_alignment_;
   bool bilinear_texture_filtering_;
   int video_width_;
