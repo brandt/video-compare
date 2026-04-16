@@ -3,6 +3,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
 #include "ffmpeg.h"
 #include "string_utils.h"
 #include "video_filter_context.h"
@@ -58,11 +61,13 @@ VideoFilterer::VideoFilterer(const Side& side,
                              const std::string& custom_color_primaries,
                              const std::string& custom_color_trc,
                              const VideoFilterContext* video_filter_context,
-                             const bool disable_auto_filters)
+                             const bool disable_auto_filters,
+                             const AVPixelFormat output_pixel_format)
     : SideAware(side),
       demuxer_(demuxer),
       video_decoder_(video_decoder),
       tone_mapping_mode_(tone_mapping_mode),
+      output_pixel_format_(output_pixel_format),
       width_(video_decoder->width()),
       height_(video_decoder->height()),
       pixel_format_(video_decoder->pixel_format()),
@@ -226,14 +231,19 @@ VideoFilterer::VideoFilterer(const Side& side,
         }
 
         post_filters.push_back(string_sprintf("tonemap=clip:param=%.5f", tone_adjustment));
-        post_filters.push_back(string_sprintf("zscale=p=%s:t=%s", display_primaries.c_str(), display_trc.c_str()));
+        post_filters.push_back(string_sprintf("zscale=p=%s:t=%s:m=%s", display_primaries.c_str(), display_trc.c_str(), display_primaries.c_str()));
       } else {
         if (tone_mapping_mode == ToneMapping::Auto) {
           // peak luma gets injected from within init_filters() during auto-mode
-          post_filters.push_back(string_sprintf("zscale=p=%s:t=%s:npl=%%d", display_primaries.c_str(), display_trc.c_str()));
+          post_filters.push_back(string_sprintf("zscale=p=%s:t=%s:m=%s:npl=%%d", display_primaries.c_str(), display_trc.c_str(), display_primaries.c_str()));
         } else {
-          post_filters.push_back(string_sprintf("zscale=p=%s:t=%s:npl=%d", display_primaries.c_str(), display_trc.c_str(), peak_luminance_nits_));
+          post_filters.push_back(string_sprintf("zscale=p=%s:t=%s:m=%s:npl=%d", display_primaries.c_str(), display_trc.c_str(), display_primaries.c_str(), peak_luminance_nits_));
         }
+      }
+
+      const char* output_format_name = av_get_pix_fmt_name(output_pixel_format_);
+      if (output_format_name != nullptr) {
+        post_filters.push_back(string_sprintf("format=%s", output_format_name));
       }
     } else {
       log_warning(string_sprintf("Cannot add tone mapping filters: %s", string_join(warnings, ", ").c_str()));
