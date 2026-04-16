@@ -228,8 +228,6 @@ VideoFilterer::VideoFilterer(const Side& side,
         post_filters.push_back(string_sprintf("tonemap=clip:param=%.5f", tone_adjustment));
         post_filters.push_back(string_sprintf("zscale=p=%s:t=%s", display_primaries.c_str(), display_trc.c_str()));
       } else {
-        post_filters.push_back("format=rgb48");
-
         if (tone_mapping_mode == ToneMapping::Auto) {
           // peak luma gets injected from within init_filters() during auto-mode
           post_filters.push_back(string_sprintf("zscale=p=%s:t=%s:npl=%%d", display_primaries.c_str(), display_trc.c_str()));
