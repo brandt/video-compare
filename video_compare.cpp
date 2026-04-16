@@ -1,4 +1,5 @@
 #include "video_compare.h"
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -129,8 +130,29 @@ static bool produces_same_decoded_video(const VideoCompareConfig& config) {
   return std::all_of(config.right_videos.begin(), config.right_videos.end(), matches_left_decode_source);
 }
 
-static inline AVPixelFormat determine_pixel_format(const VideoCompareConfig& config) {
-  return config.use_10_bpc ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
+static inline AVPixelFormat determine_pixel_format(const VideoCompareConfig& config, const bool hdr_passthrough = false) {
+  return (config.use_10_bpc || hdr_passthrough) ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
+}
+
+static bool probe_hdr_display(const int display_number) {
+  // Ensure SDL video is initialized so we can query display properties.
+  // This is idempotent — SDL_Init can be called multiple times.
+  if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+    return false;
+  }
+
+  int num_displays = 0;
+  SDL_DisplayID* displays = SDL_GetDisplays(&num_displays);
+  if (displays == nullptr || num_displays == 0) {
+    SDL_free(displays);
+    return false;
+  }
+
+  const int index = (display_number >= 0 && display_number < num_displays) ? display_number : 0;
+  SDL_PropertiesID props = SDL_GetDisplayProperties(displays[index]);
+  SDL_free(displays);
+
+  return props != 0 && SDL_GetBooleanProperty(props, SDL_PROP_DISPLAY_HDR_ENABLED_BOOLEAN, false);
 }
 
 static inline int determine_sws_flags(const bool fast) {
@@ -192,12 +214,20 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
     video_filter_context.add(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.color_trc);
   }
 
+  // Probe HDR display before constructing filterers — determines whether we can skip tonemapping
+  const bool hdr_display = probe_hdr_display(config.display_number);
+  hdr_passthrough_active_ = hdr_display;
+
+  if (hdr_display) {
+    std::cerr << "HDR display detected; HDR content will use native passthrough." << std::endl;
+  }
+
   // Initialize filterers using VideoFilterContext for consistent auto-filter determination
-  const AVPixelFormat output_pixel_format = determine_pixel_format(config);
+  const AVPixelFormat output_pixel_format = determine_pixel_format(config, hdr_passthrough_active_);
 
   install_processor(video_filterers_, ReadyToSeek::ProcessorThread::Filterer, LEFT,
                     std::make_unique<VideoFilterer>(LEFT, demuxers_[LEFT].get(), video_decoders_[LEFT].get(), config.left.tone_mapping_mode, config.left.boost_tone, config.left.video_filters, config.left.color_space,
-                                                    config.left.color_range, config.left.color_primaries, config.left.color_trc, &video_filter_context, config.disable_auto_filters, output_pixel_format));
+                                                    config.left.color_range, config.left.color_primaries, config.left.color_trc, &video_filter_context, config.disable_auto_filters, output_pixel_format, hdr_passthrough_active_));
 
   // For each right video, use VideoFilterContext for auto-filter determination
   for (size_t i = 0; i < config.right_videos.size(); ++i) {
@@ -205,8 +235,9 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
     Side right_side = Side::Right(i);
 
     install_processor(video_filterers_, ReadyToSeek::ProcessorThread::Filterer, right_side,
-                      std::make_unique<VideoFilterer>(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.tone_mapping_mode, right_config.boost_tone, right_config.video_filters, right_config.color_space,
-                                                      right_config.color_range, right_config.color_primaries, right_config.color_trc, &video_filter_context, config.disable_auto_filters, output_pixel_format));
+                      std::make_unique<VideoFilterer>(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.tone_mapping_mode, right_config.boost_tone, right_config.video_filters,
+                                                      right_config.color_space, right_config.color_range, right_config.color_primaries, right_config.color_trc, &video_filter_context, config.disable_auto_filters, output_pixel_format,
+                                                      hdr_passthrough_active_));
   }
 
   // Calculate max dimensions from all videos
@@ -332,6 +363,7 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
   display_ = std::make_unique<Display>(config_.display_number, config_.display_mode, config_.verbose, config_.fit_window_to_usable_bounds, config_.high_dpi_allowed, config_.aspect_lock_mode, config_.aspect_view_mode, config_.use_10_bpc,
                                        use_fast_input_alignment(config_), config_.bilinear_texture_filtering, config_.window_size, max_width_, max_height_, shortest_duration_, config_.wheel_sensitivity, config_.start_in_subtraction_mode,
                                        config_.start_in_fullscreen, config_.left.file_name, right_file_name);
+  display_->set_hdr_passthrough(hdr_passthrough_active_);
   display_->set_num_right_videos(right_video_info_.size());
   display_->set_active_right_index(active_right_index_);
   display_->update_metadata(left_video_metadata_, right_video_info_[active_right].metadata);
@@ -345,7 +377,7 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
 }
 
 void VideoCompare::recreate_format_converter_for_side(const Side& side, const int sws_flags) {
-  const AVPixelFormat output_pixel_format = determine_pixel_format(config_);
+  const AVPixelFormat output_pixel_format = determine_pixel_format(config_, hdr_passthrough_active_);
 
   const auto& filterer = video_filterers_.at(side);
   ready_to_seek_.init(ReadyToSeek::ProcessorThread::Converter, side);

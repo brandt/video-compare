@@ -264,3 +264,5 @@ The full cost of the `628eab8` "regression" — **all of it** — is HDR tonemap
 - Investigate moving tonemap to GPU (Metal shader) — avoids avfilter/zimg/libswscale entirely.
 - Skip the tonemap chain when the display is HDR-capable and the content's primaries/transfer already match the display.
 - No action needed on the ~600 MB RSS image gap — it's fixed-cost dylib mapping, not working set.
+
+Detailed tonemap optimization analysis and implementation progress: see [Tonemap-optimization.md](Tonemap-optimization.md).

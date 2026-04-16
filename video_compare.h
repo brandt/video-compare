@@ -215,6 +215,7 @@ class VideoCompare {
 
   const VideoCompareConfig& config_;
   const bool same_decoded_video_both_sides_;
+  bool hdr_passthrough_active_{false};
 
   const Display::Loop auto_loop_mode_;
   const size_t frame_buffer_size_;

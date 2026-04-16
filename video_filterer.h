@@ -34,7 +34,8 @@ class VideoFilterer : public SideAware {
                 const std::string& custom_color_trc,
                 const VideoFilterContext* video_filter_context,
                 const bool disable_auto_filters,
-                const AVPixelFormat output_pixel_format = AV_PIX_FMT_NONE);
+                const AVPixelFormat output_pixel_format = AV_PIX_FMT_NONE,
+                const bool hdr_passthrough = false);
   ~VideoFilterer();
 
   void init();
@@ -76,6 +77,7 @@ class VideoFilterer : public SideAware {
   const VideoDecoder* video_decoder_;
   const ToneMapping tone_mapping_mode_;
   const AVPixelFormat output_pixel_format_;
+  const bool hdr_passthrough_;
 
   std::string pre_filter_description_;
   std::string post_filter_description_;

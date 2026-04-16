@@ -62,12 +62,14 @@ VideoFilterer::VideoFilterer(const Side& side,
                              const std::string& custom_color_trc,
                              const VideoFilterContext* video_filter_context,
                              const bool disable_auto_filters,
-                             const AVPixelFormat output_pixel_format)
+                             const AVPixelFormat output_pixel_format,
+                             const bool hdr_passthrough)
     : SideAware(side),
       demuxer_(demuxer),
       video_decoder_(video_decoder),
       tone_mapping_mode_(tone_mapping_mode),
       output_pixel_format_(output_pixel_format),
+      hdr_passthrough_(hdr_passthrough),
       width_(video_decoder->width()),
       height_(video_decoder->height()),
       pixel_format_(video_decoder->pixel_format()),
@@ -147,7 +149,7 @@ VideoFilterer::VideoFilterer(const Side& side,
 
   dynamic_range_ = video_decoder->infer_dynamic_range(custom_color_trc);
   const bool is_hdr_trc = dynamic_range_ != DynamicRange::Standard;
-  const bool must_tonemap = tone_mapping_mode == ToneMapping::FullRange || tone_mapping_mode == ToneMapping::Relative || (tone_mapping_mode == ToneMapping::Auto && is_hdr_trc);
+  const bool must_tonemap = !hdr_passthrough_ && (tone_mapping_mode == ToneMapping::FullRange || tone_mapping_mode == ToneMapping::Relative || (tone_mapping_mode == ToneMapping::Auto && is_hdr_trc));
 
   // resolve initial peak luminance
   peak_luminance_nits_ = video_decoder->safe_peak_luminance_nits(dynamic_range_);
@@ -247,6 +249,17 @@ VideoFilterer::VideoFilterer(const Side& side,
       }
     } else {
       log_warning(string_sprintf("Cannot add tone mapping filters: %s", string_join(warnings, ", ").c_str()));
+    }
+  }
+
+  // HDR passthrough: for HLG content, convert transfer to PQ for HDR10 display.
+  // PQ content passes through unchanged.
+  if (hdr_passthrough_ && is_hdr_trc && dynamic_range_ == DynamicRange::HLG) {
+    if (avfilter_get_by_name("zscale")) {
+      post_filters.push_back("zscale=t=smpte2084");
+      log_info("HLG content; converting transfer to PQ for HDR10 display passthrough.");
+    } else {
+      log_warning("zscale filter missing; cannot convert HLG to PQ for HDR passthrough.");
     }
   }
 

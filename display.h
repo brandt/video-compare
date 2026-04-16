@@ -165,6 +165,10 @@ class Display {
   const bool use_10_bpc_;
   bool hdr_display_available_{false};
   float hdr_display_headroom_{1.0f};
+  bool hdr_passthrough_{false};
+
+  // HDR passthrough requires the 10-bit pipeline regardless of --10-bpc flag
+  bool requires_10_bpc() const { return use_10_bpc_ || hdr_passthrough_; }
   bool fast_input_alignment_;
   bool bilinear_texture_filtering_;
   int video_width_;
@@ -527,6 +531,7 @@ class Display {
 
   bool get_hdr_display_available() const;
   float get_hdr_display_headroom() const;
+  void set_hdr_passthrough(bool enabled);
 
   bool get_toggle_scope_window_requested(const ScopeWindow::Type type) const;
 

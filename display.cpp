@@ -495,10 +495,29 @@ void Display::recreate_video_textures_for_current_mode() {
     video_texture_nn_ = nullptr;
   }
 
+  const int tex_w = mode_ == Mode::HStack ? video_width_ * 2 : video_width_;
+  const int tex_h = mode_ == Mode::VStack ? video_height_ * 2 : video_height_;
+  const bool use_hdr_textures = hdr_display_available_ && hdr_passthrough_;
+  const SDL_PixelFormat pixel_format = requires_10_bpc() ? SDL_PIXELFORMAT_ARGB2101010 : SDL_PIXELFORMAT_RGB24;
+
   auto create_video_texture = [&](SDL_ScaleMode scale_mode, const std::string& label) {
-    SDL_Texture* tex = check_sdl(SDL_CreateTexture(renderer_, use_10_bpc_ ? SDL_PIXELFORMAT_ARGB2101010 : SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, mode_ == Mode::HStack ? video_width_ * 2 : video_width_,
-                                       mode_ == Mode::VStack ? video_height_ * 2 : video_height_),
-                     "video texture " + label);
+    SDL_Texture* tex;
+
+    if (use_hdr_textures) {
+      SDL_PropertiesID props = SDL_CreateProperties();
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, pixel_format);
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, SDL_COLORSPACE_HDR10);
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING);
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, tex_w);
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, tex_h);
+      SDL_SetFloatProperty(props, SDL_PROP_TEXTURE_CREATE_SDR_WHITE_POINT_FLOAT, 100.0f);
+      SDL_SetFloatProperty(props, SDL_PROP_TEXTURE_CREATE_HDR_HEADROOM_FLOAT, hdr_display_headroom_);
+      tex = check_sdl(SDL_CreateTextureWithProperties(renderer_, props), "video texture " + label);
+      SDL_DestroyProperties(props);
+    } else {
+      tex = check_sdl(SDL_CreateTexture(renderer_, pixel_format, SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h), "video texture " + label);
+    }
+
     SDL_SetTextureScaleMode(tex, scale_mode);
     return tex;
   };
@@ -654,9 +673,9 @@ void Display::reinitialize_video_dimensions(const unsigned width, const unsigned
     delete[] diff_buffer_;
     diff_buffer_ = nullptr;
   }
-  diff_buffer_ = new uint8_t[video_width_ * video_height_ * 3 * (use_10_bpc_ ? sizeof(uint16_t) : sizeof(uint8_t))];
+  diff_buffer_ = new uint8_t[video_width_ * video_height_ * 3 * (requires_10_bpc() ? sizeof(uint16_t) : sizeof(uint8_t))];
   diff_planes_ = {diff_buffer_, nullptr, nullptr};
-  diff_pitches_ = {video_width_ * 3 * (use_10_bpc_ ? sizeof(uint16_t) : sizeof(uint8_t)), 0, 0};
+  diff_pitches_ = {video_width_ * 3 * (requires_10_bpc() ? sizeof(uint16_t) : sizeof(uint8_t)), 0, 0};
 
   if (left_buffer_ != nullptr) {
     delete[] left_buffer_;
@@ -686,6 +705,7 @@ void Display::print_verbose_info() {
   std::cout << "Aspect lock mode:      " << aspect_lock_mode_to_string(aspect_lock_mode_) << std::endl;
   std::cout << "Aspect view mode:      " << aspect_view_mode_to_string(aspect_view_mode_) << std::endl;
   std::cout << "Use 10 bpc:            " << std::boolalpha << use_10_bpc_ << std::endl;
+  std::cout << "HDR passthrough:       " << std::boolalpha << hdr_passthrough_ << std::endl;
   std::cout << "Fast input alignment:  " << std::boolalpha << fast_input_alignment_ << std::endl;
   std::cout << "Bilinear filtering:    " << std::boolalpha << bilinear_texture_filtering_ << std::endl;
   std::cout << "Mouse whl sensitivity: " << wheel_sensitivity_ << std::endl;
@@ -712,7 +732,7 @@ void Display::print_verbose_info() {
 
   auto stringify_format_and_bpp = [&](SDL_PixelFormat pixel_format) -> std::string { return string_sprintf("%s (%d bpp)", SDL_GetPixelFormatName(pixel_format), SDL_BITSPERPIXEL(pixel_format)); };
 
-  const SDL_PixelFormat video_pixel_format = use_10_bpc_ ? SDL_PIXELFORMAT_ARGB2101010 : SDL_PIXELFORMAT_RGB24;
+  const SDL_PixelFormat video_pixel_format = requires_10_bpc() ? SDL_PIXELFORMAT_ARGB2101010 : SDL_PIXELFORMAT_RGB24;
   std::cout << "SDL video px format:   " << stringify_format_and_bpp(video_pixel_format) << std::endl;
 
   std::cout << "FFmpeg version:        " << av_version_info() << std::endl;
@@ -1043,7 +1063,7 @@ void Display::convert_to_packed_10_bpc(std::array<uint8_t*, 3> in_planes, std::a
             const uint32_t g = p_in[in_x + 1] >> 6;
             const uint32_t b = p_in[in_x + 2] >> 6;
 
-            p_out[out_x] = (r << 20) | (g << 10) | (b);
+            p_out[out_x] = (3u << 30) | (r << 20) | (g << 10) | (b);
           }
 
           p_in += in_pitches[0] / sizeof(uint16_t);
@@ -1329,7 +1349,7 @@ void Display::update_difference(std::array<uint8_t*, 3> planes_left, std::array<
   float frame_max = 1.f;
 
   // row starts after split_x pixels, i.e., split_x * 3 samples
-  if (use_10_bpc_) {
+  if (requires_10_bpc()) {
     auto plane_left0 = reinterpret_cast<uint16_t*>(planes_left[0]) + split_x * CHANNELS;
     auto plane_right0 = reinterpret_cast<uint16_t*>(planes_right[0]) + split_x * CHANNELS;
     auto plane_difference0 = reinterpret_cast<uint16_t*>(diff_planes_[0]) + split_x * CHANNELS;
@@ -1368,12 +1388,12 @@ void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_
   std::atomic_bool error_occurred(false);
 
   const auto create_onscreen_display_avframe = [&]() -> AVFramePtr {
-    const size_t pitch = use_10_bpc_ ? drawable_width_ * 3 * sizeof(uint16_t) : drawable_width_ * 3;
+    const size_t pitch = requires_10_bpc() ? drawable_width_ * 3 * sizeof(uint16_t) : drawable_width_ * 3;
     uint8_t* pixels = reinterpret_cast<uint8_t*>(av_malloc(pitch * drawable_height_));
 
     SDL_Surface* read_surface = SDL_RenderReadPixels(renderer_, nullptr);
     if (read_surface) {
-      if (use_10_bpc_) {
+      if (requires_10_bpc()) {
         const uint32_t* src = reinterpret_cast<const uint32_t*>(read_surface->pixels);
         uint16_t* dest = reinterpret_cast<uint16_t*>(pixels);
         const int src_pitch_pixels = read_surface->pitch / sizeof(uint32_t);
@@ -1407,7 +1427,7 @@ void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_
     }
 
     AVFrame* renderer_frame = av_frame_alloc();
-    renderer_frame->format = use_10_bpc_ ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
+    renderer_frame->format = requires_10_bpc() ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
     renderer_frame->width = drawable_width_;
     renderer_frame->height = drawable_height_;
     renderer_frame->data[0] = pixels;
@@ -1534,13 +1554,13 @@ void Display::update_texture(const SDL_Rect* rect, const void* pixels, int pitch
 int Display::round_and_clamp(const float value) {
   const int result = static_cast<int>(std::roundf(value));
 
-  return use_10_bpc_ ? clamp_int_to_10_bpc_range(result) : clamp_int_to_byte_range(result);
+  return requires_10_bpc() ? clamp_int_to_10_bpc_range(result) : clamp_int_to_byte_range(result);
 }
 
 const std::array<int, 3> Display::get_rgb_pixel(uint8_t* rgb_plane, const size_t pitch, const int x, const int y) {
   int r, g, b;
 
-  if (use_10_bpc_) {
+  if (requires_10_bpc()) {
     uint16_t* rgb_pixel = reinterpret_cast<uint16_t*>(rgb_plane + x * 6 + y * pitch);
 
     r = *(rgb_pixel) >> 6;
@@ -1577,12 +1597,12 @@ const std::array<int, 3> Display::convert_rgb_to_yuv(const std::array<int, 3> rg
     return AVFramePtr(raw_frame, frame_deleter);
   };
 
-  const AVPixelFormat yuv_format = use_10_bpc_ ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV444P;
+  const AVPixelFormat yuv_format = requires_10_bpc() ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV444P;
 
   auto rgb_pixel_frame = allocate_frame(rgb_format);
   auto yuv_pixel_frame = allocate_frame(yuv_format);
 
-  if (use_10_bpc_) {
+  if (requires_10_bpc()) {
     uint16_t* rgb_data = reinterpret_cast<uint16_t*>(rgb_pixel_frame->data[0]);
 
     auto extend_10_to_16_bit = [](const int value) {
@@ -1603,7 +1623,7 @@ const std::array<int, 3> Display::convert_rgb_to_yuv(const std::array<int, 3> rg
   FormatConverter rgb_to_yuv_converter(1, 1, 1, 1, rgb_format, yuv_format, color_space, color_range);
   rgb_to_yuv_converter(rgb_pixel_frame.get(), yuv_pixel_frame.get());
 
-  if (use_10_bpc_) {
+  if (requires_10_bpc()) {
     auto y_data = reinterpret_cast<const uint16_t*>(yuv_pixel_frame->data[0]);
     auto u_data = reinterpret_cast<const uint16_t*>(yuv_pixel_frame->data[1]);
     auto v_data = reinterpret_cast<const uint16_t*>(yuv_pixel_frame->data[2]);
@@ -1615,9 +1635,9 @@ const std::array<int, 3> Display::convert_rgb_to_yuv(const std::array<int, 3> rg
 }
 
 std::string Display::format_pixel(const std::array<int, 3>& pixel) {
-  std::string hex_pixel = use_10_bpc_ ? to_hex((pixel[0] << 20) | (pixel[1] << 10) | pixel[2], 8) : to_hex((pixel[0] << 16) | (pixel[1] << 8) | pixel[2], 6);
+  std::string hex_pixel = requires_10_bpc() ? to_hex((pixel[0] << 20) | (pixel[1] << 10) | pixel[2], 8) : to_hex((pixel[0] << 16) | (pixel[1] << 8) | pixel[2], 6);
 
-  return use_10_bpc_ ? string_sprintf("(%4d,%4d,%4d#%s)", pixel[0], pixel[1], pixel[2], hex_pixel.c_str()) : string_sprintf("(%3d,%3d,%3d#%s)", pixel[0], pixel[1], pixel[2], hex_pixel.c_str());
+  return requires_10_bpc() ? string_sprintf("(%4d,%4d,%4d#%s)", pixel[0], pixel[1], pixel[2], hex_pixel.c_str()) : string_sprintf("(%3d,%3d,%3d#%s)", pixel[0], pixel[1], pixel[2], hex_pixel.c_str());
 }
 
 std::string Display::get_and_format_rgb_yuv_pixel(uint8_t* rgb_plane, const size_t pitch, const AVFrame* frame, const int x, const int y) {
@@ -1666,7 +1686,7 @@ float* Display::rgb_to_grayscale(const uint8_t* plane, const size_t pitch, const
 
   auto to_grayscale = [](const float r, const float g, const float b, const float normalization_factor) -> float { return (r * 0.299f + g * 0.587f + b * 0.114f) * normalization_factor; };
 
-  if (use_10_bpc_) {
+  if (requires_10_bpc()) {
     for (int y = 0; y < height; y++) {
       const uint16_t* row = reinterpret_cast<const uint16_t*>(plane + y * pitch);
       for (int x = 0; x < (width * 3); x += 3) {
@@ -2324,7 +2344,7 @@ void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right
   AVFrame* right_selected = create_frame(selection_rect.w, selection_rect.h, right_frame);
   AVFrame* concatenated = create_frame(selection_rect.w * 2, selection_rect.h, left_frame);
 
-  const int pixel_size = use_10_bpc_ ? 3 * sizeof(uint16_t) : 3;
+  const int pixel_size = requires_10_bpc() ? 3 * sizeof(uint16_t) : 3;
 
   for (int y = 0; y < selection_rect.h; y++) {
     const int src_y = selection_rect.y + y;
@@ -2386,7 +2406,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   std::array<size_t, 3> pitches_right{static_cast<size_t>(right_frame->linesize[0]), static_cast<size_t>(right_frame->linesize[1]), static_cast<size_t>(right_frame->linesize[2])};
 
   // init 10 bpc temp buffers
-  if (use_10_bpc_) {
+  if (requires_10_bpc()) {
     if (left_buffer_ == nullptr) {
       left_buffer_ = new uint32_t[pitches_left[0] * video_height_ / 4];
       left_planes_ = {left_buffer_, nullptr, nullptr};
@@ -2542,7 +2562,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       const SDL_FRect screen_render_quad_left = video_rect_to_drawable_transform(video_to_zoom_space(tex_render_quad_left, zoom_rect));
 
       if (input_received_ || has_updated_left_frame) {
-        if (use_10_bpc_) {
+        if (requires_10_bpc()) {
           convert_to_packed_10_bpc(planes_left, pitches_left, left_planes_, pitches_left, tex_render_quad_left);
 
           update_texture(&tex_render_quad_left, left_planes_[0], pitches_left[0], "left update (10 bpc, video mode)");
@@ -2566,7 +2586,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         if (subtraction_mode_) {
           update_difference(planes_left, pitches_left, planes_right, pitches_right, start_right);
 
-          if (use_10_bpc_) {
+          if (requires_10_bpc()) {
             convert_to_packed_10_bpc(diff_planes_, diff_pitches_, right_planes_, pitches_right, roi);
 
             update_texture(&tex_render_quad_right, right_planes_[0] + start_right, pitches_right[0], "right update (10 bpc, subtraction mode)");
@@ -2574,7 +2594,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
             update_texture(&tex_render_quad_right, diff_planes_[0] + start_right * 3, diff_pitches_[0], "right update (subtraction mode)");
           }
         } else {
-          if (use_10_bpc_) {
+          if (requires_10_bpc()) {
             convert_to_packed_10_bpc(planes_right, pitches_right, right_planes_, pitches_right, roi);
 
             update_texture(&tex_render_quad_right, right_planes_[0] + start_right, pitches_right[0], "right update (10 bpc, video mode)");
@@ -3718,6 +3738,34 @@ bool Display::get_hdr_display_available() const {
 
 float Display::get_hdr_display_headroom() const {
   return hdr_display_headroom_;
+}
+
+void Display::set_hdr_passthrough(bool enabled) {
+  if (hdr_passthrough_ != enabled) {
+    hdr_passthrough_ = enabled;
+
+    recreate_video_textures_for_current_mode();
+
+    // Reallocate diff buffer for new bit depth
+    if (diff_buffer_ != nullptr) {
+      delete[] diff_buffer_;
+    }
+    diff_buffer_ = new uint8_t[video_width_ * video_height_ * 3 * (requires_10_bpc() ? sizeof(uint16_t) : sizeof(uint8_t))];
+    diff_planes_ = {diff_buffer_, nullptr, nullptr};
+    diff_pitches_ = {video_width_ * 3 * (requires_10_bpc() ? sizeof(uint16_t) : sizeof(uint8_t)), 0, 0};
+
+    // Force reallocation of packed-pixel buffers on next frame
+    if (left_buffer_ != nullptr) {
+      delete[] left_buffer_;
+      left_buffer_ = nullptr;
+    }
+    if (right_buffer_ != nullptr) {
+      delete[] right_buffer_;
+      right_buffer_ = nullptr;
+    }
+    left_planes_ = {nullptr, nullptr, nullptr};
+    right_planes_ = {nullptr, nullptr, nullptr};
+  }
 }
 
 bool Display::get_quit() const {
