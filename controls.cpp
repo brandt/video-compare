@@ -41,7 +41,7 @@ static const std::vector<ControlSection> control_sections{
       {"M", "Print image similarity metrics to console"},
       {"Q", "Toggle on-screen quality metrics overlay (PSNR/SSIM live, VMAF on pause)"},
       {"`", "Auto-align right video: shift to buffered right frame best matching current left frame (by PSNR)"},
-      {"F", "Save both frames and the on-screen content as PNG images"},
+      {"F", "Save both frames and the on-screen content as images"},
       {"I", "Toggle fast/high-quality resizing for input alignment"},
       {"T", "Toggle nearest-neighbor/bilinear video texture filtering"},
       {"Y", "Cycle through subtraction modes"},

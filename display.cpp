@@ -16,6 +16,7 @@
 #include "controls.h"
 #include "ffmpeg.h"
 #include "format_converter.h"
+#include "jxl_saver.h"
 #include "png_saver.h"
 #include "scope_window.h"
 #include "source_code_pro_regular_ttf.h"
@@ -1372,14 +1373,18 @@ void Display::update_difference(std::array<uint8_t*, 3> planes_left, std::array<
   }
 }
 
-void write_png(const AVFrame* frame, const std::string& filename, std::atomic_bool& error_occurred) {
+void save_frame_image(const AVFrame* frame, const std::string& filename, std::atomic_bool& error_occurred) {
   try {
-    PngSaver::save(frame, filename);
-  } catch (const PngSaver::IOException& e) {
-    std::cerr << "Error saving video PNG image to file: " << filename << std::endl;
+    if (frame->format == AV_PIX_FMT_X2RGB10LE) {
+      JxlSaver::save(frame, filename);
+    } else {
+      PngSaver::save(frame, filename);
+    }
+  } catch (const std::ios_base::failure& e) {
+    std::cerr << "Error saving image to file: " << filename << std::endl;
     error_occurred = true;
   } catch (const std::runtime_error& e) {
-    std::cerr << "Unexpected while error saving PNG: " << e.what() << std::endl;
+    std::cerr << "Error saving image: " << e.what() << std::endl;
     error_occurred = true;
   }
 };
@@ -1441,11 +1446,12 @@ void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_
   const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
   const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
   const bool stems_equal = (left_stem == right_stem);
-  const std::string left_filename = string_sprintf("%s%s_%04d.png", left_stem.c_str(), stems_equal ? "_left" : "", saved_image_number_);
-  const std::string right_filename = string_sprintf("%s%s_%04d.png", right_stem.c_str(), stems_equal ? "_right" : "", saved_image_number_);
+  const char* frame_ext = (left_frame->format == AV_PIX_FMT_X2RGB10LE) ? "jxl" : "png";
+  const std::string left_filename = string_sprintf("%s%s_%04d.%s", left_stem.c_str(), stems_equal ? "_left" : "", saved_image_number_, frame_ext);
+  const std::string right_filename = string_sprintf("%s%s_%04d.%s", right_stem.c_str(), stems_equal ? "_right" : "", saved_image_number_, frame_ext);
   const std::string osd_filename = string_sprintf("%s_%s_osd_%04d.png", left_stem.c_str(), right_stem.c_str(), saved_image_number_);
 
-  auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return write_png(frame, filename, error_occurred); };
+  auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return save_frame_image(frame, filename, error_occurred); };
 
   std::thread save_left_frame_thread(save_frame, left_frame, left_filename);
   std::thread save_right_frame_thread(save_frame, right_frame, right_filename);
@@ -2364,11 +2370,12 @@ void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right
   const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
   const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
   const bool stems_equal = (left_stem == right_stem);
-  const std::string left_filename = string_sprintf("%s%s_cutout_%04d.png", left_stem.c_str(), stems_equal ? "_left" : "", saved_selected_image_number_);
-  const std::string right_filename = string_sprintf("%s%s_cutout_%04d.png", right_stem.c_str(), stems_equal ? "_right" : "", saved_selected_image_number_);
-  const std::string concatenated_filename = string_sprintf("%s_%s_cutout_concat_%04d.png", left_stem.c_str(), right_stem.c_str(), saved_selected_image_number_);
+  const char* cutout_ext = (left_frame->format == AV_PIX_FMT_X2RGB10LE) ? "jxl" : "png";
+  const std::string left_filename = string_sprintf("%s%s_cutout_%04d.%s", left_stem.c_str(), stems_equal ? "_left" : "", saved_selected_image_number_, cutout_ext);
+  const std::string right_filename = string_sprintf("%s%s_cutout_%04d.%s", right_stem.c_str(), stems_equal ? "_right" : "", saved_selected_image_number_, cutout_ext);
+  const std::string concatenated_filename = string_sprintf("%s_%s_cutout_concat_%04d.%s", left_stem.c_str(), right_stem.c_str(), saved_selected_image_number_, cutout_ext);
 
-  auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return write_png(frame, filename, error_occurred); };
+  auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return save_frame_image(frame, filename, error_occurred); };
 
   std::thread save_left_thread(save_frame, left_selected, left_filename);
   std::thread save_right_thread(save_frame, right_selected, right_filename);

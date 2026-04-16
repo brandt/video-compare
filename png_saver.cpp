@@ -29,7 +29,7 @@ void PngSaver::save_with_ffmpeg(const AVFrame* frame, const std::string& filenam
   // Convert to a format the PNG encoder accepts (RGB24 or RGB48BE)
   AVFramePtr converted_frame(nullptr);
 
-  if (frame->format == AV_PIX_FMT_RGB48LE || frame->format == AV_PIX_FMT_X2RGB10LE) {
+  if (frame->format == AV_PIX_FMT_RGB48LE) {
     converted_frame.reset(convert(frame, AV_PIX_FMT_RGB48BE));
     frame_to_save = converted_frame.get();
   }
@@ -80,15 +80,6 @@ void PngSaver::save_with_stb(const AVFrame* frame, const std::string& filename) 
     }
   } else if (frame->format == AV_PIX_FMT_RGB48LE) {
     if (stbi_write_png_16(filename.c_str(), frame->width, frame->height, 3, frame->data[0], frame->linesize[0]) == 0) {
-      throw IOException("Error while writing PNG via stb: " + filename);
-    }
-  } else if (frame->format == AV_PIX_FMT_X2RGB10LE) {
-    // Convert X2RGB10LE to RGB48LE for 16-bit PNG output
-    AVFrame* rgb48_frame = convert(frame, AV_PIX_FMT_RGB48LE);
-    int result = stbi_write_png_16(filename.c_str(), rgb48_frame->width, rgb48_frame->height, 3, rgb48_frame->data[0], rgb48_frame->linesize[0]);
-    av_freep(&rgb48_frame->data[0]);
-    av_frame_free(&rgb48_frame);
-    if (result == 0) {
       throw IOException("Error while writing PNG via stb: " + filename);
     }
   } else {
