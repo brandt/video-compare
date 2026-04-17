@@ -2788,7 +2788,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // A vector (not a fixed array) — zoom-magnifier mode pushes extra ops on
     // top of the main-view ops.
     std::vector<GpuRenderer::SideRenderOp> ops;
-    ops.reserve(4);
+    ops.reserve(8);  // 2 main + up to 4 zoom (2 sides × up to 2 slices each)
 
     auto push_op = [&](int side, int src_x, int src_y, int src_w, int src_h,
                         const SDL_Rect& video_quad) {
@@ -2838,11 +2838,12 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
     // Zoom magnifier windows (bottom-left / bottom-right corners). Each
     // active zoom renders a 64-drawable-pixel source block around the mouse,
-    // scaled up to fill half of the min(drawable_w, drawable_h). Unlike the
-    // SDL path (which reads back the composited frame), the GPU path samples
-    // directly from the per-side frame textures: zoom_left shows left-side
-    // content, zoom_right shows right-side content, independent of the
-    // current split position.
+    // scaled up to fill half of the min(drawable_w, drawable_h). Matches the
+    // SDL path's composited view: Split mode shows right under left clipped
+    // at the split position; HStack/VStack show the per-side content on each
+    // side of the stack boundary that falls within the src rect. This lets
+    // the user switch to the opposite corner when the zoom box itself covers
+    // the area they want to inspect.
     const int dst_zoomed_size = static_cast<int>(std::round(std::min(drawable_width_, drawable_height_) * 0.5F)) & -2;
     const int dst_half_zoomed_size = dst_zoomed_size / 2;
 
@@ -2858,47 +2859,95 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       const int src_x1_draw = src_x0_draw + src_zoomed_size;
       const int src_y1_draw = src_y0_draw + src_zoomed_size;
 
-      // Convert drawable corners back into video-layout coords using the
-      // existing inverse transform. Layout coords include HStack/VStack
-      // offsets — side_src_rect() strips them per side.
+      // Drawable corners → video-layout coords (layout coords include any
+      // HStack/VStack offsets; split_x and video_{width,height} are the
+      // boundary coordinates we split on below).
       const Vector2D tl_layout = window_to_video_position(
           static_cast<int>(std::floor(src_x0_draw / drawable_to_window_width_factor_)),
           static_cast<int>(std::floor(src_y0_draw / drawable_to_window_height_factor_)), zoom_rect, true);
       const Vector2D br_layout = window_to_video_position(
           static_cast<int>(std::ceil(src_x1_draw / drawable_to_window_width_factor_)),
           static_cast<int>(std::ceil(src_y1_draw / drawable_to_window_height_factor_)), zoom_rect, false);
+      const float sx0 = tl_layout.x(), sy0 = tl_layout.y();
+      const float sx1 = br_layout.x(), sy1 = br_layout.y();
 
-      auto side_src_rect = [&](int side) -> SDL_FRect {
+      // Push a side render op whose src rect is in *layout* coords (the
+      // per-side frame offset is applied here), dst in FBO coords.
+      auto push_zoom_slice = [&](int side,
+                                  float layout_x0, float layout_y0, float layout_x1, float layout_y1,
+                                  float dst_x0, float dst_y0, float dst_x1, float dst_y1) {
         const float x_off = (side == 1 && mode_ == Mode::HStack) ? static_cast<float>(video_width_) : 0.f;
         const float y_off = (side == 1 && mode_ == Mode::VStack) ? static_cast<float>(video_height_) : 0.f;
-        const float x0 = clamp_range(tl_layout.x() - x_off, 0.f, static_cast<float>(video_width_));
-        const float x1 = clamp_range(br_layout.x() - x_off, 0.f, static_cast<float>(video_width_));
-        const float y0 = clamp_range(tl_layout.y() - y_off, 0.f, static_cast<float>(video_height_));
-        const float y1 = clamp_range(br_layout.y() - y_off, 0.f, static_cast<float>(video_height_));
-        return {x0, y0, x1 - x0, y1 - y0};
-      };
-
-      auto push_zoom_op = [&](int side, const SDL_FRect& src_video, float dst_x, float dst_y) {
-        if (src_video.w <= 0 || src_video.h <= 0) return;
+        const float fsx0 = clamp_range(layout_x0 - x_off, 0.f, static_cast<float>(video_width_));
+        const float fsx1 = clamp_range(layout_x1 - x_off, 0.f, static_cast<float>(video_width_));
+        const float fsy0 = clamp_range(layout_y0 - y_off, 0.f, static_cast<float>(video_height_));
+        const float fsy1 = clamp_range(layout_y1 - y_off, 0.f, static_cast<float>(video_height_));
+        if (fsx1 <= fsx0 || fsy1 <= fsy0 || dst_x1 <= dst_x0 || dst_y1 <= dst_y0) return;
         GpuRenderer::SideRenderOp op{};
         op.side = side;
-        op.src_x0 = src_video.x;
-        op.src_y0 = src_video.y;
-        op.src_x1 = src_video.x + src_video.w;
-        op.src_y1 = src_video.y + src_video.h;
-        op.dst_x0 = dst_x;
-        op.dst_y0 = dst_y;
-        op.dst_x1 = dst_x + static_cast<float>(dst_zoomed_size);
-        op.dst_y1 = dst_y + static_cast<float>(dst_zoomed_size);
+        op.src_x0 = fsx0; op.src_y0 = fsy0;
+        op.src_x1 = fsx1; op.src_y1 = fsy1;
+        op.dst_x0 = dst_x0; op.dst_y0 = dst_y0;
+        op.dst_x1 = dst_x1; op.dst_y1 = dst_y1;
         ops.push_back(op);
+      };
+
+      // Render the same logical src rect into the given dst box, reproducing
+      // the main view's split / stack composition inside the zoom window.
+      auto push_zoom_box = [&](float dx0, float dy0, float dx1, float dy1) {
+        const float src_w = std::max(1e-3f, sx1 - sx0);
+        const float src_h = std::max(1e-3f, sy1 - sy0);
+        auto mx = [&](float lx) { return dx0 + (lx - sx0) / src_w * (dx1 - dx0); };
+        auto my = [&](float ly) { return dy0 + (ly - sy0) / src_h * (dy1 - dy0); };
+
+        if (mode_ == Mode::Split && compare_mode) {
+          // Right full, then left overlaid clipped at split_x (matches the
+          // main-view layering so left-of-split shows left, right-of-split
+          // shows right).
+          if (show_right_) {
+            push_zoom_slice(1, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
+          }
+          if (show_left_) {
+            const float sxl = static_cast<float>(split_x);
+            if (sxl > sx0) {
+              const float lx1 = std::min(sx1, sxl);
+              push_zoom_slice(0, sx0, sy0, lx1, sy1, dx0, dy0, mx(lx1), dy1);
+            }
+          }
+        } else if (mode_ == Mode::HStack) {
+          const float boundary = static_cast<float>(video_width_);
+          if (show_left_ && sx0 < boundary) {
+            const float lx1 = std::min(sx1, boundary);
+            push_zoom_slice(0, sx0, sy0, lx1, sy1, dx0, dy0, mx(lx1), dy1);
+          }
+          if (show_right_ && sx1 > boundary) {
+            const float rx0 = std::max(sx0, boundary);
+            push_zoom_slice(1, rx0, sy0, sx1, sy1, mx(rx0), dy0, dx1, dy1);
+          }
+        } else if (mode_ == Mode::VStack) {
+          const float boundary = static_cast<float>(video_height_);
+          if (show_left_ && sy0 < boundary) {
+            const float ty1 = std::min(sy1, boundary);
+            push_zoom_slice(0, sx0, sy0, sx1, ty1, dx0, dy0, dx1, my(ty1));
+          }
+          if (show_right_ && sy1 > boundary) {
+            const float by0 = std::max(sy0, boundary);
+            push_zoom_slice(1, sx0, by0, sx1, sy1, dx0, my(by0), dx1, dy1);
+          }
+        } else {
+          // Split mode with only one side visible.
+          if (show_left_) push_zoom_slice(0, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
+          else if (show_right_) push_zoom_slice(1, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
+        }
       };
 
       const float zoom_dst_y = static_cast<float>(drawable_height_ - dst_zoomed_size);
       if (zoom_left_) {
-        push_zoom_op(0, side_src_rect(0), 0.f, zoom_dst_y);
+        push_zoom_box(0.f, zoom_dst_y, static_cast<float>(dst_zoomed_size), zoom_dst_y + dst_zoomed_size);
       }
       if (zoom_right_) {
-        push_zoom_op(1, side_src_rect(1), static_cast<float>(drawable_width_ - dst_zoomed_size), zoom_dst_y);
+        const float rx0 = static_cast<float>(drawable_width_ - dst_zoomed_size);
+        push_zoom_box(rx0, zoom_dst_y, rx0 + dst_zoomed_size, zoom_dst_y + dst_zoomed_size);
       }
     }
 
