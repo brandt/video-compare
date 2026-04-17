@@ -2568,23 +2568,77 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     }
 
     // Build overlay list (Phase 2: primitives only, no text yet).
-    std::array<GpuRenderer::OverlayOp, 4> overlays{};
-    int overlay_count = 0;
+    std::vector<GpuRenderer::OverlayOp> overlays;
 
-    // Split line — vertical white line at mouse-snapped video texel position.
-    if (mode_ == Mode::Split && show_hud_ && compare_mode) {
-      const float video_texel_clamped_mouse_x = static_cast<float>(content_window_.x) + (std::round(video_mouse_x) * zoom_rect.size.x() / static_cast<float>(video_width_) + zoom_rect.start.x()) / video_to_window_width_factor_;
-      const float split_drawable_x = std::round(video_texel_clamped_mouse_x * drawable_to_window_width_factor_);
+    auto push_rect = [&](float x0, float y0, float x1, float y1, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+      GpuRenderer::OverlayOp op;
+      op.dst_x0 = x0; op.dst_y0 = y0;
+      op.dst_x1 = x1; op.dst_y1 = y1;
+      op.color[0] = r / 255.0f;
+      op.color[1] = g / 255.0f;
+      op.color[2] = b / 255.0f;
+      op.color[3] = a / 255.0f;
+      overlays.push_back(op);
+    };
 
-      GpuRenderer::OverlayOp& op = overlays[overlay_count++];
-      op.dst_x0 = split_drawable_x;
-      op.dst_y0 = 0;
-      op.dst_x1 = split_drawable_x + 1;
-      op.dst_y1 = static_cast<float>(drawable_height_);
-      op.color[0] = 1.0f; op.color[1] = 1.0f; op.color[2] = 1.0f; op.color[3] = 1.0f;
+    if (show_hud_) {
+      // Split line — vertical white line at mouse-snapped video texel position.
+      if (mode_ == Mode::Split && compare_mode) {
+        const float video_texel_clamped_mouse_x = static_cast<float>(content_window_.x) + (std::round(video_mouse_x) * zoom_rect.size.x() / static_cast<float>(video_width_) + zoom_rect.start.x()) / video_to_window_width_factor_;
+        const float split_drawable_x = std::round(video_texel_clamped_mouse_x * drawable_to_window_width_factor_);
+        push_rect(split_drawable_x, 0, split_drawable_x + 1, static_cast<float>(drawable_height_),
+                  255, 255, 255, 255);
+      }
+
+      // Progress dots — alternating yellow / black strip per side showing
+      // playback position, with a small outline rect at the current-frame
+      // sub-range. Matches render_progress_dots() in the SDL path.
+      if (duration_ > 0) {
+        const float dot_size = 2.f;
+        const int dot_width = std::round(drawable_to_window_width_factor_ * dot_size);
+        const int dot_height = std::round(drawable_to_window_height_factor_ * dot_size);
+
+        auto render_dots = [&](float position, float progress, bool is_top) {
+          const int y_offset = is_top ? 1 : drawable_height_ - 1 - dot_height;
+          const int x_position = std::round(position * drawable_width_ / duration_);
+          const int x_progress = std::round(progress * drawable_width_ / duration_);
+
+          for (int x = 0; x < x_position; x += dot_width) {
+            const int x_end = std::min(x + dot_width, x_position);
+            const bool yellow = (x % (2 * dot_width)) < dot_width;
+            const uint8_t alpha = yellow ? static_cast<uint8_t>(BACKGROUND_ALPHA * 3 / 2) : static_cast<uint8_t>(BACKGROUND_ALPHA);
+            const uint8_t r = yellow ? POSITION_COLOR.r : 0;
+            const uint8_t g = yellow ? POSITION_COLOR.g : 0;
+            const uint8_t b = yellow ? POSITION_COLOR.b : 0;
+            push_rect(static_cast<float>(x), static_cast<float>(y_offset),
+                      static_cast<float>(x_end), static_cast<float>(y_offset + dot_height),
+                      r, g, b, alpha);
+          }
+
+          // Current-frame outline: 4 thin rects (top/bottom/left/right).
+          const float cf_x0 = static_cast<float>(x_position);
+          const float cf_y0 = static_cast<float>(is_top ? y_offset : y_offset - dot_height);
+          const float cf_x1 = static_cast<float>(x_progress);
+          const float cf_y1 = cf_y0 + static_cast<float>(dot_height * 2);
+          const uint8_t cf_a = static_cast<uint8_t>(BACKGROUND_ALPHA * 2);
+          if (cf_x1 > cf_x0 && cf_y1 > cf_y0) {
+            push_rect(cf_x0, cf_y0, cf_x1, cf_y0 + 1, POSITION_COLOR.r, POSITION_COLOR.g, POSITION_COLOR.b, cf_a); // top
+            push_rect(cf_x0, cf_y1 - 1, cf_x1, cf_y1, POSITION_COLOR.r, POSITION_COLOR.g, POSITION_COLOR.b, cf_a); // bottom
+            push_rect(cf_x0, cf_y0, cf_x0 + 1, cf_y1, POSITION_COLOR.r, POSITION_COLOR.g, POSITION_COLOR.b, cf_a); // left
+            push_rect(cf_x1 - 1, cf_y0, cf_x1, cf_y1, POSITION_COLOR.r, POSITION_COLOR.g, POSITION_COLOR.b, cf_a); // right
+          }
+        };
+
+        const float left_position = ffmpeg::pts_in_secs(left_frame);
+        const float right_position = ffmpeg::pts_in_secs(right_frame);
+        const float left_progress = left_position + ffmpeg::frame_duration_in_secs(left_frame);
+        const float right_progress = right_position + ffmpeg::frame_duration_in_secs(right_frame);
+        render_dots(left_position, left_progress, true);
+        render_dots(right_position, right_progress, false);
+      }
     }
 
-    if (gpu_renderer_.render(ops.data(), op_count, overlays.data(), overlay_count, nullptr)) {
+    if (gpu_renderer_.render(ops.data(), op_count, overlays.data(), static_cast<int>(overlays.size()), nullptr)) {
       gpu_renderer_.present();
     }
 
