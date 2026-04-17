@@ -2567,7 +2567,24 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       }
     }
 
-    if (gpu_renderer_.render(ops.data(), op_count, nullptr)) {
+    // Build overlay list (Phase 2: primitives only, no text yet).
+    std::array<GpuRenderer::OverlayOp, 4> overlays{};
+    int overlay_count = 0;
+
+    // Split line — vertical white line at mouse-snapped video texel position.
+    if (mode_ == Mode::Split && show_hud_ && compare_mode) {
+      const float video_texel_clamped_mouse_x = static_cast<float>(content_window_.x) + (std::round(video_mouse_x) * zoom_rect.size.x() / static_cast<float>(video_width_) + zoom_rect.start.x()) / video_to_window_width_factor_;
+      const float split_drawable_x = std::round(video_texel_clamped_mouse_x * drawable_to_window_width_factor_);
+
+      GpuRenderer::OverlayOp& op = overlays[overlay_count++];
+      op.dst_x0 = split_drawable_x;
+      op.dst_y0 = 0;
+      op.dst_x1 = split_drawable_x + 1;
+      op.dst_y1 = static_cast<float>(drawable_height_);
+      op.color[0] = 1.0f; op.color[1] = 1.0f; op.color[2] = 1.0f; op.color[3] = 1.0f;
+    }
+
+    if (gpu_renderer_.render(ops.data(), op_count, overlays.data(), overlay_count, nullptr)) {
       gpu_renderer_.present();
     }
 

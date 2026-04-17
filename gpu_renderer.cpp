@@ -2,6 +2,7 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 // Tell the header we just want declarations, not inline definitions
 // (those live in pl_libav_impl.c).
@@ -19,6 +20,7 @@ GpuRenderer::GpuRenderer()
       mapped_frames_{},
       frame_mapped_{},
       overlay_tex_(nullptr),
+      white_tex_(nullptr),
       window_(nullptr) {}
 
 GpuRenderer::~GpuRenderer() {
@@ -133,6 +135,7 @@ void GpuRenderer::destroy() {
       }
     }
     pl_tex_destroy(vk_->gpu, &overlay_tex_);
+    pl_tex_destroy(vk_->gpu, &white_tex_);
   }
 
   pl_renderer_destroy(&renderer_);
@@ -191,7 +194,33 @@ void GpuRenderer::unmap_frame(int side) {
   }
 }
 
+// Ensure the shared single-pixel white texture exists. Used as the source
+// for monochrome primitive overlays (split line, filled rects, progress dots).
+static bool ensure_white_tex(pl_gpu gpu, pl_tex* tex) {
+  if (*tex) return true;
+
+  pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 1, 8, 0, PL_FMT_CAP_SAMPLEABLE);
+  if (!fmt) return false;
+
+  struct pl_tex_params tp = {};
+  tp.w = 1;
+  tp.h = 1;
+  tp.format = fmt;
+  tp.sampleable = true;
+  tp.host_writable = true;
+  tp.debug_tag = PL_DEBUG_TAG;
+
+  if (!pl_tex_recreate(gpu, tex, &tp)) return false;
+
+  const uint8_t pixel = 0xFF;
+  struct pl_tex_transfer_params xfer = {};
+  xfer.tex = *tex;
+  xfer.ptr = (void*)&pixel;
+  return pl_tex_upload(gpu, &xfer);
+}
+
 bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
+                          const OverlayOp* overlays, int num_overlays,
                           const struct pl_color_space* target_color) {
   if (!swapchain_ || !renderer_) return false;
 
@@ -216,6 +245,39 @@ bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
   params.background = PL_CLEAR_SKIP;
   params.border = PL_CLEAR_SKIP;
 
+  // Build primitive overlay (monochrome, one pl_overlay with N parts sharing
+  // the 1×1 white texture). Done up-front so we can skip it in side renders.
+  std::vector<struct pl_overlay_part> primitive_parts;
+  struct pl_overlay primitive_overlay = {};
+  bool have_primitives = false;
+
+  if (num_overlays > 0 && ensure_white_tex(vk_->gpu, &white_tex_)) {
+    primitive_parts.reserve(num_overlays);
+    for (int i = 0; i < num_overlays; ++i) {
+      struct pl_overlay_part p = {};
+      p.src.x0 = 0; p.src.y0 = 0; p.src.x1 = 1; p.src.y1 = 1;
+      p.dst.x0 = overlays[i].dst_x0;
+      p.dst.y0 = overlays[i].dst_y0;
+      p.dst.x1 = overlays[i].dst_x1;
+      p.dst.y1 = overlays[i].dst_y1;
+      memcpy(p.color, overlays[i].color, sizeof(p.color));
+      primitive_parts.push_back(p);
+    }
+    primitive_overlay.tex = white_tex_;
+    primitive_overlay.mode = PL_OVERLAY_MONOCHROME;
+    primitive_overlay.coords = PL_OVERLAY_COORDS_DST_FRAME;
+    primitive_overlay.repr = pl_color_repr_rgb;
+    primitive_overlay.color = pl_color_space_srgb;
+    primitive_overlay.parts = primitive_parts.data();
+    primitive_overlay.num_parts = static_cast<int>(primitive_parts.size());
+    have_primitives = true;
+  }
+
+  // No overlays attached to target during side renders — we composite overlays
+  // in a separate image=NULL pass below so they're not applied multiple times.
+  target.overlays = nullptr;
+  target.num_overlays = 0;
+
   for (int i = 0; i < num_ops; ++i) {
     const SideRenderOp& op = ops[i];
     if (op.side < 0 || op.side >= kSideCount) continue;
@@ -233,6 +295,20 @@ bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
     target.crop.y1 = op.dst_y1;
 
     pl_render_image(renderer_, &image, &target, &params);
+  }
+
+  // Final overlay-only pass (image = NULL). pl_render_image still composites
+  // target.overlays onto the target when the image is NULL.
+  if (have_primitives) {
+    target.overlays = &primitive_overlay;
+    target.num_overlays = 1;
+    // Use target.crop = full target so overlays in DST_FRAME coords aren't
+    // clipped by a previously set sub-crop.
+    target.crop.x0 = 0;
+    target.crop.y0 = 0;
+    target.crop.x1 = static_cast<float>(sw_frame.fbo->params.w);
+    target.crop.y1 = static_cast<float>(sw_frame.fbo->params.h);
+    pl_render_image(renderer_, nullptr, &target, &params);
   }
 
   if (!pl_swapchain_submit_frame(swapchain_)) {

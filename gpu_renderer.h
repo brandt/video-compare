@@ -41,9 +41,19 @@ class GpuRenderer {
     float dst_x0, dst_y0, dst_x1, dst_y1;
   };
 
-  // Render video frames to the swapchain. `ops` lists the per-side renders.
+  // A solid-colored filled-rect overlay, composited in sRGB space on top of
+  // the rendered video. Destination is in swapchain (FBO pixel) coordinates.
+  // Color channels are 0..1 (RGBA).
+  struct OverlayOp {
+    float dst_x0, dst_y0, dst_x1, dst_y1;
+    float color[4];
+  };
+
+  // Render video frames + overlays to the swapchain. `ops` lists per-side
+  // renders; `overlays` lists compositing rects drawn after all sides.
   // `target_color` overrides target colorspace (e.g. for HDR passthrough).
   bool render(const SideRenderOp* ops, int num_ops,
+              const OverlayOp* overlays, int num_overlays,
               const struct pl_color_space* target_color);
 
   // Present the rendered frame.
@@ -79,6 +89,10 @@ class GpuRenderer {
 
   // Overlay texture (reused across frames).
   pl_tex overlay_tex_;
+
+  // Single-pixel all-white texture, used as the source for monochrome
+  // primitive overlays (split line, rects, dots). Lazy-created.
+  pl_tex white_tex_;
 
   SDL_Window* window_;
 };
