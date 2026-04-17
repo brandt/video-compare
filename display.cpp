@@ -2886,6 +2886,116 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       }
     }
 
+    // Message toast — fading center-screen notification. Independent of
+    // show_hud_.  On arrival, move pending_message_ to the "active" slot so
+    // it persists through the fade even after pending_message_ is cleared.
+    if (!pending_message_.empty()) {
+      gpu_active_message_ = pending_message_;
+      pending_message_.clear();
+      message_shown_at_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
+    }
+    if (!gpu_active_message_.empty()) {
+      const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
+      const float elapsed_s = (now - message_shown_at_).count() / 1000.0f;
+      constexpr float kHoldSeconds = 3.0f;
+      constexpr float kFadeSeconds = 0.5f;
+      float keep_alpha;
+      if (elapsed_s < kHoldSeconds) {
+        keep_alpha = 1.0f;
+      } else {
+        keep_alpha = std::max(std::sqrt(1.0f - (elapsed_s - kHoldSeconds) / kFadeSeconds), 0.0f);
+      }
+      if (keep_alpha <= 0.0f) {
+        gpu_active_message_.clear();
+      } else {
+        SDL_Surface* raw = TTF_RenderText_Blended(big_font_, gpu_active_message_.c_str(), 0, TEXT_COLOR);
+        if (raw) {
+          SDL_Surface* rgba = SDL_ConvertSurface(raw, SDL_PIXELFORMAT_RGBA32);
+          SDL_DestroySurface(raw);
+          if (rgba) {
+            // libplacebo's PL_OVERLAY_NORMAL ignores per-part color/alpha, so
+            // bake the fade into the source alpha channel on CPU.
+            if (keep_alpha < 1.0f) {
+              uint8_t* pixels = static_cast<uint8_t*>(rgba->pixels);
+              const int pitch = rgba->pitch;
+              for (int py = 0; py < rgba->h; ++py) {
+                uint8_t* row = pixels + py * pitch;
+                for (int px = 0; px < rgba->w; ++px) {
+                  row[px * 4 + 3] = static_cast<uint8_t>(row[px * 4 + 3] * keep_alpha);
+                }
+              }
+            }
+            text_surfaces.push_back(rgba);
+            const int mx = drawable_width_ / 2 - rgba->w / 2;
+            const int my = drawable_height_ / 2 - rgba->h / 2;
+            push_rect(static_cast<float>(mx - 2), static_cast<float>(my - 2),
+                      static_cast<float>(mx + rgba->w + 2), static_cast<float>(my + rgba->h + 2),
+                      0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * keep_alpha));
+            GpuRenderer::TextOverlayOp t{};
+            t.rgba_data = rgba->pixels;
+            t.width = rgba->w;
+            t.height = rgba->h;
+            t.stride = rgba->pitch;
+            t.dst_x = static_cast<float>(mx);
+            t.dst_y = static_cast<float>(my);
+            t.alpha = 1.0f;  // applied via CPU alpha-multiply above
+            text_ops.push_back(t);
+          }
+        }
+        timer_based_update_performed_ = true;
+      }
+    }
+
+    // Selection / crop rect — shown whenever a selection is in progress,
+    // independent of show_hud_ (matching draw_selection_rect in the SDL path).
+    if (selection_state_ == SelectionState::Started) {
+      auto push_selection_rect = [&](const SDL_FRect& r, uint8_t r_val, uint8_t g_val, uint8_t b_val, int alpha_divider = 1) {
+        // Semi-transparent fill (half-intensity color).
+        push_rect(r.x, r.y, r.x + r.w, r.y + r.h,
+                  r_val / 2, g_val / 2, b_val / 2,
+                  static_cast<uint8_t>(128 / alpha_divider));
+
+        // Outline: four 1-pixel-thick edges.
+        const uint8_t border_a = static_cast<uint8_t>(255 / alpha_divider);
+        push_rect(r.x, r.y,                r.x + r.w, r.y + 1,         r_val, g_val, b_val, border_a); // top
+        push_rect(r.x, r.y + r.h - 1,      r.x + r.w, r.y + r.h,       r_val, g_val, b_val, border_a); // bottom
+        push_rect(r.x, r.y,                r.x + 1,   r.y + r.h,       r_val, g_val, b_val, border_a); // left
+        push_rect(r.x + r.w - 1, r.y,      r.x + r.w, r.y + r.h,       r_val, g_val, b_val, border_a); // right
+      };
+
+      SDL_Rect selection_rect = get_left_selection_rect();
+      SDL_FRect drawable_rect = video_rect_to_drawable_transform(video_to_zoom_space(selection_rect, zoom_rect));
+
+      if (mode_ == Mode::Split) {
+        if (crop_mode_) {
+          switch (crop_target_side_) {
+            case CropTargetSide::Right: push_selection_rect(drawable_rect, 128, 128, 255); break;
+            case CropTargetSide::Both:  push_selection_rect(drawable_rect, 255, 255, 255); break;
+            default:                    push_selection_rect(drawable_rect, 255, 128, 128); break;
+          }
+        } else {
+          push_selection_rect(drawable_rect, 255, 255, 255);
+        }
+      } else {
+        if (!crop_mode_ || crop_target_side_ == CropTargetSide::Left || crop_target_side_ == CropTargetSide::Both) {
+          push_selection_rect(drawable_rect, 255, 128, 128);
+        } else {
+          push_selection_rect(drawable_rect, 96, 96, 96, 3);
+        }
+
+        // Right-side rect offset by the stack gap.
+        if (mode_ == Mode::HStack) selection_rect.x += video_width_;
+        else if (mode_ == Mode::VStack) selection_rect.y += video_height_;
+
+        drawable_rect = video_rect_to_drawable_transform(video_to_zoom_space(selection_rect, zoom_rect));
+        if (!crop_mode_ || crop_target_side_ == CropTargetSide::Right || crop_target_side_ == CropTargetSide::Both) {
+          push_selection_rect(drawable_rect, 128, 128, 255);
+        } else {
+          push_selection_rect(drawable_rect, 96, 96, 96, 3);
+        }
+      }
+    }
+
     if (gpu_renderer_.render(ops.data(), op_count,
                               overlays.data(), static_cast<int>(overlays.size()),
                               text_ops.data(), static_cast<int>(text_ops.size()),
@@ -2895,9 +3005,6 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
     // Surfaces are no longer referenced by libplacebo after render() returns.
     for (SDL_Surface* s : text_surfaces) SDL_DestroySurface(s);
-
-    // Consume pending messages (just clear them — no HUD in Phase 1)
-    pending_message_.clear();
 
     input_received_ = false;
     previous_left_frame_pts_ = left_frame->pts;
@@ -3376,7 +3483,12 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   }
   if (message_texture_ != nullptr) {
     std::chrono::milliseconds now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
-    const float keep_alpha = std::max(sqrtf(1.0F - (now - message_shown_at_).count() / 1000.0F / 4.0F), 0.0F);
+    const float elapsed_s = (now - message_shown_at_).count() / 1000.0F;
+    constexpr float kHoldSeconds = 2.0F;
+    constexpr float kFadeSeconds = 1.0F;
+    const float keep_alpha = (elapsed_s < kHoldSeconds)
+                                 ? 1.0F
+                                 : std::max(sqrtf(1.0F - (elapsed_s - kHoldSeconds) / kFadeSeconds), 0.0F);
 
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, BACKGROUND_ALPHA * keep_alpha);
     fill_rect = make_frect(drawable_width_ / 2 - message_width_ / 2 - 2, drawable_height_ / 2 - message_height_ / 2 - 2, message_width_ + 4, message_height_ + 4);

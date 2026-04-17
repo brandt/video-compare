@@ -1019,8 +1019,10 @@ void VideoCompare::compare() {
     const bool log_event_routing = env_flag_enabled("VIDEO_COMPARE_LOG_EVENT_ROUTING");
 
     for (uint64_t frame_number = 0;; ++frame_number) {
-      // Set FPS message if needed
-      if (display_->get_show_fps()) {
+      // Set FPS message if needed. GPU renderer shows persistent FPS
+      // counters instead, so skip the toast there (it would re-trigger every
+      // iteration and never fade).
+      if (display_->get_show_fps() && !display_->get_gpu_renderer_active()) {
         display_->set_pending_message(fps_message);
       }
 

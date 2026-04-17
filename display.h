@@ -320,6 +320,10 @@ class Display {
   int message_width_;
   int message_height_;
 
+  // Currently-visible message for the GPU renderer path — held until the
+  // fade-out alpha reaches zero, at which point it is cleared.
+  std::string gpu_active_message_;
+
   SDL_Window* window_;
   SDL_Renderer* renderer_;  // nullptr when gpu_renderer_active_
 
