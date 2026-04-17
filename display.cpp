@@ -454,10 +454,8 @@ Display::Display(const int display_number,
 
 Display::~Display() {
   for (int s = 0; s < kSideCount; s++) {
-    for (int b = 0; b < kBufferCount; b++) {
-      if (side_textures_linear_[s][b]) SDL_DestroyTexture(side_textures_linear_[s][b]);
-      if (side_textures_nn_[s][b]) SDL_DestroyTexture(side_textures_nn_[s][b]);
-    }
+    if (side_textures_linear_[s]) SDL_DestroyTexture(side_textures_linear_[s]);
+    if (side_textures_nn_[s]) SDL_DestroyTexture(side_textures_nn_[s]);
   }
   SDL_DestroyTexture(side_ui_[LEFT.as_simple_index()].text_texture);
   SDL_DestroyTexture(side_ui_[RIGHT.as_simple_index()].text_texture);
@@ -492,17 +490,14 @@ Display::~Display() {
 
 void Display::recreate_video_textures_for_current_mode() {
   for (int s = 0; s < kSideCount; s++) {
-    for (int b = 0; b < kBufferCount; b++) {
-      if (side_textures_linear_[s][b] != nullptr) {
-        SDL_DestroyTexture(side_textures_linear_[s][b]);
-        side_textures_linear_[s][b] = nullptr;
-      }
-      if (side_textures_nn_[s][b] != nullptr) {
-        SDL_DestroyTexture(side_textures_nn_[s][b]);
-        side_textures_nn_[s][b] = nullptr;
-      }
+    if (side_textures_linear_[s] != nullptr) {
+      SDL_DestroyTexture(side_textures_linear_[s]);
+      side_textures_linear_[s] = nullptr;
     }
-    side_write_index_[s] = 0;
+    if (side_textures_nn_[s] != nullptr) {
+      SDL_DestroyTexture(side_textures_nn_[s]);
+      side_textures_nn_[s] = nullptr;
+    }
   }
 
   // Per-side textures: each is video_width_ × video_height_ (no HStack/VStack doubling)
@@ -530,11 +525,9 @@ void Display::recreate_video_textures_for_current_mode() {
   };
 
   for (int s = 0; s < kSideCount; s++) {
-    for (int b = 0; b < kBufferCount; b++) {
-      const std::string label = std::string(s == 0 ? "left" : "right") + " buf" + std::to_string(b);
-      side_textures_linear_[s][b] = create_video_texture(SDL_SCALEMODE_LINEAR, label + " linear");
-      side_textures_nn_[s][b] = create_video_texture(SDL_SCALEMODE_NEAREST, label + " nearest");
-    }
+    const std::string label = std::string(s == 0 ? "left" : "right");
+    side_textures_linear_[s] = create_video_texture(SDL_SCALEMODE_LINEAR, label + " linear");
+    side_textures_nn_[s] = create_video_texture(SDL_SCALEMODE_NEAREST, label + " nearest");
   }
 }
 
@@ -1569,30 +1562,18 @@ void Display::render_progress_dots(const float position, const float progress, c
   }
 }
 
-SDL_Texture* Display::get_side_texture_for_write(int side) const {
-  const int wi = side_write_index_[side];
-  return bilinear_texture_filtering_ ? side_textures_linear_[side][wi] : side_textures_nn_[side][wi];
-}
-
-SDL_Texture* Display::get_side_texture_for_render(int side) const {
-  // Render from the buffer we last finished writing to
-  const int ri = 1 - side_write_index_[side];
-  return bilinear_texture_filtering_ ? side_textures_linear_[side][ri] : side_textures_nn_[side][ri];
-}
-
-void Display::swap_side_texture(int side) {
-  side_write_index_[side] = 1 - side_write_index_[side];
+SDL_Texture* Display::get_side_texture(int side) const {
+  return bilinear_texture_filtering_ ? side_textures_linear_[side] : side_textures_nn_[side];
 }
 
 void Display::update_side_texture(int side, const void* pixels, int pitch) {
-  SDL_Texture* tex = get_side_texture_for_write(side);
+  SDL_Texture* tex = get_side_texture(side);
   void* locked_pixels = nullptr;
   int locked_pitch = 0;
 
   // Full-frame upload (no sub-rect — each side has its own texture)
   if (!SDL_LockTexture(tex, nullptr, &locked_pixels, &locked_pitch)) {
     check_sdl(SDL_UpdateTexture(tex, nullptr, pixels, pitch), "side texture update fallback");
-    swap_side_texture(side);
     return;
   }
 
@@ -1611,7 +1592,6 @@ void Display::update_side_texture(int side, const void* pixels, int pitch) {
   }
 
   SDL_UnlockTexture(tex);
-  swap_side_texture(side);
 }
 
 int Display::round_and_clamp(const float value) {
@@ -2620,7 +2600,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   if (show_left_ || show_right_) {
     const int split_x = (compare_mode && mode_ == Mode::Split) ? clamp_range(std::round(video_mouse_x), 0.0F, float(video_width_)) : show_left_ ? video_width_ : 0;
 
-    // Upload full frames to per-side textures (double-buffered)
+    // Upload full frames to per-side textures
     if (input_received_ || has_updated_left_frame) {
       if (requires_10_bpc()) {
         const SDL_Rect full_rect = {0, 0, video_width_, video_height_};
@@ -2661,7 +2641,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       const SDL_FRect src_left = {0, 0, static_cast<float>(split_x), static_cast<float>(video_height_)};
       const SDL_Rect video_quad_left = {0, 0, split_x, video_height_};
       const SDL_FRect screen_quad_left = video_rect_to_drawable_transform(video_to_zoom_space(video_quad_left, zoom_rect));
-      check_sdl(SDL_RenderTexture(renderer_, get_side_texture_for_render(0), &src_left, &screen_quad_left), "left video texture render");
+      check_sdl(SDL_RenderTexture(renderer_, get_side_texture(0), &src_left, &screen_quad_left), "left video texture render");
     }
     if (show_right_ && ((split_x < video_width_) || mode_ != Mode::Split)) {
       const int start_right = (mode_ == Mode::Split) ? std::max(split_x, 0) : 0;
@@ -2671,7 +2651,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       const SDL_FRect src_right = {static_cast<float>(start_right), 0, static_cast<float>(video_width_ - start_right), static_cast<float>(video_height_)};
       const SDL_Rect video_quad_right = {right_x_offset + start_right, right_y_offset, video_width_ - start_right, video_height_};
       const SDL_FRect screen_quad_right = video_rect_to_drawable_transform(video_to_zoom_space(video_quad_right, zoom_rect));
-      check_sdl(SDL_RenderTexture(renderer_, get_side_texture_for_render(1), &src_right, &screen_quad_right), "right video texture render");
+      check_sdl(SDL_RenderTexture(renderer_, get_side_texture(1), &src_right, &screen_quad_right), "right video texture render");
     }
   }
 

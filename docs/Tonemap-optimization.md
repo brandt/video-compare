@@ -260,9 +260,28 @@ The remaining ~2.1-core steady-state gap vs SDR is the HLG→PQ `zscale=t=smpte2
 
 - **SDR texture colorspace tagging (display.cpp):** SDR textures now created with `SDL_CreateTextureWithProperties` + `SDL_COLORSPACE_SRGB` instead of plain `SDL_CreateTexture`. The `SDL_COLORSPACE_SRGB_LINEAR` renderer now has explicit gamma information for SDR content, ensuring correct sRGB rendering.
 
-### Remaining work
+### Display refresh optimization (2026-04-17)
 
-1. **Display refresh performance** — `possibly_refresh` takes ~57ms at 4K (two 33MB texture uploads + render + VSync). This limits UI FPS to ~17fps regardless of pipeline speed. Potential improvements: `SDL_LockTexture` instead of `SDL_UpdateTexture` to avoid Metal synchronization stalls, double-buffered textures, or dirty-region tracking to upload only changed sub-rects.
+`possibly_refresh` was taking ~57ms at 4K, dominated entirely by `SDL_UpdateTexture` (~53ms for two sub-rect uploads to a shared texture). `SDL_RenderPresent` and `SDL_RenderTexture` were negligible (~35μs each).
+
+**Root cause:** `SDL_UpdateTexture` on Metal streaming textures blocks waiting for the GPU command buffer to complete before allowing writes to the staging buffer.
+
+**Approaches tested:**
+
+| approach | upload time | notes |
+|---|---:|---|
+| `SDL_UpdateTexture`, shared texture, sub-rects | 53ms | original — Metal fence wait per texture |
+| `SDL_LockTexture`, per-side double-buffered | 105ms | **worse** — Metal locks on command buffer, not individual textures; 2 textures = 2 waits |
+| `SDL_LockTexture`, per-side single-buffered | **17ms** | **3× faster** — one lock per side, full-frame upload |
+
+**What was implemented:**
+
+- **Per-side textures (display.h, display.cpp):** replaced the single shared texture (`video_width*2 × video_height` for HStack, etc.) with two independent textures (`video_width × video_height` each), one per side. Each side uploads its full frame independently — no sub-rect calculations needed. This eliminates the HStack/VStack texture size doubling and simplifies the upload path.
+- **`SDL_LockTexture` upload (display.cpp):** `update_side_texture()` uses `SDL_LockTexture` to get a direct pointer to the staging buffer, copies the frame data via `memcpy`, and calls `SDL_UnlockTexture`. Falls back to `SDL_UpdateTexture` if lock fails. Full-frame lock (no sub-rect) appears to be more efficient on Metal.
+- **Independent render (display.cpp):** each side is rendered from its own texture to the appropriate screen region. The split/HStack/VStack logic now only affects the `SDL_RenderTexture` source and destination rects, not the texture layout. Subtraction mode refreshes when either side's frame changes (both inputs affect the diff).
+- **Frame-skip fix (video_compare.cpp):** capped the adaptive refresh skip to `max(target_time, refresh_time)` so frames aren't dropped when the display can't hit the content's target FPS. Smooth slow-motion is preferable to choppy skipping for a comparison tool.
+
+**Result:** display refresh dropped from 57ms to 17ms. At 4K 60fps content, UI FPS improved from ~9fps (choppy frame-skipping) to ~16.5fps (smooth, every produced frame displayed). The remaining ~43ms per cycle is pipeline production time (decode + filter + format convert), not display. Further improvement requires pipeline optimizations (hardware decode, parallel format conversion, etc.).
 
 ## Recommended priority
 
@@ -274,3 +293,4 @@ The remaining ~2.1-core steady-state gap vs SDR is the HLG→PQ `zscale=t=smpte2
 | 4 | Tonemap curve choice      | ~0.2 core              | intentional change   | small (expose CLI flag) |
 | 5 | Cache tonemapped frames   | variable               | none                 | moderate |
 | 6 | SDL3 HDR passthrough      | ~0.3 core HLG (measured), ~2.4 PQ (est.) | more faithful HDR | moderate | **done** (phases 1-4)
+| 7 | Display refresh (per-side `SDL_LockTexture`) | 53→17ms upload (3×) | none | moderate | **done**

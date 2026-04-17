@@ -320,13 +320,11 @@ class Display {
   SDL_Window* window_;
   SDL_Renderer* renderer_;
 
-  // Per-side double-buffered video textures (each is video_width_ × video_height_).
-  // Index 0 = left side, 1 = right side. Each has [2] for double-buffering.
+  // Per-side video textures (each is video_width_ × video_height_).
+  // Index 0 = left side, 1 = right side.
   static constexpr int kSideCount = 2;
-  static constexpr int kBufferCount = 2;
-  SDL_Texture* side_textures_linear_[kSideCount][kBufferCount]{};
-  SDL_Texture* side_textures_nn_[kSideCount][kBufferCount]{};
-  int side_write_index_[kSideCount]{0, 0};
+  SDL_Texture* side_textures_linear_[kSideCount]{};
+  SDL_Texture* side_textures_nn_[kSideCount]{};
 
   SDL_Event event_;
   float mouse_x_;
@@ -412,9 +410,7 @@ class Display {
 
   SDL_Surface* render_text_with_fallback(const std::string& text);
 
-  SDL_Texture* get_side_texture_for_write(int side) const;
-  SDL_Texture* get_side_texture_for_render(int side) const;
-  void swap_side_texture(int side);
+  SDL_Texture* get_side_texture(int side) const;
   void update_side_texture(int side, const void* pixels, int pitch);
   void update_texture(const SDL_Rect* rect, const void* pixels, int pitch, const std::string& message);
 
