@@ -1,4 +1,4 @@
-CXXFLAGS = -g3 -Ofast -std=c++14 -D__STDC_CONSTANT_MACROS \
+CXXFLAGS = -g3 -O3 -ffast-math -std=c++14 -D__STDC_CONSTANT_MACROS \
 		   -Wall -Wextra -Wno-deprecated -Wno-deprecated-declarations \
 		   -Wdisabled-optimization -Wctor-dtor-privacy \
 		   -Woverloaded-virtual -Wno-unused -Wno-missing-field-initializers
@@ -84,7 +84,7 @@ $(target): $(obj)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -MMD -MP -MF $(@:.o=.d) -c -o $@ $<
 
-CFLAGS = -g3 -Ofast -D__STDC_CONSTANT_MACROS -Wall -Wextra -Wno-unused
+CFLAGS = -g3 -O3 -ffast-math -D__STDC_CONSTANT_MACROS -Wall -Wextra -Wno-unused
 CC ?= cc
 
 # Inherit the same include/lib paths as C++ (strip C++-only flags)
