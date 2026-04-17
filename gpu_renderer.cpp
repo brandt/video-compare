@@ -136,6 +136,10 @@ void GpuRenderer::destroy() {
     }
     pl_tex_destroy(vk_->gpu, &overlay_tex_);
     pl_tex_destroy(vk_->gpu, &white_tex_);
+    for (auto& tex : text_tex_slots_) {
+      pl_tex_destroy(vk_->gpu, &tex);
+    }
+    text_tex_slots_.clear();
   }
 
   pl_renderer_destroy(&renderer_);
@@ -221,6 +225,7 @@ static bool ensure_white_tex(pl_gpu gpu, pl_tex* tex) {
 
 bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
                           const OverlayOp* overlays, int num_overlays,
+                          const TextOverlayOp* text_overlays, int num_text_overlays,
                           const struct pl_color_space* target_color) {
   if (!swapchain_ || !renderer_) return false;
 
@@ -297,11 +302,78 @@ bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
     pl_render_image(renderer_, &image, &target, &params);
   }
 
+  // Upload text-overlay pixel data to per-slot textures and build pl_overlays.
+  // Slot i is reused across frames: pl_tex_recreate is a no-op when dims match.
+  std::vector<struct pl_overlay> text_overlays_list;
+  std::vector<struct pl_overlay_part> text_parts_storage; // one part per overlay
+  text_overlays_list.reserve(num_text_overlays);
+  text_parts_storage.reserve(num_text_overlays); // stable pointers guaranteed
+
+  pl_fmt rgba_fmt = pl_find_fmt(vk_->gpu, PL_FMT_UNORM, 4, 8, 0, PL_FMT_CAP_SAMPLEABLE);
+
+  for (int i = 0; i < num_text_overlays; ++i) {
+    const TextOverlayOp& t = text_overlays[i];
+    if (!t.rgba_data || t.width <= 0 || t.height <= 0 || !rgba_fmt) continue;
+
+    // Grow slots as needed.
+    if (static_cast<int>(text_tex_slots_.size()) <= i) {
+      text_tex_slots_.resize(i + 1, nullptr);
+    }
+
+    struct pl_tex_params tp = {};
+    tp.w = t.width;
+    tp.h = t.height;
+    tp.format = rgba_fmt;
+    tp.sampleable = true;
+    tp.host_writable = true;
+    tp.debug_tag = PL_DEBUG_TAG;
+
+    if (!pl_tex_recreate(vk_->gpu, &text_tex_slots_[i], &tp)) continue;
+
+    struct pl_tex_transfer_params xfer = {};
+    xfer.tex = text_tex_slots_[i];
+    xfer.row_pitch = static_cast<size_t>(t.stride);
+    xfer.ptr = const_cast<void*>(t.rgba_data);
+    if (!pl_tex_upload(vk_->gpu, &xfer)) continue;
+
+    struct pl_overlay_part part = {};
+    part.src.x0 = 0; part.src.y0 = 0;
+    part.src.x1 = static_cast<float>(t.width);
+    part.src.y1 = static_cast<float>(t.height);
+    part.dst.x0 = t.dst_x;
+    part.dst.y0 = t.dst_y;
+    part.dst.x1 = t.dst_x + static_cast<float>(t.width);
+    part.dst.y1 = t.dst_y + static_cast<float>(t.height);
+    // For PL_OVERLAY_NORMAL only color[3] (alpha) multiplies into the texture.
+    part.color[0] = 1.0f; part.color[1] = 1.0f; part.color[2] = 1.0f;
+    part.color[3] = t.alpha;
+
+    // reserve() above guarantees push_back doesn't invalidate pointers.
+    text_parts_storage.push_back(part);
+    const struct pl_overlay_part* part_ptr = &text_parts_storage.back();
+
+    struct pl_overlay ov = {};
+    ov.tex = text_tex_slots_[i];
+    ov.mode = PL_OVERLAY_NORMAL;
+    ov.coords = PL_OVERLAY_COORDS_DST_FRAME;
+    ov.repr = pl_color_repr_rgb;
+    ov.color = pl_color_space_srgb;
+    ov.parts = part_ptr;
+    ov.num_parts = 1;
+    text_overlays_list.push_back(ov);
+  }
+
+  // Assemble combined overlay list: primitive first (background rects, split,
+  // dots), then text on top.
+  std::vector<struct pl_overlay> all_overlays;
+  if (have_primitives) all_overlays.push_back(primitive_overlay);
+  for (const auto& ov : text_overlays_list) all_overlays.push_back(ov);
+
   // Final overlay-only pass (image = NULL). pl_render_image still composites
   // target.overlays onto the target when the image is NULL.
-  if (have_primitives) {
-    target.overlays = &primitive_overlay;
-    target.num_overlays = 1;
+  if (!all_overlays.empty()) {
+    target.overlays = all_overlays.data();
+    target.num_overlays = static_cast<int>(all_overlays.size());
     // Use target.crop = full target so overlays in DST_FRAME coords aren't
     // clipped by a previously set sub-crop.
     target.crop.x0 = 0;

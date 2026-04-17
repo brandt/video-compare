@@ -2638,9 +2638,95 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       }
     }
 
-    if (gpu_renderer_.render(ops.data(), op_count, overlays.data(), static_cast<int>(overlays.size()), nullptr)) {
+    // Build text overlays — file labels, position times, zoom factor, etc.
+    // Each TTF_RenderText_Blended surface is kept alive through the render()
+    // call; destroyed immediately after.
+    std::vector<GpuRenderer::TextOverlayOp> text_ops;
+    std::vector<SDL_Surface*> text_surfaces; // owns the per-frame surfaces
+
+    if (show_hud_) {
+      auto push_text = [&](const std::string& text, TTF_Font* font, SDL_Color color,
+                            int x, int y) -> std::pair<int, int> {
+        if (text.empty()) return {0, 0};
+        SDL_Surface* raw = TTF_RenderText_Blended(font, text.c_str(), 0, color);
+        if (!raw) return {0, 0};
+        SDL_Surface* rgba = SDL_ConvertSurface(raw, SDL_PIXELFORMAT_RGBA32);
+        SDL_DestroySurface(raw);
+        if (!rgba) return {0, 0};
+        text_surfaces.push_back(rgba);
+
+        // Background rect behind the text.
+        push_rect(static_cast<float>(x - border_extension_), static_cast<float>(y - border_extension_),
+                  static_cast<float>(x + rgba->w + border_extension_),
+                  static_cast<float>(y + rgba->h + border_extension_),
+                  0, 0, 0, BACKGROUND_ALPHA);
+
+        GpuRenderer::TextOverlayOp t{};
+        t.rgba_data = rgba->pixels;
+        t.width = rgba->w;
+        t.height = rgba->h;
+        t.stride = rgba->pitch;
+        t.dst_x = static_cast<float>(x);
+        t.dst_y = static_cast<float>(y);
+        t.alpha = 1.0f;
+        text_ops.push_back(t);
+        return {rgba->w, rgba->h};
+      };
+
+      // File-name labels (top-left / top-right, matching SDL path layout).
+      // Pick label string based on displayed_*_side_ so the `s` swap key
+      // flips labels together with the video content.
+      const float left_position = ffmpeg::pts_in_secs(left_frame);
+      const float right_position = ffmpeg::pts_in_secs(right_frame);
+
+      auto label_for_side = [&](Side s) -> std::string {
+        return s.is_left() ? left_file_name_
+                           : format_right_file_label(left_file_name_, right_file_name_, active_right_index_ + 1);
+      };
+      const std::string left_label = label_for_side(displayed_left_side_);
+      const std::string right_label = label_for_side(displayed_right_side_);
+
+      if (show_left_) {
+        const std::string left_pic(1, av_get_picture_type_char(left_frame->pict_type));
+        const std::string left_pos_str = format_position(left_position, true) + " " + left_pic + format_position_difference(left_position, right_position);
+
+        if (mode_ == Mode::VStack) {
+          push_text(left_pos_str, small_font_, POSITION_COLOR, line1_y_, line1_y_);
+          push_text(left_label, small_font_, TEXT_COLOR, line1_y_, line2_y_);
+        } else {
+          push_text(left_label, small_font_, TEXT_COLOR, line1_y_, line1_y_);
+          push_text(left_pos_str, small_font_, POSITION_COLOR, line1_y_, line2_y_);
+        }
+      }
+      if (show_right_) {
+        const std::string right_pic(1, av_get_picture_type_char(right_frame->pict_type));
+        const std::string right_pos_str = format_position(right_position, true) + " " + right_pic + format_position_difference(right_position, left_position);
+
+        // Pre-measure text widths for right-alignment in non-VStack modes.
+        int w_label = 0, h_label = 0;
+        int w_pos = 0, h_pos = 0;
+        TTF_GetStringSize(small_font_, right_label.c_str(), 0, &w_label, &h_label);
+        TTF_GetStringSize(small_font_, right_pos_str.c_str(), 0, &w_pos, &h_pos);
+
+        if (mode_ == Mode::VStack) {
+          push_text(right_label, small_font_, TEXT_COLOR, line1_y_, drawable_height_ - line2_y_ - h_label);
+          push_text(right_pos_str, small_font_, POSITION_COLOR, line1_y_, drawable_height_ - line1_y_ - h_pos);
+        } else {
+          push_text(right_label, small_font_, TEXT_COLOR, drawable_width_ - line1_y_ - w_label, line1_y_);
+          push_text(right_pos_str, small_font_, POSITION_COLOR, drawable_width_ - line1_y_ - w_pos, line2_y_);
+        }
+      }
+    }
+
+    if (gpu_renderer_.render(ops.data(), op_count,
+                              overlays.data(), static_cast<int>(overlays.size()),
+                              text_ops.data(), static_cast<int>(text_ops.size()),
+                              nullptr)) {
       gpu_renderer_.present();
     }
+
+    // Surfaces are no longer referenced by libplacebo after render() returns.
+    for (SDL_Surface* s : text_surfaces) SDL_DestroySurface(s);
 
     // Consume pending messages (just clear them — no HUD in Phase 1)
     pending_message_.clear();

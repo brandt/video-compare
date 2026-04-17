@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
@@ -49,11 +51,29 @@ class GpuRenderer {
     float color[4];
   };
 
-  // Render video frames + overlays to the swapchain. `ops` lists per-side
-  // renders; `overlays` lists compositing rects drawn after all sides.
+  // A text (or arbitrary RGBA image) overlay. The pixel data is uploaded
+  // synchronously during `render()` to an internal per-slot `pl_tex` that
+  // persists and is reused across frames (so pushing the same logical
+  // overlay repeatedly avoids tex re-creation when dimensions match).
+  //
+  // `rgba_data` must remain valid through the `render()` call. After `render()`
+  // returns, the caller may free its source surface.
+  struct TextOverlayOp {
+    const void* rgba_data;  // source pixels, RGBA8 (channel-order: R, G, B, A)
+    int width, height;
+    int stride;             // bytes per row
+    float dst_x, dst_y;     // top-left in FBO coords
+    float alpha;            // 0..1 multiplier on the texture alpha
+  };
+
+  // Render video frames + overlays + text to the swapchain. `ops` lists
+  // per-side renders; `overlays` are monochrome filled-rect primitives;
+  // `text_overlays` are RGBA bitmaps (e.g. pre-rendered text). The draw
+  // order is: side renders → primitive overlays → text overlays.
   // `target_color` overrides target colorspace (e.g. for HDR passthrough).
   bool render(const SideRenderOp* ops, int num_ops,
               const OverlayOp* overlays, int num_overlays,
+              const TextOverlayOp* text_overlays, int num_text_overlays,
               const struct pl_color_space* target_color);
 
   // Present the rendered frame.
@@ -93,6 +113,10 @@ class GpuRenderer {
   // Single-pixel all-white texture, used as the source for monochrome
   // primitive overlays (split line, rects, dots). Lazy-created.
   pl_tex white_tex_;
+
+  // Per-slot RGBA textures for text overlays. Grown as needed; slot i is
+  // reused across frames so repeated same-sized uploads avoid tex recreate.
+  std::vector<pl_tex> text_tex_slots_;
 
   SDL_Window* window_;
 };
