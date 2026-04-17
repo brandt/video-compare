@@ -2496,10 +2496,14 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     return false;
   }
 
-  // --- GPU renderer path (Phase 1: video frames only, no HUD) ---
+  // --- GPU renderer path ---
   if (gpu_renderer_active_) {
     const bool compare_mode = show_left_ && show_right_;
     const auto zoom_rect = compute_zoom_rect();
+
+    // Reset each frame; set below by animations that need a periodic refresh
+    // (loop-mode blink, fading message) even when no new input arrives.
+    timer_based_update_performed_ = false;
 
     // Upload frames only when they've actually changed (matches SDL path logic).
     if (input_received_ || has_updated_left_frame) {
@@ -2655,7 +2659,9 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       // the END of long file paths stays visible, the beginning fades out.
       // Returns the surface's (w, h) (before clipping).
       auto push_text = [&](const std::string& text, TTF_Font* font, SDL_Color color,
-                            int x, int y, TextAlign align) -> std::pair<int, int> {
+                            int x, int y, TextAlign align,
+                            uint8_t bg_r = 0, uint8_t bg_g = 0, uint8_t bg_b = 0,
+                            uint8_t bg_a = BACKGROUND_ALPHA) -> std::pair<int, int> {
         if (text.empty()) return {0, 0};
         SDL_Surface* raw = TTF_RenderText_Blended(font, text.c_str(), 0, color);
         if (!raw) return {0, 0};
@@ -2708,7 +2714,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
                   static_cast<float>(y - border_extension_),
                   static_cast<float>(dst_x_left + visible_w + border_extension_),
                   static_cast<float>(y + rgba->h + border_extension_),
-                  0, 0, 0, BACKGROUND_ALPHA);
+                  bg_r, bg_g, bg_b, bg_a);
 
         GpuRenderer::TextOverlayOp t{};
         t.rgba_data = rgba->pixels;
@@ -2785,6 +2791,98 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
         push_text(vid_str, small_font_, FPS_VIDEO_COLOR, vid_x, fps_y, TextAlign::Left);
         push_text(ui_str, small_font_, FPS_UI_COLOR, ui_x, fps_y, TextAlign::Left);
+      }
+
+      // Zoom factor — bottom-left (top-right in VStack). Precision varies
+      // with the value to avoid noisy fractional digits at common zooms.
+      std::string zoom_factor_str;
+      {
+        const uint64_t zr = lrintf(global_zoom_factor_ * 1000);
+        int tz = ((zr % 10) > 0 ? 0 : 1) + ((zr % 100) > 0 ? 0 : 1) + ((zr % 1000) > 0 ? 0 : 1);
+        if (global_zoom_factor_ < 1e-1 || (tz == 0 && zr < 1000)) {
+          zoom_factor_str = string_sprintf("x%1.3f", global_zoom_factor_);
+        } else if (tz <= 1 && zr < 10000) {
+          zoom_factor_str = string_sprintf("x%1.2f", global_zoom_factor_);
+        } else if (tz <= 2 && zr < 100000) {
+          zoom_factor_str = string_sprintf("x%1.1f", global_zoom_factor_);
+        } else {
+          zoom_factor_str = string_sprintf("x%1.0f", global_zoom_factor_);
+        }
+      }
+      {
+        int zw = 0, zh = 0;
+        TTF_GetStringSize(small_font_, zoom_factor_str.c_str(), 0, &zw, &zh);
+        const int zx = (mode_ == Mode::VStack) ? drawable_width_ - line1_y_ - zw : line1_y_;
+        const int zy = (mode_ == Mode::VStack) ? line1_y_ : drawable_height_ - line1_y_ - zh;
+        push_text(zoom_factor_str, small_font_, ZOOM_COLOR, zx, zy, TextAlign::Left,
+                  0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 2));
+      }
+
+      // Playback speed — bottom-center. "@<speed>" with optional "|<pct>%"
+      // when a manual speed level has been applied.
+      {
+        std::string speed_str, speed_factor_str;
+        const float playback_speed = 1000000.0f * playback_speed_factor_ /
+                                      float(std::max(ffmpeg::frame_duration(left_frame), ffmpeg::frame_duration(right_frame)));
+        const uint64_t ps_r = lrintf(playback_speed * 1000);
+        if (ps_r < 1000) {
+          speed_str = string_sprintf("%1.2f", playback_speed);
+        } else if (ps_r % 1000 && ps_r < 240000) {
+          if (ps_r % 100 && ps_r < 60000) speed_str = string_sprintf("%1.2f", playback_speed);
+          else speed_str = string_sprintf("%1.1f", playback_speed);
+        } else {
+          speed_str = string_sprintf("%1.0f", playback_speed);
+        }
+        if (playback_speed_level_ != 0) {
+          if (lrintf(playback_speed_factor_ * 100) < 10)
+            speed_factor_str = string_sprintf("|%1.1f%%", playback_speed_factor_ * 100);
+          else
+            speed_factor_str = string_sprintf("|%1.0f%%", playback_speed_factor_ * 100);
+        }
+        const std::string united = string_sprintf("@%s%s", speed_str.c_str(), speed_factor_str.c_str());
+        int sw = 0, sh = 0;
+        TTF_GetStringSize(small_font_, united.c_str(), 0, &sw, &sh);
+        const int sx = drawable_width_ / 2 - sw / 2 - border_extension_;
+        const int sy = drawable_height_ - line1_y_ - sh;
+        push_text(united, small_font_, PLAYBACK_SPEED_COLOR, sx, sy, TextAlign::Left,
+                  0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 2));
+      }
+
+      // Current frame / total browsable — top-center. In loop mode the
+      // background blinks with a mode-specific color.
+      if (!current_total_browsable.empty()) {
+        int cw = 0, ch = 0;
+        TTF_GetStringSize(small_font_, current_total_browsable.c_str(), 0, &cw, &ch);
+        const int cx = drawable_width_ / 2 - cw / 2;
+        const int cy = (mode_ == Mode::VStack) ? line1_y_ : line2_y_;
+
+        SDL_Color bg_color = LOOP_OFF_LABEL_COLOR;
+        int bg_alpha = BACKGROUND_ALPHA;
+        if (buffer_play_loop_mode_ != Loop::Off) {
+          bg_alpha = static_cast<int>(bg_alpha * (1.0 + std::sin(float(SDL_GetTicks()) / 180.0) * 0.6));
+          bg_alpha = clamp_range(bg_alpha, 0, 255);
+          switch (buffer_play_loop_mode_) {
+            case Loop::ForwardOnly: bg_color = LOOP_FW_LABEL_COLOR; break;
+            case Loop::PingPong:    bg_color = LOOP_PP_LABEL_COLOR; break;
+            default: break;
+          }
+          timer_based_update_performed_ = true;
+        }
+        push_text(current_total_browsable, small_font_, BUFFER_COLOR, cx, cy, TextAlign::Left,
+                  bg_color.r, bg_color.g, bg_color.b, static_cast<uint8_t>(bg_alpha));
+      }
+
+      // Target seek position — bottom-right, only when the cursor is in the
+      // window and the content is seekable.
+      if (mouse_is_inside_window_ && duration_ > 0) {
+        const float target_position = static_cast<float>(mouse_x_) / static_cast<float>(window_width_) * duration_;
+        const std::string target_str = format_position(target_position, true);
+        int tw = 0, th = 0;
+        TTF_GetStringSize(small_font_, target_str.c_str(), 0, &tw, &th);
+        const int tx = drawable_width_ - line1_y_ - tw;
+        const int ty = drawable_height_ - line1_y_ - th;
+        push_text(target_str, small_font_, TARGET_COLOR, tx, ty, TextAlign::Right,
+                  0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 2));
       }
     }
 
