@@ -208,13 +208,12 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
   }
 
   // Create VideoFilterContext to manage all videos for consistent auto-filter determination
-  VideoFilterContext video_filter_context;
-  video_filter_context.add(LEFT, demuxers_[LEFT].get(), video_decoders_[LEFT].get(), config.left.color_trc);
+  video_filter_context_.add(LEFT, demuxers_[LEFT].get(), video_decoders_[LEFT].get(), config.left.color_trc);
 
   for (size_t i = 0; i < config.right_videos.size(); ++i) {
     const auto& right_config = config.right_videos[i];
     Side right_side = Side::Right(i);
-    video_filter_context.add(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.color_trc);
+    video_filter_context_.add(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.color_trc);
   }
 
   // Probe HDR display before constructing filterers — determines whether we can skip tonemapping.
@@ -247,7 +246,7 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
 
   install_processor(video_filterers_, ReadyToSeek::ProcessorThread::Filterer, LEFT,
                     std::make_unique<VideoFilterer>(LEFT, demuxers_[LEFT].get(), video_decoders_[LEFT].get(), config.left.tone_mapping_mode, config.left.boost_tone, config.left.video_filters, config.left.color_space,
-                                                    config.left.color_range, config.left.color_primaries, config.left.color_trc, &video_filter_context, config.disable_auto_filters, output_pixel_format, hdr_passthrough_active_));
+                                                    config.left.color_range, config.left.color_primaries, config.left.color_trc, &video_filter_context_, config.disable_auto_filters, output_pixel_format, hdr_passthrough_active_));
 
   // For each right video, use VideoFilterContext for auto-filter determination
   for (size_t i = 0; i < config.right_videos.size(); ++i) {
@@ -256,7 +255,7 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
 
     install_processor(video_filterers_, ReadyToSeek::ProcessorThread::Filterer, right_side,
                       std::make_unique<VideoFilterer>(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.tone_mapping_mode, right_config.boost_tone, right_config.video_filters,
-                                                      right_config.color_space, right_config.color_range, right_config.color_primaries, right_config.color_trc, &video_filter_context, config.disable_auto_filters, output_pixel_format,
+                                                      right_config.color_space, right_config.color_range, right_config.color_primaries, right_config.color_trc, &video_filter_context_, config.disable_auto_filters, output_pixel_format,
                                                       hdr_passthrough_active_));
   }
 
@@ -411,6 +410,61 @@ void VideoCompare::recreate_format_converters(const int sws_flags) {
   for (const auto& pair : video_filterers_) {
     recreate_format_converter_for_side(pair.first, sws_flags);
   }
+}
+
+bool VideoCompare::handle_hdr_state_change() {
+  if (!display_->consume_hdr_state_change()) {
+    return false;
+  }
+
+  // Determine new HDR passthrough state based on updated display capability + content type
+  const bool hdr_display = display_->get_hdr_display_available();
+  bool new_passthrough = false;
+
+  if (hdr_display) {
+    auto is_hdr_content = [](const VideoDecoder* decoder, const std::string& custom_trc) {
+      return decoder->infer_dynamic_range(custom_trc) != DynamicRange::Standard;
+    };
+
+    new_passthrough = is_hdr_content(video_decoders_[LEFT].get(), config_.left.color_trc);
+    for (size_t i = 0; i < config_.right_videos.size() && new_passthrough; ++i) {
+      new_passthrough = is_hdr_content(video_decoders_[Side::Right(i)].get(), config_.right_videos[i].color_trc);
+    }
+  }
+
+  if (new_passthrough == hdr_passthrough_active_) {
+    return false;
+  }
+
+  hdr_passthrough_active_ = new_passthrough;
+  std::cerr << "HDR state changed; " << (new_passthrough ? "enabling" : "disabling") << " HDR passthrough." << std::endl;
+
+  // Reconstruct filterers with new HDR passthrough state
+  const AVPixelFormat output_pixel_format = determine_pixel_format(config_, hdr_passthrough_active_);
+
+  video_filterers_[LEFT] = std::make_unique<VideoFilterer>(LEFT, demuxers_[LEFT].get(), video_decoders_[LEFT].get(), config_.left.tone_mapping_mode, config_.left.boost_tone, config_.left.video_filters, config_.left.color_space,
+                                                           config_.left.color_range, config_.left.color_primaries, config_.left.color_trc, &video_filter_context_, config_.disable_auto_filters, output_pixel_format, hdr_passthrough_active_);
+
+  for (size_t i = 0; i < config_.right_videos.size(); ++i) {
+    const auto& right_config = config_.right_videos[i];
+    Side right_side = Side::Right(i);
+
+    video_filterers_[right_side] = std::make_unique<VideoFilterer>(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.tone_mapping_mode, right_config.boost_tone, right_config.video_filters,
+                                                                   right_config.color_space, right_config.color_range, right_config.color_primaries, right_config.color_trc, &video_filter_context_, config_.disable_auto_filters,
+                                                                   output_pixel_format, hdr_passthrough_active_);
+  }
+
+  // Recalculate dimensions and recreate format converters
+  const auto dims = calculate_max_dest_dimensions(video_filterers_);
+  max_width_ = dims.first;
+  max_height_ = dims.second;
+
+  recreate_format_converters(determine_sws_flags(display_->get_fast_input_alignment()));
+
+  // Update display textures
+  display_->set_hdr_passthrough(hdr_passthrough_active_);
+
+  return true;
 }
 
 void VideoCompare::operator()() {
@@ -1053,8 +1107,11 @@ void VideoCompare::compare() {
       };
       intake_prefetch();
 
+      // handle HDR display state change (window moved between HDR/SDR displays)
+      const bool hdr_changed = handle_hdr_state_change();
+
       // handle pending crop request
-      const bool force_seek_current_position = handle_pending_crop_request(active_right);
+      const bool force_seek_current_position = handle_pending_crop_request(active_right) || hdr_changed;
 
       int shift_right_frames = display_->get_shift_right_frames();
 

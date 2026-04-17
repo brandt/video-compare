@@ -930,9 +930,18 @@ void Display::update_hdr_display_state() {
   if (hdr_available != hdr_display_available_) {
     hdr_display_available_ = hdr_available;
     hdr_display_headroom_ = hdr_headroom;
+    hdr_state_changed_ = true;
 
     std::cerr << "HDR display " << (hdr_available ? "available" : "not available") << " (headroom: " << hdr_headroom << ")" << std::endl;
   }
+}
+
+bool Display::consume_hdr_state_change() {
+  if (hdr_state_changed_) {
+    hdr_state_changed_ = false;
+    return true;
+  }
+  return false;
 }
 
 void Display::handle_window_resize(const bool reset_forced_size_guard, const bool force_layout_refresh) {

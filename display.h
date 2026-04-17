@@ -166,6 +166,7 @@ class Display {
   bool hdr_display_available_{false};
   float hdr_display_headroom_{1.0f};
   bool hdr_passthrough_{false};
+  bool hdr_state_changed_{false};
 
   // True when frames arrive as RGB48LE and need convert_to_packed_10_bpc before upload.
   // HDR passthrough uses X2RGB10LE (already packed 4 bytes/pixel) — no conversion needed.
@@ -533,6 +534,7 @@ class Display {
   bool get_hdr_display_available() const;
   float get_hdr_display_headroom() const;
   void set_hdr_passthrough(bool enabled);
+  bool consume_hdr_state_change();
 
   bool get_toggle_scope_window_requested(const ScopeWindow::Type type) const;
 

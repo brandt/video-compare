@@ -147,6 +147,8 @@ class VideoCompare {
   void recreate_format_converter_for_side(const Side& side, const int sws_flags);
   void recreate_format_converters(const int sws_flags);
 
+  bool handle_hdr_state_change();
+
   void demultiplex(const Side& side);
 
   void decode_video(const Side& side);
@@ -225,6 +227,8 @@ class VideoCompare {
   std::map<Side, std::unique_ptr<VideoDecoder>> video_decoders_;
   std::map<Side, std::unique_ptr<VideoFilterer>> video_filterers_;
   std::map<Side, std::unique_ptr<FormatConverter>> format_converters_;
+
+  VideoFilterContext video_filter_context_;
 
   std::map<Side, std::unique_ptr<PacketQueue>> packet_queues_;
   std::map<Side, std::shared_ptr<DecodedFrameQueue>> decoded_frame_queues_;
