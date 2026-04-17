@@ -17,6 +17,8 @@
 #include "row_workers.h"
 #include "scope_window.h"
 #include "string_utils.h"
+
+class FormatConverter;
 extern "C" {
 #include <libavutil/frame.h>
 }
@@ -337,6 +339,16 @@ class Display {
   SDL_Texture* side_textures_linear_[kSideCount]{};
   SDL_Texture* side_textures_nn_[kSideCount]{};
 
+  // GPU-mode RGB cache for features that still need CPU pixel access:
+  // subtraction mode, per-pixel inspector, live PSNR/SSIM/VMAF. Lazily
+  // populated via on-demand sws_scale from the native YUV frames; main
+  // GPU pipeline stays YUV-only when these features are off.
+  std::unique_ptr<FormatConverter> rgb_converter_[kSideCount];
+  AVFrame* rgb_frames_[kSideCount]{};
+  std::string rgb_frame_keys_[kSideCount];
+  // Upload-only AVFrame shell used to hand diff_buffer_ to libplacebo.
+  AVFrame* diff_upload_frame_{nullptr};
+
   SDL_Event event_;
   float mouse_x_;
   float mouse_y_;
@@ -405,6 +417,12 @@ class Display {
                                  const float diff_max) const;
 
   void save_image_frames(const AVFrame* left_frame, const AVFrame* right_frame);
+
+  // GPU path: lazily convert native YUV frames to packed RGB24 / RGB48LE so
+  // that subtraction mode, per-pixel inspector, and live PSNR/SSIM/VMAF can
+  // continue to work. The converted frames are cached per frame_key and
+  // reused across consecutive uses within the same frame.
+  bool ensure_rgb_frames(const AVFrame* left_frame, const AVFrame* right_frame);
 
   inline int static round(const float value) { return static_cast<int>(std::round(value)); }
 

@@ -523,6 +523,22 @@ Display::~Display() {
     delete[] right_buffer_;
   }
 
+  // GPU-mode RGB cache: release per-side FormatConverters and their packed
+  // RGB destination frames. diff_upload_frame_ is an AVFrame shell that
+  // aliases diff_buffer_ (freed above) — clear data[0] first so av_frame_free
+  // doesn't try to walk into memory it doesn't own.
+  for (int s = 0; s < kSideCount; ++s) {
+    if (rgb_frames_[s] != nullptr) {
+      av_freep(&rgb_frames_[s]->data[0]);
+      av_frame_free(&rgb_frames_[s]);
+    }
+    rgb_converter_[s].reset();
+  }
+  if (diff_upload_frame_ != nullptr) {
+    diff_upload_frame_->data[0] = nullptr;  // diff_buffer_ is owned separately
+    av_frame_free(&diff_upload_frame_);
+  }
+
   if (renderer_) {
     SDL_DestroyRenderer(renderer_);
   }
@@ -736,6 +752,17 @@ void Display::reinitialize_video_dimensions(const unsigned width, const unsigned
   }
   left_planes_ = {nullptr, nullptr, nullptr};
   right_planes_ = {nullptr, nullptr, nullptr};
+
+  // Drop any cached RGB conversion state — new video dims require fresh
+  // FormatConverter and RGB destination frames.
+  for (int s = 0; s < kSideCount; ++s) {
+    if (rgb_frames_[s] != nullptr) {
+      av_freep(&rgb_frames_[s]->data[0]);
+      av_frame_free(&rgb_frames_[s]);
+    }
+    rgb_converter_[s].reset();
+    rgb_frame_keys_[s].clear();
+  }
 
   move_offset_ = Vector2D((global_center_.x() - 0.5F) * static_cast<float>(video_width_), (global_center_.y() - 0.5F) * static_cast<float>(video_height_));
 
@@ -2501,6 +2528,75 @@ void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right
   }
 }
 
+// Lazily materialize packed RGB copies of the current native YUV  frames for
+// features that still need CPU pixel access (subtraction mode, per-pixel
+// inspector, live PSNR/SSIM/VMAF). Cached per frame_key so multiple consumers
+// in the same refresh share one conversion, and skipped entirely when none of
+// those features are active -- the normal GPU path stays YUV-only. Target
+// format mirrors what requires_10_bpc() selects so the existing RGB helpers
+// (update_difference, get_rgb_pixel, rgb_to_grayscale) interpret the pixels
+// correctly. Returns true when both sides are ready; callers must gate RGB-
+// dependent work on this.
+bool Display::ensure_rgb_frames(const AVFrame* left_frame, const AVFrame* right_frame) {
+  if (!gpu_renderer_active_) return true;  // SDL path frames are already RGB
+
+  // Target format matches what the existing CPU pixel helpers expect based on
+  // requires_10_bpc(): RGB48LE (10-bit) or RGB24 (8-bit).
+  const AVPixelFormat dst_fmt = requires_10_bpc() ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
+
+  auto ensure_side = [&](int side, const AVFrame* src, std::string& cache_key) -> bool {
+    if (!src || src->data[0] == nullptr || src->width <= 0 || src->height <= 0) return false;
+
+    const std::string new_key = get_frame_key(src);
+    if (!new_key.empty() && new_key == cache_key && rgb_frames_[side] != nullptr) {
+      return true;
+    }
+
+    // Allocate or (re)allocate the destination RGB frame if size/format changed.
+    if (rgb_frames_[side] == nullptr || rgb_frames_[side]->width != video_width_ ||
+        rgb_frames_[side]->height != video_height_ || rgb_frames_[side]->format != dst_fmt) {
+      if (rgb_frames_[side] != nullptr) {
+        av_freep(&rgb_frames_[side]->data[0]);
+        av_frame_free(&rgb_frames_[side]);
+      }
+      AVFrame* fr = av_frame_alloc();
+      if (!fr) return false;
+      fr->format = dst_fmt;
+      fr->width = video_width_;
+      fr->height = video_height_;
+      if (av_image_alloc(fr->data, fr->linesize, video_width_, video_height_, dst_fmt, 64) < 0) {
+        av_frame_free(&fr);
+        return false;
+      }
+      rgb_frames_[side] = fr;
+      // Force converter rebuild on the next conversion.
+      rgb_converter_[side].reset();
+    }
+
+    // Lazily construct / reuse the per-side FormatConverter (handles format
+    // changes itself via reinit on operator()). Initial params are seeded from
+    // the first frame we see.
+    if (!rgb_converter_[side]) {
+      rgb_converter_[side] = std::make_unique<FormatConverter>(
+          src->width, src->height, video_width_, video_height_,
+          static_cast<AVPixelFormat>(src->format), dst_fmt,
+          src->colorspace, src->color_range);
+    }
+
+    // Copy color/CLL props and invoke the converter. The converter sets
+    // frame_key metadata on dst from src automatically.
+    rgb_frames_[side]->colorspace = src->colorspace;
+    rgb_frames_[side]->color_range = src->color_range;
+    (*rgb_converter_[side])(const_cast<AVFrame*>(src), rgb_frames_[side]);
+    cache_key = new_key;
+    return true;
+  };
+
+  const bool ok_left = ensure_side(0, left_frame, rgb_frame_keys_[0]);
+  const bool ok_right = ensure_side(1, right_frame, rgb_frame_keys_[1]);
+  return ok_left && ok_right;
+}
+
 bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_frame, const std::string& current_total_browsable) {
   const std::string left_frame_key = get_frame_key(left_frame);
   const std::string right_frame_key = get_frame_key(right_frame);
@@ -2521,12 +2617,160 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // (loop-mode blink, fading message) even when no new input arrives.
     timer_based_update_performed_ = false;
 
+    // Features that still need CPU pixel access drive an on-demand YUV→RGB
+    // conversion. Skipped entirely when none are active to keep the pipeline
+    // GPU-fast.
+    const bool need_rgb = subtraction_mode_ || print_mouse_position_and_color_ ||
+                          print_image_similarity_metrics_ || show_quality_metrics_;
+    bool have_rgb = false;
+    if (need_rgb) {
+      have_rgb = ensure_rgb_frames(left_frame, right_frame);
+    }
+
+    // Pixel inspector + similarity metrics consume RGB frames and run before
+    // any visual update so a successful key press gets immediate feedback.
+    if (have_rgb) {
+      const Vector2D mouse_video_pos = window_to_video_position(mouse_x_, mouse_y_, zoom_rect);
+      const int mouse_video_x = mouse_video_pos.x();
+      const int mouse_video_y = mouse_video_pos.y();
+
+      if (print_mouse_position_and_color_) {
+        const bool print_left_pixel = mouse_video_x >= 0 && mouse_video_x < video_width_ && mouse_video_y >= 0 && mouse_video_y < video_height_;
+
+        bool print_right_pixel;
+        switch (mode_) {
+          case Mode::HStack:
+            print_right_pixel = mouse_video_x >= video_width_ && mouse_video_x < (2 * video_width_) && mouse_video_y >= 0 && mouse_video_y < video_height_;
+            break;
+          case Mode::VStack:
+            print_right_pixel = mouse_video_x >= 0 && mouse_video_x < video_width_ && mouse_video_y >= video_height_ && mouse_video_y < (video_height_ * 2);
+            break;
+          default:
+            print_right_pixel = print_left_pixel;
+        }
+
+        if (print_left_pixel || print_right_pixel) {
+          const int pixel_video_x = mouse_video_x % video_width_;
+          const int pixel_video_y = mouse_video_y % video_height_;
+
+          auto original_dims = [&](const AVFrame* frame) -> std::pair<int, int> {
+            const int ow = get_metadata_int_value(frame, "original_width", frame->width);
+            const int oh = get_metadata_int_value(frame, "original_height", frame->height);
+            return {ow, oh};
+          };
+          const auto od_left = original_dims(left_frame);
+          const auto od_right = original_dims(right_frame);
+
+          std::cout << "Left:  " << string_sprintf("[%4d,%4d]", pixel_video_x * od_left.first / video_width_, pixel_video_y * od_left.second / video_height_);
+          std::cout << ", " << get_and_format_rgb_yuv_pixel(rgb_frames_[0]->data[0], rgb_frames_[0]->linesize[0], rgb_frames_[0], pixel_video_x, pixel_video_y);
+          std::cout << " - ";
+          std::cout << "Right: " << string_sprintf("[%4d,%4d]", pixel_video_x * od_right.first / video_width_, pixel_video_y * od_right.second / video_height_);
+          std::cout << ", " << get_and_format_rgb_yuv_pixel(rgb_frames_[1]->data[0], rgb_frames_[1]->linesize[0], rgb_frames_[1], pixel_video_x, pixel_video_y);
+          std::cout << std::endl;
+        }
+        print_mouse_position_and_color_ = false;
+      }
+
+      if (print_image_similarity_metrics_) {
+        SDL_Rect roi = get_visible_roi_in_single_frame_coordinates();
+        if (roi.w <= 0 || roi.h <= 0) {
+          std::cerr << "ROI is empty, skipping metrics calculation" << std::endl;
+        } else {
+          SDL_Rect effective_roi_left{}, effective_roi_right{};
+          AVFrame* left_crop = crop_rgb_frame(rgb_frames_[0], roi, &effective_roi_left);
+          AVFrame* right_crop = crop_rgb_frame(rgb_frames_[1], roi, &effective_roi_right);
+          if (!SDL_RectsEqual(&effective_roi_left, &effective_roi_right)) {
+            std::cerr << "Error: Left and right effective ROIs are different" << std::endl;
+          } else {
+            const int crop_width = effective_roi_left.w;
+            const int crop_height = effective_roi_left.h;
+
+            float* left_gray = rgb_to_grayscale(left_crop->data[0], left_crop->linesize[0], crop_width, crop_height);
+            float* right_gray = rgb_to_grayscale(right_crop->data[0], right_crop->linesize[0], crop_width, crop_height);
+
+            const std::string psnr = compute_psnr(left_gray, right_gray, crop_width, crop_height);
+            const std::string ssim = compute_ssim(left_gray, right_gray, crop_width, crop_height);
+            const std::string vmaf = (left_crop && right_crop) ? VMAFCalculator::instance().compute(left_crop, right_crop) : "n/a";
+
+            const std::string roi_str =
+                (crop_width < video_width_ || crop_height < video_height_)
+                    ? string_sprintf("  (%d,%d)-(%d,%d)", effective_roi_left.x, effective_roi_left.y, effective_roi_left.x + crop_width - 1, effective_roi_left.y + crop_height - 1)
+                    : "";
+
+            std::cout << string_sprintf("Metrics: [%s|%s] PSNR(%s), SSIM(%s), VMAF(%s)%s",
+                                        format_position(ffmpeg::pts_in_secs(left_frame), false).c_str(),
+                                        format_position(ffmpeg::pts_in_secs(right_frame), false).c_str(),
+                                        psnr.c_str(), ssim.c_str(), vmaf.c_str(), roi_str.c_str())
+                      << std::endl;
+
+            delete[] left_gray;
+            delete[] right_gray;
+          }
+          if (left_crop) av_frame_free(&left_crop);
+          if (right_crop) av_frame_free(&right_crop);
+        }
+        print_image_similarity_metrics_ = false;
+      }
+
+      // Live on-screen quality metrics (rendered further down).
+      if (show_quality_metrics_ && video_width_ > 0 && video_height_ > 0) {
+        float* left_gray = rgb_to_grayscale(rgb_frames_[0]->data[0], rgb_frames_[0]->linesize[0], video_width_, video_height_);
+        float* right_gray = rgb_to_grayscale(rgb_frames_[1]->data[0], rgb_frames_[1]->linesize[0], video_width_, video_height_);
+        last_psnr_ = compute_psnr(left_gray, right_gray, video_width_, video_height_);
+        last_ssim_ = compute_ssim(left_gray, right_gray, video_width_, video_height_);
+        delete[] left_gray;
+        delete[] right_gray;
+
+        if (!play_) {
+          if (left_frame->pts != last_vmaf_left_pts_ || right_frame->pts != last_vmaf_right_pts_) {
+            last_vmaf_ = VMAFCalculator::instance().compute(rgb_frames_[0], rgb_frames_[1]);
+            last_vmaf_left_pts_ = left_frame->pts;
+            last_vmaf_right_pts_ = right_frame->pts;
+          }
+        }
+      }
+    } else {
+      // One-shot keys still need to be cleared so they don't re-fire next frame.
+      if (need_rgb) {
+        if (print_mouse_position_and_color_) print_mouse_position_and_color_ = false;
+        if (print_image_similarity_metrics_) print_image_similarity_metrics_ = false;
+      }
+    }
+
     // Upload frames only when they've actually changed (matches SDL path logic).
+    const bool gpu_subtraction = subtraction_mode_ && have_rgb;
+    const bool right_needs_update = input_received_ || has_updated_right_frame || (gpu_subtraction && has_updated_left_frame);
+
     if (input_received_ || has_updated_left_frame) {
       gpu_renderer_.upload_frame(0, left_frame);
     }
-    if (input_received_ || has_updated_right_frame) {
-      gpu_renderer_.upload_frame(1, right_frame);
+    if (right_needs_update) {
+      if (gpu_subtraction) {
+        // Compute the RGB diff into diff_buffer_ and hand it to libplacebo via
+        // a reusable AVFrame shell. When RGB conversion fails we fall back to
+        // the normal YUV upload below so the video stays visible.
+        std::array<uint8_t*, 3> rgb_l_planes{rgb_frames_[0]->data[0], nullptr, nullptr};
+        std::array<uint8_t*, 3> rgb_r_planes{rgb_frames_[1]->data[0], nullptr, nullptr};
+        std::array<size_t, 3> rgb_l_pitches{static_cast<size_t>(rgb_frames_[0]->linesize[0]), 0, 0};
+        std::array<size_t, 3> rgb_r_pitches{static_cast<size_t>(rgb_frames_[1]->linesize[0]), 0, 0};
+        update_difference(rgb_l_planes, rgb_l_pitches, rgb_r_planes, rgb_r_pitches, 0);
+
+        if (diff_upload_frame_ == nullptr) {
+          diff_upload_frame_ = av_frame_alloc();
+        }
+        diff_upload_frame_->format = rgb_frames_[1]->format;
+        diff_upload_frame_->width = video_width_;
+        diff_upload_frame_->height = video_height_;
+        diff_upload_frame_->data[0] = diff_buffer_;
+        for (int i = 1; i < AV_NUM_DATA_POINTERS; ++i) diff_upload_frame_->data[i] = nullptr;
+        diff_upload_frame_->linesize[0] = static_cast<int>(diff_pitches_[0]);
+        for (int i = 1; i < AV_NUM_DATA_POINTERS; ++i) diff_upload_frame_->linesize[i] = 0;
+        diff_upload_frame_->colorspace = rgb_frames_[1]->colorspace;
+        diff_upload_frame_->color_range = rgb_frames_[1]->color_range;
+        gpu_renderer_.upload_frame(1, diff_upload_frame_);
+      } else {
+        gpu_renderer_.upload_frame(1, right_frame);
+      }
     }
 
     // Compute mouse-x in video coordinates — identical to the SDL path.
@@ -3008,6 +3252,62 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
           push_selection_rect(drawable_rect, 128, 128, 255);
         } else {
           push_selection_rect(drawable_rect, 96, 96, 96, 3);
+        }
+      }
+    }
+
+    // Live quality metrics overlay (PSNR / SSIM / VMAF) — rendered at the
+    // top-right corner when show_quality_metrics_ is on. Suppressed while
+    // a full-screen panel is visible (they'd otherwise peek through).
+    if (show_quality_metrics_ && !show_help_ && !show_metadata_) {
+      const std::string vmaf_display = (last_vmaf_ == "n/a") ? std::string("n/a (pause to compute)") : last_vmaf_;
+      const std::array<std::string, 3> metric_lines = {
+          std::string("PSNR: ") + last_psnr_ + " dB",
+          std::string("SSIM: ") + last_ssim_,
+          std::string("VMAF: ") + vmaf_display,
+      };
+
+      std::array<SDL_Surface*, 3> metric_surfaces{{nullptr, nullptr, nullptr}};
+      int max_w = 0;
+      int total_h = 0;
+      const int metric_line_spacing = 4;
+      for (size_t i = 0; i < metric_lines.size(); ++i) {
+        SDL_Surface* raw = TTF_RenderText_Blended(small_font_, metric_lines[i].c_str(), 0, POSITION_COLOR);
+        if (!raw) continue;
+        SDL_Surface* rgba = SDL_ConvertSurface(raw, SDL_PIXELFORMAT_RGBA32);
+        SDL_DestroySurface(raw);
+        if (!rgba) continue;
+        metric_surfaces[i] = rgba;
+        text_surfaces.push_back(rgba);
+        max_w = std::max(max_w, rgba->w);
+        total_h += rgba->h + (i + 1 < metric_lines.size() ? metric_line_spacing : 0);
+      }
+
+      if (max_w > 0) {
+        const int padding = border_extension_ * 2;
+        const int right_margin = HELP_TEXT_HORIZONTAL_MARGIN;
+        const int top_margin = line2_y_ * 2;
+
+        const float bg_x = static_cast<float>(drawable_width_ - right_margin - max_w - padding * 2);
+        const float bg_y = static_cast<float>(top_margin);
+        const float bg_w = static_cast<float>(max_w + padding * 2);
+        const float bg_h = static_cast<float>(total_h + padding * 2);
+        push_rect(bg_x, bg_y, bg_x + bg_w, bg_y + bg_h, 0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 2));
+
+        float y = bg_y + padding;
+        for (size_t i = 0; i < metric_lines.size(); ++i) {
+          SDL_Surface* s = metric_surfaces[i];
+          if (!s) continue;
+          GpuRenderer::TextOverlayOp t{};
+          t.rgba_data = s->pixels;
+          t.width = s->w;
+          t.height = s->h;
+          t.stride = s->pitch;
+          t.dst_x = bg_x + padding;
+          t.dst_y = y;
+          t.alpha = 1.0f;
+          text_ops.push_back(t);
+          y += s->h + metric_line_spacing;
         }
       }
     }
