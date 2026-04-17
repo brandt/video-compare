@@ -2645,8 +2645,15 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     std::vector<SDL_Surface*> text_surfaces; // owns the per-frame surfaces
 
     if (show_hud_) {
+      enum class TextAlign { Left, Right };
+
+      // Render `text` to an RGBA surface, bake a left-edge alpha fade for any
+      // portion that would exceed `max_text_width_`, and push background +
+      // text overlay ops.  Matches the SDL `render_text` clip-and-fade logic:
+      // the END of long file paths stays visible, the beginning fades out.
+      // Returns the surface's (w, h) (before clipping).
       auto push_text = [&](const std::string& text, TTF_Font* font, SDL_Color color,
-                            int x, int y) -> std::pair<int, int> {
+                            int x, int y, TextAlign align) -> std::pair<int, int> {
         if (text.empty()) return {0, 0};
         SDL_Surface* raw = TTF_RenderText_Blended(font, text.c_str(), 0, color);
         if (!raw) return {0, 0};
@@ -2655,9 +2662,49 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         if (!rgba) return {0, 0};
         text_surfaces.push_back(rgba);
 
-        // Background rect behind the text.
-        push_rect(static_cast<float>(x - border_extension_), static_cast<float>(y - border_extension_),
-                  static_cast<float>(x + rgba->w + border_extension_),
+        const int clip_amount = std::max((rgba->w + double_border_extension_) - max_text_width_, 0);
+        const int gradient = std::min(clip_amount, 24);
+
+        // Bake alpha gradient into source pixels: alpha=0 for the clipped-out
+        // left portion, smoothly ramping to original alpha over `gradient` px.
+        if (clip_amount > 0) {
+          uint8_t* pixels = static_cast<uint8_t*>(rgba->pixels);
+          const int pitch = rgba->pitch;
+          for (int py = 0; py < rgba->h; ++py) {
+            uint8_t* row = pixels + py * pitch;
+            const int zero_end = std::min(clip_amount, rgba->w);
+            for (int px = 0; px < zero_end; ++px) {
+              row[px * 4 + 3] = 0;  // RGBA32: A is the 4th byte
+            }
+            if (gradient > 0) {
+              const int grad_end = std::min(clip_amount + gradient, rgba->w);
+              for (int px = clip_amount; px < grad_end; ++px) {
+                const int ramp = px - clip_amount;
+                row[px * 4 + 3] = static_cast<uint8_t>((row[px * 4 + 3] * ramp) / gradient);
+              }
+            }
+          }
+        }
+
+        // Position the texture so the visible (unclipped) portion lands at
+        // the requested (x, y) for left-aligned text, or ends at (x + w)
+        // for right-aligned text.  Clipped (transparent) pixels spill off
+        // to the side; libplacebo ignores them.
+        const int visible_w = rgba->w - clip_amount;
+        int dst_x_left;   // visible-region left edge in FBO coords
+        int tex_x;        // texture's own top-left in FBO coords
+        if (align == TextAlign::Left) {
+          dst_x_left = x;
+          tex_x = x - clip_amount;
+        } else {
+          dst_x_left = x + clip_amount;
+          tex_x = x;
+        }
+
+        // Background (hard edges, spans only the visible text region).
+        push_rect(static_cast<float>(dst_x_left - border_extension_),
+                  static_cast<float>(y - border_extension_),
+                  static_cast<float>(dst_x_left + visible_w + border_extension_),
                   static_cast<float>(y + rgba->h + border_extension_),
                   0, 0, 0, BACKGROUND_ALPHA);
 
@@ -2666,7 +2713,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         t.width = rgba->w;
         t.height = rgba->h;
         t.stride = rgba->pitch;
-        t.dst_x = static_cast<float>(x);
+        t.dst_x = static_cast<float>(tex_x);
         t.dst_y = static_cast<float>(y);
         t.alpha = 1.0f;
         text_ops.push_back(t);
@@ -2691,11 +2738,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         const std::string left_pos_str = format_position(left_position, true) + " " + left_pic + format_position_difference(left_position, right_position);
 
         if (mode_ == Mode::VStack) {
-          push_text(left_pos_str, small_font_, POSITION_COLOR, line1_y_, line1_y_);
-          push_text(left_label, small_font_, TEXT_COLOR, line1_y_, line2_y_);
+          push_text(left_pos_str, small_font_, POSITION_COLOR, line1_y_, line1_y_, TextAlign::Left);
+          push_text(left_label, small_font_, TEXT_COLOR, line1_y_, line2_y_, TextAlign::Left);
         } else {
-          push_text(left_label, small_font_, TEXT_COLOR, line1_y_, line1_y_);
-          push_text(left_pos_str, small_font_, POSITION_COLOR, line1_y_, line2_y_);
+          push_text(left_label, small_font_, TEXT_COLOR, line1_y_, line1_y_, TextAlign::Left);
+          push_text(left_pos_str, small_font_, POSITION_COLOR, line1_y_, line2_y_, TextAlign::Left);
         }
       }
       if (show_right_) {
@@ -2709,11 +2756,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         TTF_GetStringSize(small_font_, right_pos_str.c_str(), 0, &w_pos, &h_pos);
 
         if (mode_ == Mode::VStack) {
-          push_text(right_label, small_font_, TEXT_COLOR, line1_y_, drawable_height_ - line2_y_ - h_label);
-          push_text(right_pos_str, small_font_, POSITION_COLOR, line1_y_, drawable_height_ - line1_y_ - h_pos);
+          push_text(right_label, small_font_, TEXT_COLOR, line1_y_, drawable_height_ - line2_y_ - h_label, TextAlign::Left);
+          push_text(right_pos_str, small_font_, POSITION_COLOR, line1_y_, drawable_height_ - line1_y_ - h_pos, TextAlign::Left);
         } else {
-          push_text(right_label, small_font_, TEXT_COLOR, drawable_width_ - line1_y_ - w_label, line1_y_);
-          push_text(right_pos_str, small_font_, POSITION_COLOR, drawable_width_ - line1_y_ - w_pos, line2_y_);
+          push_text(right_label, small_font_, TEXT_COLOR, drawable_width_ - line1_y_ - w_label, line1_y_, TextAlign::Right);
+          push_text(right_pos_str, small_font_, POSITION_COLOR, drawable_width_ - line1_y_ - w_pos, line2_y_, TextAlign::Right);
         }
       }
     }
