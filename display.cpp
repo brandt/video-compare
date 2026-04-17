@@ -348,9 +348,32 @@ Display::Display(const int display_number,
     throw std::runtime_error{"Window height cannot be less than " + std::to_string(MIN_WINDOW_HEIGHT)};
   }
 
-  const SDL_WindowFlags create_window_flags = SDL_WINDOW_RESIZABLE | (high_dpi_allowed_ ? SDL_WINDOW_HIGH_PIXEL_DENSITY : 0);
-  window_ = check_sdl(SDL_CreateWindow(format_window_title(left_file_name, right_file_name).c_str(), window_width, window_height, create_window_flags),
-                      "window");
+  // Try creating a Vulkan window for GPU-accelerated rendering.
+  // Fall back to SDL_Renderer if Vulkan initialisation fails.
+  SDL_WindowFlags create_window_flags = SDL_WINDOW_RESIZABLE | (high_dpi_allowed_ ? SDL_WINDOW_HIGH_PIXEL_DENSITY : 0);
+  renderer_ = nullptr;
+
+  // Attempt Vulkan path first.
+  window_ = SDL_CreateWindow(format_window_title(left_file_name, right_file_name).c_str(),
+                             window_width, window_height,
+                             create_window_flags | SDL_WINDOW_VULKAN);
+  if (window_ && gpu_renderer_.init(window_)) {
+    gpu_renderer_active_ = true;
+    std::cerr << "Display: using libplacebo GPU renderer" << std::endl;
+  } else {
+    // Vulkan failed — destroy the window (if created) and try without Vulkan.
+    if (window_) {
+      gpu_renderer_.destroy();
+      SDL_DestroyWindow(window_);
+      window_ = nullptr;
+    }
+    window_ = check_sdl(SDL_CreateWindow(format_window_title(left_file_name, right_file_name).c_str(),
+                                         window_width, window_height, create_window_flags),
+                        "window");
+    gpu_renderer_active_ = false;
+    std::cerr << "Display: Vulkan unavailable, using SDL_Renderer" << std::endl;
+  }
+
   SDL_SetWindowPosition(window_, window_x, window_y);
 
   SDL_IOStream* embedded_icon = check_sdl(SDL_IOFromConstMem(VIDEO_COMPARE_ICON_BMP, VIDEO_COMPARE_ICON_BMP_LEN), "get pointer to icon");
@@ -367,21 +390,21 @@ Display::Display(const int display_number,
 
   SDL_DestroySurface(icon_surface);
 
-  {
+  if (!gpu_renderer_active_) {
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetPointerProperty(props, SDL_PROP_RENDERER_CREATE_WINDOW_POINTER, window_);
     SDL_SetNumberProperty(props, SDL_PROP_RENDERER_CREATE_OUTPUT_COLORSPACE_NUMBER, SDL_COLORSPACE_SRGB_LINEAR);
     renderer_ = check_sdl(SDL_CreateRendererWithProperties(props), "renderer");
     SDL_DestroyProperties(props);
+    SDL_SetRenderVSync(renderer_, 1);
+
+    // Detect HDR display capability (SDL renderer path)
+    update_hdr_display_state();
+
+    SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+    SDL_RenderClear(renderer_);
+    SDL_RenderPresent(renderer_);
   }
-  SDL_SetRenderVSync(renderer_, 1);
-
-  // Detect HDR display capability
-  update_hdr_display_state();
-
-  SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
-  SDL_RenderClear(renderer_);
-  SDL_RenderPresent(renderer_);
 
   SDL_GetWindowSizeInPixels(window_, &drawable_width_, &drawable_height_);
   SDL_GetWindowSize(window_, &window_width_, &window_height_);
@@ -425,7 +448,9 @@ Display::Display(const int display_number,
   pan_mode_cursor_ = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_MOVE);
   selection_mode_cursor_ = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR);
 
-  SDL_SetRenderLogicalPresentation(renderer_, drawable_width_, drawable_height_, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+  if (renderer_) {
+    SDL_SetRenderLogicalPresentation(renderer_, drawable_width_, drawable_height_, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+  }
 
   // Store left/right names before reinitializing dimensions since it may refresh title text.
   left_file_name_ = left_file_name;
@@ -453,19 +478,26 @@ Display::Display(const int display_number,
 }
 
 Display::~Display() {
+  if (gpu_renderer_active_) {
+    gpu_renderer_.destroy();
+  }
+
   for (int s = 0; s < kSideCount; s++) {
     if (side_textures_linear_[s]) SDL_DestroyTexture(side_textures_linear_[s]);
     if (side_textures_nn_[s]) SDL_DestroyTexture(side_textures_nn_[s]);
   }
-  SDL_DestroyTexture(side_ui_[LEFT.as_simple_index()].text_texture);
-  SDL_DestroyTexture(side_ui_[RIGHT.as_simple_index()].text_texture);
 
-  if (message_texture_ != nullptr) {
-    SDL_DestroyTexture(message_texture_);
-  }
+  if (!gpu_renderer_active_) {
+    SDL_DestroyTexture(side_ui_[LEFT.as_simple_index()].text_texture);
+    SDL_DestroyTexture(side_ui_[RIGHT.as_simple_index()].text_texture);
 
-  for (auto help_texture : help_textures_) {
-    SDL_DestroyTexture(help_texture);
+    if (message_texture_ != nullptr) {
+      SDL_DestroyTexture(message_texture_);
+    }
+
+    for (auto help_texture : help_textures_) {
+      SDL_DestroyTexture(help_texture);
+    }
   }
 
   TTF_CloseFont(small_font_);
@@ -484,11 +516,16 @@ Display::~Display() {
     delete[] right_buffer_;
   }
 
-  SDL_DestroyRenderer(renderer_);
+  if (renderer_) {
+    SDL_DestroyRenderer(renderer_);
+  }
   SDL_DestroyWindow(window_);
 }
 
 void Display::recreate_video_textures_for_current_mode() {
+  // GPU renderer: no SDL textures needed for video frames.
+  if (gpu_renderer_active_) return;
+
   for (int s = 0; s < kSideCount; s++) {
     if (side_textures_linear_[s] != nullptr) {
       SDL_DestroyTexture(side_textures_linear_[s]);
@@ -721,8 +758,12 @@ void Display::print_verbose_info() {
   const int ttf_ver = TTF_Version();
   std::cout << "SDL_ttf version:       " << string_sprintf("%u.%u.%u", SDL_VERSIONNUM_MAJOR(ttf_ver), SDL_VERSIONNUM_MINOR(ttf_ver), SDL_VERSIONNUM_MICRO(ttf_ver)) << std::endl;
 
-  const char* renderer_name = SDL_GetRendererName(renderer_);
-  std::cout << "SDL renderer:          " << (renderer_name ? renderer_name : "unknown") << std::endl;
+  if (gpu_renderer_active_) {
+    std::cout << "SDL renderer:          libplacebo (Vulkan)" << std::endl;
+  } else {
+    const char* renderer_name = SDL_GetRendererName(renderer_);
+    std::cout << "SDL renderer:          " << (renderer_name ? renderer_name : "unknown") << std::endl;
+  }
 
   SDL_DisplayID current_display_id = SDL_GetDisplayForWindow(window_);
   std::cout << "SDL display ID:        " << current_display_id << std::endl;
@@ -768,6 +809,7 @@ void Display::rebuild_fonts() {
 }
 
 void Display::rebuild_side_ui_textures() {
+  if (gpu_renderer_active_) return; // no SDL textures in GPU renderer mode
   auto rebuild_side = [&](Side side, const std::string& label) {
     auto& ui = side_ui_[side.as_simple_index()];
     if (ui.text_texture != nullptr) {
@@ -790,6 +832,7 @@ void Display::rebuild_side_ui_textures() {
 }
 
 void Display::rebuild_help_textures() {
+  if (gpu_renderer_active_) return; // no SDL textures in GPU renderer mode
   // Rebuild all help textures because wrapping and layout depend on drawable width.
   for (auto help_texture : help_textures_) {
     SDL_DestroyTexture(help_texture);
@@ -1022,6 +1065,10 @@ void Display::handle_window_resize(const bool reset_forced_size_guard, const boo
   window_width_ = new_window_w;
   window_height_ = new_window_h;
 
+  if (gpu_renderer_active_) {
+    gpu_renderer_.resize(drawable_width_, drawable_height_);
+  }
+
   drawable_to_window_width_factor_ = static_cast<float>(drawable_width_) / static_cast<float>(window_width_);
   drawable_to_window_height_factor_ = static_cast<float>(drawable_height_) / static_cast<float>(window_height_);
   update_content_window_layout();
@@ -1041,7 +1088,9 @@ void Display::handle_window_resize(const bool reset_forced_size_guard, const boo
   }
 
   // Rebuild cached UI assets that are size-dependent (fonts, help, metadata, labels).
-  SDL_SetRenderLogicalPresentation(renderer_, drawable_width_, drawable_height_, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+  if (renderer_) {
+    SDL_SetRenderLogicalPresentation(renderer_, drawable_width_, drawable_height_, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+  }
 
   rebuild_fonts();
   rebuild_side_ui_textures();
@@ -1960,6 +2009,7 @@ void Display::refresh_display_side_mapping() {
 }
 
 void Display::build_metadata_textures(const VideoMetadata& left_metadata, const VideoMetadata& right_metadata) {
+  if (gpu_renderer_active_) return;
   constexpr char TOKENIZER = ',';
 
   for (auto texture : metadata_textures_) {
@@ -2443,6 +2493,79 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   if (!input_received_ && !has_updated_left_frame && !has_updated_right_frame && !timer_based_update_performed_ && pending_message_.empty()) {
     return false;
   }
+
+  // --- GPU renderer path (Phase 1: video frames only, no HUD) ---
+  if (gpu_renderer_active_) {
+    const bool compare_mode = show_left_ && show_right_;
+    const auto zoom_rect = compute_zoom_rect();
+
+    // Upload frames only when they've actually changed (matches SDL path logic).
+    if (input_received_ || has_updated_left_frame) {
+      gpu_renderer_.upload_frame(0, left_frame);
+    }
+    if (input_received_ || has_updated_right_frame) {
+      gpu_renderer_.upload_frame(1, right_frame);
+    }
+
+    // Compute mouse-x in video coordinates — identical to the SDL path.
+    const float content_mouse_x = static_cast<float>(mouse_x_ - content_window_.x);
+    const float safe_content_window_w = static_cast<float>(std::max(1, content_window_.w));
+    const float full_ws_mouse_video_x = (content_mouse_x * safe_content_window_w / std::max(1.0F, safe_content_window_w - 1.0F)) * video_to_window_width_factor_;
+    const float video_mouse_x = (full_ws_mouse_video_x - zoom_rect.start.x()) * static_cast<float>(video_width_) / zoom_rect.size.x();
+
+    const int split_x = (compare_mode && mode_ == Mode::Split)
+                             ? clamp_range(std::round(video_mouse_x), 0.0F, float(video_width_))
+                             : show_left_ ? video_width_ : 0;
+
+    // Build render ops using the exact same coordinate chain as the SDL path:
+    // video rect -> video_to_zoom_space -> video_rect_to_drawable_transform.
+    std::array<GpuRenderer::SideRenderOp, 2> ops{};
+    int op_count = 0;
+
+    auto push_op = [&](int side, int src_x, int src_y, int src_w, int src_h,
+                        const SDL_Rect& video_quad) {
+      const SDL_FRect screen_rect = video_rect_to_drawable_transform(video_to_zoom_space(video_quad, zoom_rect));
+      GpuRenderer::SideRenderOp& op = ops[op_count++];
+      op.side = side;
+      op.src_x0 = static_cast<float>(src_x);
+      op.src_y0 = static_cast<float>(src_y);
+      op.src_x1 = static_cast<float>(src_x + src_w);
+      op.src_y1 = static_cast<float>(src_y + src_h);
+      op.dst_x0 = screen_rect.x;
+      op.dst_y0 = screen_rect.y;
+      op.dst_x1 = screen_rect.x + screen_rect.w;
+      op.dst_y1 = screen_rect.y + screen_rect.h;
+    };
+
+    if (show_left_ || show_right_) {
+      if (show_left_ && split_x > 0) {
+        const SDL_Rect video_quad_left = {0, 0, split_x, video_height_};
+        push_op(0, 0, 0, split_x, video_height_, video_quad_left);
+      }
+      if (show_right_ && ((split_x < video_width_) || mode_ != Mode::Split)) {
+        const int start_right = (mode_ == Mode::Split) ? std::max(split_x, 0) : 0;
+        const int right_x_offset = (mode_ == Mode::HStack) ? video_width_ : 0;
+        const int right_y_offset = (mode_ == Mode::VStack) ? video_height_ : 0;
+        const SDL_Rect video_quad_right = {right_x_offset + start_right, right_y_offset, video_width_ - start_right, video_height_};
+        push_op(1, start_right, 0, video_width_ - start_right, video_height_, video_quad_right);
+      }
+    }
+
+    if (gpu_renderer_.render(ops.data(), op_count, nullptr)) {
+      gpu_renderer_.present();
+    }
+
+    // Consume pending messages (just clear them — no HUD in Phase 1)
+    pending_message_.clear();
+
+    input_received_ = false;
+    previous_left_frame_pts_ = left_frame->pts;
+    previous_right_frame_pts_ = right_frame->pts;
+    previous_left_frame_key_ = left_frame_key;
+    previous_right_frame_key_ = right_frame_key;
+    return true;
+  }
+  // --- End GPU renderer path ---
 
   std::array<uint8_t*, 3> planes_left{left_frame->data[0], left_frame->data[1], left_frame->data[2]};
   std::array<uint8_t*, 3> planes_right{right_frame->data[0], right_frame->data[1], right_frame->data[2]};
@@ -2973,6 +3096,12 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   previous_right_frame_key_ = right_frame_key;
 
   return true;
+}
+
+void Display::upload_native_frame(int side, const AVFrame* frame) {
+  if (gpu_renderer_active_) {
+    gpu_renderer_.upload_frame(side, frame);
+  }
 }
 
 void Display::set_pending_message(const std::string& message) {

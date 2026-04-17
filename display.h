@@ -13,6 +13,7 @@
 #include <tuple>
 #include <vector>
 #include "core_types.h"
+#include "gpu_renderer.h"
 #include "row_workers.h"
 #include "scope_window.h"
 #include "string_utils.h"
@@ -318,7 +319,11 @@ class Display {
   int message_height_;
 
   SDL_Window* window_;
-  SDL_Renderer* renderer_;
+  SDL_Renderer* renderer_;  // nullptr when gpu_renderer_active_
+
+  // libplacebo GPU renderer (Phase 1: video frames only, no HUD).
+  GpuRenderer gpu_renderer_;
+  bool gpu_renderer_active_{false};
 
   // Per-side video textures (each is video_width_ × video_height_).
   // Index 0 = left side, 1 = right side.
@@ -536,6 +541,12 @@ class Display {
 
   std::pair<SDL_Rect, SDL_Rect> get_visible_rois_in_single_frame_coordinates() const;
   SDL_Rect get_visible_roi_in_single_frame_coordinates() const;
+
+  bool get_gpu_renderer_active() const { return gpu_renderer_active_; }
+
+  // Upload a native-format (decoded/filtered) AVFrame for GPU rendering.
+  // Must be called before possibly_refresh() when gpu_renderer_active_.
+  void upload_native_frame(int side, const AVFrame* frame);
 
   bool get_hdr_display_available() const;
   float get_hdr_display_headroom() const;

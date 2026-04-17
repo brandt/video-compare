@@ -51,6 +51,13 @@ ifneq "$(wildcard /usr/include/ffmpeg)" ""
   CXXFLAGS += -I/usr/include/ffmpeg
 endif
 
+# libplacebo GPU renderer (Vulkan via MoltenVK on macOS)
+ifneq "$(wildcard /opt/homebrew/opt/libplacebo)" ""
+  CXXFLAGS += -I/opt/homebrew/opt/libplacebo/include/
+  LDLIBS += -L/opt/homebrew/opt/libplacebo/lib/
+endif
+LDLIBS += -lplacebo
+
 # Default: don't use pkg-config unless user explicitly enables it
 # Usage: make USE_PKG_CONFIG=1
 USE_PKG_CONFIG ?= 0
@@ -61,8 +68,9 @@ else
   LDLIBS += -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lSDL3_ttf -lSDL3
 endif
 
-src = $(wildcard *.cpp)
-obj = $(src:.cpp=.o)
+cpp_src = $(wildcard *.cpp)
+c_src = $(wildcard *.c)
+obj = $(cpp_src:.cpp=.o) $(c_src:.c=.o)
 dep = $(obj:.o=.d)
 target = video-compare
 
@@ -75,6 +83,15 @@ $(target): $(obj)
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -MMD -MP -MF $(@:.o=.d) -c -o $@ $<
+
+CFLAGS = -g3 -Ofast -D__STDC_CONSTANT_MACROS -Wall -Wextra -Wno-unused
+CC ?= cc
+
+# Inherit the same include/lib paths as C++ (strip C++-only flags)
+C_INCLUDES = $(filter -I%,$(CXXFLAGS))
+
+%.o: %.c
+	$(CC) $(CFLAGS) $(C_INCLUDES) -MMD -MP -MF $(@:.o=.d) -c -o $@ $<
 
 test: $(target)
 	./$(target) -w 800x screenshot_1.jpg screenshot_2.jpg

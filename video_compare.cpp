@@ -241,12 +241,18 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
     }
   }
 
-  // Initialize filterers using VideoFilterContext for consistent auto-filter determination
-  const AVPixelFormat output_pixel_format = determine_pixel_format(config, hdr_passthrough_active_);
+  // Initialize filterers using VideoFilterContext for consistent auto-filter determination.
+  // gpu_color_processing = true: skip CPU tonemap/color conversion in the filter chain.
+  // libplacebo's GPU renderer handles all color conversion. If GPU init fails,
+  // FormatConverter's sws_scale provides a basic fallback.
+  const bool gpu_color_processing = true;
+  const AVPixelFormat output_pixel_format = gpu_color_processing ? AV_PIX_FMT_NONE : determine_pixel_format(config, hdr_passthrough_active_);
+  const bool filterer_hdr_passthrough = gpu_color_processing ? false : hdr_passthrough_active_;
 
   install_processor(video_filterers_, ReadyToSeek::ProcessorThread::Filterer, LEFT,
                     std::make_unique<VideoFilterer>(LEFT, demuxers_[LEFT].get(), video_decoders_[LEFT].get(), config.left.tone_mapping_mode, config.left.boost_tone, config.left.video_filters, config.left.color_space,
-                                                    config.left.color_range, config.left.color_primaries, config.left.color_trc, &video_filter_context_, config.disable_auto_filters, output_pixel_format, hdr_passthrough_active_));
+                                                    config.left.color_range, config.left.color_primaries, config.left.color_trc, &video_filter_context_, config.disable_auto_filters, output_pixel_format, filterer_hdr_passthrough,
+                                                    gpu_color_processing));
 
   // For each right video, use VideoFilterContext for auto-filter determination
   for (size_t i = 0; i < config.right_videos.size(); ++i) {
@@ -256,7 +262,7 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
     install_processor(video_filterers_, ReadyToSeek::ProcessorThread::Filterer, right_side,
                       std::make_unique<VideoFilterer>(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.tone_mapping_mode, right_config.boost_tone, right_config.video_filters,
                                                       right_config.color_space, right_config.color_range, right_config.color_primaries, right_config.color_trc, &video_filter_context_, config.disable_auto_filters, output_pixel_format,
-                                                      hdr_passthrough_active_));
+                                                      filterer_hdr_passthrough, gpu_color_processing));
   }
 
   // Calculate max dimensions from all videos
@@ -450,10 +456,13 @@ bool VideoCompare::handle_hdr_state_change() {
   std::cerr << "HDR state changed; " << (new_passthrough ? "enabling" : "disabling") << " HDR passthrough." << std::endl;
 
   // Reconstruct filterers with new HDR passthrough state
-  const AVPixelFormat output_pixel_format = determine_pixel_format(config_, hdr_passthrough_active_);
+  const bool gpu_color = display_ && display_->get_gpu_renderer_active();
+  const AVPixelFormat output_pixel_format = gpu_color ? AV_PIX_FMT_NONE : determine_pixel_format(config_, hdr_passthrough_active_);
+  const bool filt_hdr_pt = gpu_color ? false : hdr_passthrough_active_;
 
   video_filterers_[LEFT] = std::make_unique<VideoFilterer>(LEFT, demuxers_[LEFT].get(), video_decoders_[LEFT].get(), config_.left.tone_mapping_mode, config_.left.boost_tone, config_.left.video_filters, config_.left.color_space,
-                                                           config_.left.color_range, config_.left.color_primaries, config_.left.color_trc, &video_filter_context_, config_.disable_auto_filters, output_pixel_format, hdr_passthrough_active_);
+                                                           config_.left.color_range, config_.left.color_primaries, config_.left.color_trc, &video_filter_context_, config_.disable_auto_filters, output_pixel_format, filt_hdr_pt,
+                                                           gpu_color);
 
   for (size_t i = 0; i < config_.right_videos.size(); ++i) {
     const auto& right_config = config_.right_videos[i];
@@ -461,7 +470,7 @@ bool VideoCompare::handle_hdr_state_change() {
 
     video_filterers_[right_side] = std::make_unique<VideoFilterer>(right_side, demuxers_[right_side].get(), video_decoders_[right_side].get(), right_config.tone_mapping_mode, right_config.boost_tone, right_config.video_filters,
                                                                    right_config.color_space, right_config.color_range, right_config.color_primaries, right_config.color_trc, &video_filter_context_, config_.disable_auto_filters,
-                                                                   output_pixel_format, hdr_passthrough_active_);
+                                                                   output_pixel_format, filt_hdr_pt, gpu_color);
   }
 
   // Recalculate dimensions and recreate format converters
@@ -720,18 +729,30 @@ void VideoCompare::format_convert_video(const Side& side) {
       AVFrameUniquePtr frame_filtered{av_frame_alloc(), avframe_deleter};
 
       if (filtered_frame_queues_[side]->pop(frame_filtered)) {
-        // scale and convert pixel format before pushing to frame queue for displaying
-        AVFrameUniquePtr frame_converted{av_frame_alloc(), avframe_and_data_deleter};
+        if (display_ && display_->get_gpu_renderer_active()) {
+          // GPU renderer: pass filtered frame through without CPU format conversion.
+          // Ensure frame_key metadata is set (normally done by FormatConverter).
+          const AVDictionaryEntry* gen = av_dict_get(frame_filtered->metadata, "filter_generation", nullptr, 0);
+          const std::string frame_key = std::to_string(frame_filtered->pts) + ":" + (gen ? gen->value : "0");
+          set_frame_key(frame_filtered.get(), frame_key);
+          av_dict_set(&frame_filtered->metadata, "original_width", std::to_string(frame_filtered->width).c_str(), 0);
+          av_dict_set(&frame_filtered->metadata, "original_height", std::to_string(frame_filtered->height).c_str(), 0);
 
-        if (av_frame_copy_props(frame_converted.get(), frame_filtered.get()) < 0) {
-          throw std::runtime_error("Copying filtered frame properties");
-        }
-        if (av_image_alloc(frame_converted->data, frame_converted->linesize, format_converters_[side]->dest_width(), format_converters_[side]->dest_height(), format_converters_[side]->dest_pixel_format(), 64) < 0) {
-          throw std::runtime_error("Allocating converted picture");
-        }
-        (*format_converters_[side])(frame_filtered.get(), frame_converted.get());
+          converted_frame_queues_[side]->push(std::move(frame_filtered));
+        } else {
+          // scale and convert pixel format before pushing to frame queue for displaying
+          AVFrameUniquePtr frame_converted{av_frame_alloc(), avframe_and_data_deleter};
 
-        converted_frame_queues_[side]->push(std::move(frame_converted));
+          if (av_frame_copy_props(frame_converted.get(), frame_filtered.get()) < 0) {
+            throw std::runtime_error("Copying filtered frame properties");
+          }
+          if (av_image_alloc(frame_converted->data, frame_converted->linesize, format_converters_[side]->dest_width(), format_converters_[side]->dest_height(), format_converters_[side]->dest_pixel_format(), 64) < 0) {
+            throw std::runtime_error("Allocating converted picture");
+          }
+          (*format_converters_[side])(frame_filtered.get(), frame_converted.get());
+
+          converted_frame_queues_[side]->push(std::move(frame_converted));
+        }
       } else if (filtered_frame_queues_[side]->is_stopped() || is_seeking(side)) {
         // Stop filtering
         converted_frame_queues_[side]->stop();

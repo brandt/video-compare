@@ -63,13 +63,15 @@ VideoFilterer::VideoFilterer(const Side& side,
                              const VideoFilterContext* video_filter_context,
                              const bool disable_auto_filters,
                              const AVPixelFormat output_pixel_format,
-                             const bool hdr_passthrough)
+                             const bool hdr_passthrough,
+                             const bool gpu_color_processing)
     : SideAware(side),
       demuxer_(demuxer),
       video_decoder_(video_decoder),
       tone_mapping_mode_(tone_mapping_mode),
       output_pixel_format_(output_pixel_format),
       hdr_passthrough_(hdr_passthrough),
+      gpu_color_processing_(gpu_color_processing),
       width_(video_decoder->width()),
       height_(video_decoder->height()),
       pixel_format_(video_decoder->pixel_format()),
@@ -149,7 +151,9 @@ VideoFilterer::VideoFilterer(const Side& side,
 
   dynamic_range_ = video_decoder->infer_dynamic_range(custom_color_trc);
   const bool is_hdr_trc = dynamic_range_ != DynamicRange::Standard;
-  const bool must_tonemap = !hdr_passthrough_ && (tone_mapping_mode == ToneMapping::FullRange || tone_mapping_mode == ToneMapping::Relative || (tone_mapping_mode == ToneMapping::Auto && is_hdr_trc));
+  // GPU color processing (libplacebo) handles all color conversion on the GPU —
+  // skip CPU tone mapping, HDR passthrough filters, and format conversion.
+  const bool must_tonemap = !gpu_color_processing_ && !hdr_passthrough_ && (tone_mapping_mode == ToneMapping::FullRange || tone_mapping_mode == ToneMapping::Relative || (tone_mapping_mode == ToneMapping::Auto && is_hdr_trc));
 
   // resolve initial peak luminance
   peak_luminance_nits_ = video_decoder->safe_peak_luminance_nits(dynamic_range_);
@@ -253,7 +257,8 @@ VideoFilterer::VideoFilterer(const Side& side,
   }
 
   // HDR passthrough: PQ content passes through unchanged; HLG needs transfer conversion to PQ.
-  if (hdr_passthrough_ && is_hdr_trc) {
+  // (Skipped when GPU handles color processing — libplacebo converts HLG natively.)
+  if (hdr_passthrough_ && !gpu_color_processing_ && is_hdr_trc) {
     if (dynamic_range_ == DynamicRange::HLG) {
       if (avfilter_get_by_name("zscale")) {
         post_filters.push_back("zscale=t=smpte2084");
