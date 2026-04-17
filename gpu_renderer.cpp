@@ -259,6 +259,11 @@ bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
   if (num_overlays > 0 && ensure_white_tex(vk_->gpu, &white_tex_)) {
     primitive_parts.reserve(num_overlays);
     for (int i = 0; i < num_overlays; ++i) {
+      // libplacebo asserts non-zero dst extent; skip degenerate rects.
+      if (overlays[i].dst_x1 <= overlays[i].dst_x0 ||
+          overlays[i].dst_y1 <= overlays[i].dst_y0) {
+        continue;
+      }
       struct pl_overlay_part p = {};
       p.src.x0 = 0; p.src.y0 = 0; p.src.x1 = 1; p.src.y1 = 1;
       p.dst.x0 = overlays[i].dst_x0;
@@ -268,14 +273,16 @@ bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
       memcpy(p.color, overlays[i].color, sizeof(p.color));
       primitive_parts.push_back(p);
     }
-    primitive_overlay.tex = white_tex_;
-    primitive_overlay.mode = PL_OVERLAY_MONOCHROME;
-    primitive_overlay.coords = PL_OVERLAY_COORDS_DST_FRAME;
-    primitive_overlay.repr = pl_color_repr_rgb;
-    primitive_overlay.color = pl_color_space_srgb;
-    primitive_overlay.parts = primitive_parts.data();
-    primitive_overlay.num_parts = static_cast<int>(primitive_parts.size());
-    have_primitives = true;
+    if (!primitive_parts.empty()) {
+      primitive_overlay.tex = white_tex_;
+      primitive_overlay.mode = PL_OVERLAY_MONOCHROME;
+      primitive_overlay.coords = PL_OVERLAY_COORDS_DST_FRAME;
+      primitive_overlay.repr = pl_color_repr_rgb;
+      primitive_overlay.color = pl_color_space_srgb;
+      primitive_overlay.parts = primitive_parts.data();
+      primitive_overlay.num_parts = static_cast<int>(primitive_parts.size());
+      have_primitives = true;
+    }
   }
 
   // No overlays attached to target during side renders — we composite overlays

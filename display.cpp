@@ -502,6 +502,11 @@ Display::~Display() {
     }
   }
 
+  for (auto s : help_surfaces_) SDL_DestroySurface(s);
+  help_surfaces_.clear();
+  for (auto s : metadata_surfaces_) SDL_DestroySurface(s);
+  metadata_surfaces_.clear();
+
   TTF_CloseFont(small_font_);
   TTF_CloseFont(big_font_);
 
@@ -834,28 +839,33 @@ void Display::rebuild_side_ui_textures() {
 }
 
 void Display::rebuild_help_textures() {
-  if (gpu_renderer_active_) return; // no SDL textures in GPU renderer mode
-  // Rebuild all help textures because wrapping and layout depend on drawable width.
-  for (auto help_texture : help_textures_) {
-    SDL_DestroyTexture(help_texture);
-  }
+  // Wrapping and layout depend on drawable width, so everything is rebuilt.
+  for (auto help_texture : help_textures_) SDL_DestroyTexture(help_texture);
   help_textures_.clear();
+  for (auto s : help_surfaces_) SDL_DestroySurface(s);
+  help_surfaces_.clear();
   help_total_height_ = 0;
 
   bool primary_color = true;
 
   // Helper to render one line and track its height for scrolling math.
   auto add_help_texture = [&](TTF_Font* font, const std::string& text) {
-    int h;
-
     SDL_Surface* surface = TTF_RenderText_Blended_Wrapped(font, text.c_str(), 0, primary_color ? HELP_TEXT_PRIMARY_COLOR : HELP_TEXT_ALTERNATE_COLOR, drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2);
-    SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, surface);
-    SDL_DestroySurface(surface);
+    if (!surface) return;
 
-    { float tw, th; SDL_GetTextureSize(texture, &tw, &th); h = static_cast<int>(th); }
-    help_total_height_ += h;
-
-    help_textures_.push_back(texture);
+    if (gpu_renderer_active_) {
+      SDL_Surface* rgba = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
+      SDL_DestroySurface(surface);
+      if (!rgba) return;
+      help_total_height_ += rgba->h;
+      help_surfaces_.push_back(rgba);
+    } else {
+      SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, surface);
+      SDL_DestroySurface(surface);
+      float tw, th; SDL_GetTextureSize(texture, &tw, &th);
+      help_total_height_ += static_cast<int>(th);
+      help_textures_.push_back(texture);
+    }
   };
 
   add_help_texture(small_font_, " ");
@@ -893,14 +903,16 @@ void Display::rebuild_help_textures() {
 }
 
 void Display::clamp_overlay_offsets() {
-  auto clamp_offset = [&](int& y_offset, const int total_height, const std::vector<SDL_Texture*>& textures) {
-    const int min_offset = drawable_height_ - total_height - static_cast<int>(textures.size()) * HELP_TEXT_LINE_SPACING;
+  auto clamp_offset = [&](int& y_offset, const int total_height, const size_t count) {
+    const int min_offset = drawable_height_ - total_height - static_cast<int>(count) * HELP_TEXT_LINE_SPACING;
     y_offset = std::max(y_offset, min_offset);
     y_offset = std::min(y_offset, 0);
   };
 
-  clamp_offset(help_y_offset_, help_total_height_, help_textures_);
-  clamp_offset(metadata_y_offset_, metadata_total_height_, metadata_textures_);
+  const size_t help_count = gpu_renderer_active_ ? help_surfaces_.size() : help_textures_.size();
+  const size_t meta_count = gpu_renderer_active_ ? metadata_surfaces_.size() : metadata_textures_.size();
+  clamp_offset(help_y_offset_, help_total_height_, help_count);
+  clamp_offset(metadata_y_offset_, metadata_total_height_, meta_count);
 }
 
 float Display::compute_content_aspect_ratio() const {
@@ -2011,31 +2023,35 @@ void Display::refresh_display_side_mapping() {
 }
 
 void Display::build_metadata_textures(const VideoMetadata& left_metadata, const VideoMetadata& right_metadata) {
-  if (gpu_renderer_active_) return;
   constexpr char TOKENIZER = ',';
 
-  for (auto texture : metadata_textures_) {
-    SDL_DestroyTexture(texture);
-  }
+  for (auto texture : metadata_textures_) SDL_DestroyTexture(texture);
   metadata_textures_.clear();
+  for (auto s : metadata_surfaces_) SDL_DestroySurface(s);
+  metadata_surfaces_.clear();
   metadata_total_height_ = 0;
 
   auto add_metadata_texture = [&](TTF_Font* font, const std::string& text, bool primary_color, bool is_header) {
-    int h;
-
     // choose text color based on content type and alternating pattern
     SDL_Color text_color = is_header ? HELP_TEXT_PRIMARY_COLOR : (primary_color ? HELP_TEXT_PRIMARY_COLOR : HELP_TEXT_ALTERNATE_COLOR);
 
     // render text with word wrapping to fit available width
     SDL_Surface* surface = TTF_RenderText_Blended_Wrapped(font, text.c_str(), 0, text_color, drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2);
-    SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, surface);
-    SDL_DestroySurface(surface);
+    if (!surface) return;
 
-    // get texture dimensions and accumulate total height for scrolling calculations
-    { float tw, th; SDL_GetTextureSize(texture, &tw, &th); h = static_cast<int>(th); }
-    metadata_total_height_ += h + HELP_TEXT_LINE_SPACING;
-
-    metadata_textures_.push_back(texture);
+    if (gpu_renderer_active_) {
+      SDL_Surface* rgba = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
+      SDL_DestroySurface(surface);
+      if (!rgba) return;
+      metadata_total_height_ += rgba->h + HELP_TEXT_LINE_SPACING;
+      metadata_surfaces_.push_back(rgba);
+    } else {
+      SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, surface);
+      SDL_DestroySurface(surface);
+      float tw, th; SDL_GetTextureSize(texture, &tw, &th);
+      metadata_total_height_ += static_cast<int>(th) + HELP_TEXT_LINE_SPACING;
+      metadata_textures_.push_back(texture);
+    }
   };
 
   // Calculate max length for column sizing
@@ -2996,6 +3012,78 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       }
     }
 
+    // Help and metadata overlays — full-screen panels with multi-line text
+    // honoring the scroll offset. Pushed after all other HUD so they layer
+    // on top.  Because libplacebo draws primitive-overlays before text-
+    // overlays in a single render pass, the full-screen dim rect would end
+    // up UNDER the HUD text (wrong order). Simplest fix: suppress HUD text
+    // while a full-screen panel is visible.  The panel's own background
+    // fully dims the area where HUD would have been, so the result is
+    // visually equivalent to the SDL path.
+    if (show_help_ || show_metadata_) {
+      // Clear previously-accumulated text overlays (HUD labels, positions,
+      // FPS, etc.) so they don't poke through the panel.
+      text_ops.clear();
+      for (SDL_Surface* s : text_surfaces) SDL_DestroySurface(s);
+      text_surfaces.clear();
+      overlays.clear();
+
+      // Full-screen semi-transparent black background.
+      push_rect(0, 0, static_cast<float>(drawable_width_), static_cast<float>(drawable_height_),
+                0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 3 / 2));
+
+      if (show_help_) {
+        int y = help_y_offset_;
+        for (SDL_Surface* s : help_surfaces_) {
+          if (!s) continue;
+          // Skip lines fully outside the visible area.
+          if (y + s->h > 0 && y < drawable_height_) {
+            GpuRenderer::TextOverlayOp t{};
+            t.rgba_data = s->pixels;
+            t.width = s->w;
+            t.height = s->h;
+            t.stride = s->pitch;
+            t.dst_x = static_cast<float>(HELP_TEXT_HORIZONTAL_MARGIN);
+            t.dst_y = static_cast<float>(y);
+            t.alpha = 1.0f;
+            text_ops.push_back(t);
+          }
+          y += s->h + HELP_TEXT_LINE_SPACING;
+        }
+      } else if (show_metadata_) {
+        ensure_metadata_textures_current();
+
+        const int table_width = drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2;
+        const int table_x = HELP_TEXT_HORIZONTAL_MARGIN;
+
+        int y;
+        if (mode_ == Mode::VStack && metadata_total_height_ < drawable_height_ / 2) {
+          y = (drawable_height_ / 2 - metadata_total_height_) / 2;
+        } else if (mode_ != Mode::VStack && metadata_total_height_ < drawable_height_) {
+          y = (drawable_height_ - metadata_total_height_) / 2;
+        } else {
+          y = metadata_y_offset_ + 10;
+        }
+
+        for (SDL_Surface* s : metadata_surfaces_) {
+          if (!s) continue;
+          const int x_offset = (table_width - s->w) / 2;
+          if (y + s->h > 0 && y < drawable_height_) {
+            GpuRenderer::TextOverlayOp t{};
+            t.rgba_data = s->pixels;
+            t.width = s->w;
+            t.height = s->h;
+            t.stride = s->pitch;
+            t.dst_x = static_cast<float>(table_x + x_offset);
+            t.dst_y = static_cast<float>(y);
+            t.alpha = 1.0f;
+            text_ops.push_back(t);
+          }
+          y += s->h + HELP_TEXT_LINE_SPACING;
+        }
+      }
+    }
+
     if (gpu_renderer_.render(ops.data(), op_count,
                               overlays.data(), static_cast<int>(overlays.size()),
                               text_ops.data(), static_cast<int>(text_ops.size()),
@@ -3005,6 +3093,23 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
     // Surfaces are no longer referenced by libplacebo after render() returns.
     for (SDL_Surface* s : text_surfaces) SDL_DestroySurface(s);
+
+    // Deferred actions. `save_image_frames` needs `SDL_RenderReadPixels` and
+    // `save_selected_area` expects RGB frame data — both are SDL-path only
+    // for now. `possibly_apply_crop` just sets a pending request that the
+    // main loop consumes, so it works in both paths.
+    if (save_image_frames_) {
+      std::cerr << "Save image frames: not supported in GPU renderer mode yet." << std::endl;
+      save_image_frames_ = false;
+    }
+    if (save_selected_area_) {
+      std::cerr << "Save selected area: not supported in GPU renderer mode yet." << std::endl;
+      save_selected_area_ = false;
+      selection_state_ = SelectionState::None;
+    }
+    if (crop_mode_) {
+      possibly_apply_crop();
+    }
 
     input_received_ = false;
     previous_left_frame_pts_ = left_frame->pts;
@@ -3797,9 +3902,9 @@ void Display::handle_event(const SDL_Event& event) {
     SDL_SetCursor(cursor);
   };
 
-  auto handle_scroll = [&](int& y_offset, const int total_height, std::vector<SDL_Texture*>& textures) {
+  auto handle_scroll = [&](int& y_offset, const int total_height, size_t count) {
     y_offset += (-event_.motion.yrel * total_height * 3) / drawable_height_;
-    y_offset = std::max(y_offset, drawable_height_ - total_height - static_cast<int>(textures.size()) * HELP_TEXT_LINE_SPACING);
+    y_offset = std::max(y_offset, drawable_height_ - total_height - static_cast<int>(count) * HELP_TEXT_LINE_SPACING);
     y_offset = std::min(y_offset, 0);
   };
 
@@ -3865,11 +3970,13 @@ void Display::handle_event(const SDL_Event& event) {
       }
 
       if (show_metadata_) {
-        handle_scroll(metadata_y_offset_, metadata_total_height_, metadata_textures_);
+        handle_scroll(metadata_y_offset_, metadata_total_height_,
+                       gpu_renderer_active_ ? metadata_surfaces_.size() : metadata_textures_.size());
       }
 
       if (show_help_) {
-        handle_scroll(help_y_offset_, help_total_height_, help_textures_);
+        handle_scroll(help_y_offset_, help_total_height_,
+                       gpu_renderer_active_ ? help_surfaces_.size() : help_textures_.size());
       }
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:

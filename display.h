@@ -346,6 +346,7 @@ class Display {
   int saved_selected_image_number_{1};
 
   std::vector<SDL_Texture*> metadata_textures_;
+  std::vector<SDL_Surface*> metadata_surfaces_;  // RGBA surfaces (GPU renderer path)
   int metadata_total_height_{0};
   int metadata_y_offset_{0};
   VideoMetadata left_metadata_;
@@ -361,6 +362,7 @@ class Display {
   std::string last_window_title_;
 
   std::vector<SDL_Texture*> help_textures_;
+  std::vector<SDL_Surface*> help_surfaces_;  // RGBA surfaces (GPU renderer path)
   int help_total_height_{0};
   int help_y_offset_{0};
 
