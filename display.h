@@ -165,6 +165,7 @@ class Display {
   const bool use_10_bpc_;
   bool hdr_display_available_{false};
   float hdr_display_headroom_{1.0f};
+  float hdr_content_headroom_{10.0f};
   bool hdr_passthrough_{false};
   bool hdr_state_changed_{false};
 
@@ -534,6 +535,7 @@ class Display {
   bool get_hdr_display_available() const;
   float get_hdr_display_headroom() const;
   void set_hdr_passthrough(bool enabled);
+  void set_hdr_content_headroom(float headroom);
   bool consume_hdr_state_change();
 
   bool get_toggle_scope_window_requested(const ScopeWindow::Type type) const;

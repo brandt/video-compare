@@ -252,15 +252,17 @@ Phases 1–3 implemented and functional. HDR content renders on HDR displays via
 
 The remaining ~2.1-core steady-state gap vs SDR is the HLG→PQ `zscale=t=smpte2084`. For PQ content (no HLG→PQ step), steady-state would approach the SDR baseline (~3.2 cores).
 
+### Additional implementations (2026-04-17)
+
+- **Phase 4: Dynamic fallback (video_compare.cpp, display.cpp):** `Display::update_hdr_display_state()` sets a dirty flag when `SDL_EVENT_WINDOW_HDR_STATE_CHANGED` fires. `VideoCompare::handle_hdr_state_change()` checks the flag each main-loop iteration, recalculates `hdr_passthrough_active_` based on new display state + content type, reconstructs all VideoFilterers and FormatConverters, updates Display textures, and triggers a pipeline flush via seek. Stored `VideoFilterContext` as a member (`video_filter_context_`) so filterers can be reconstructed at runtime.
+
+- **Headroom from content metadata (video_compare.cpp, display.cpp):** `Display::set_hdr_content_headroom(float)` sets the HDR10 texture's headroom property. `VideoCompare` calculates `max(safe_peak_luminance_nits) / 100.0` across all decoder sides and passes it to Display before `set_hdr_passthrough`. SDL's GPU tonemapper now activates when content headroom exceeds display headroom (e.g., 1000-nit content on a 500-nit display). Default is 10.0 (1000 nits) when MaxCLL metadata is absent.
+
+- **SDR texture colorspace tagging (display.cpp):** SDR textures now created with `SDL_CreateTextureWithProperties` + `SDL_COLORSPACE_SRGB` instead of plain `SDL_CreateTexture`. The `SDL_COLORSPACE_SRGB_LINEAR` renderer now has explicit gamma information for SDR content, ensuring correct sRGB rendering.
+
 ### Remaining work
 
-1. **Phase 4: Dynamic fallback** — reinitialize filter chain and textures when `SDL_EVENT_WINDOW_HDR_STATE_CHANGED` fires (window moves between HDR and SDR displays). Currently HDR state is only checked at startup.
-
-2. **Headroom from content metadata** — currently uses `hdr_display_headroom_` from the display. Should use `MaxCLL / 100.0` from the content when available, so SDL can tone-map content that exceeds display headroom.
-
-3. **SDR texture colorspace tagging** — with the `SDL_COLORSPACE_SRGB_LINEAR` renderer, explicitly tag SDR textures with `SDL_COLORSPACE_SRGB` for correct gamma handling.
-
-4. **Display refresh performance** — `possibly_refresh` takes ~57ms at 4K (two 33MB texture uploads + render + VSync). This limits UI FPS to ~17fps regardless of pipeline speed. Potential improvements: `SDL_LockTexture` instead of `SDL_UpdateTexture` to avoid Metal synchronization stalls, double-buffered textures, or dirty-region tracking to upload only changed sub-rects.
+1. **Display refresh performance** — `possibly_refresh` takes ~57ms at 4K (two 33MB texture uploads + render + VSync). This limits UI FPS to ~17fps regardless of pipeline speed. Potential improvements: `SDL_LockTexture` instead of `SDL_UpdateTexture` to avoid Metal synchronization stalls, double-buffered textures, or dirty-region tracking to upload only changed sub-rects.
 
 ## Recommended priority
 
@@ -271,4 +273,4 @@ The remaining ~2.1-core steady-state gap vs SDR is the HLG→PQ `zscale=t=smpte2
 | 3 | Fix colorspace mismatch   | negligible             | correctness fix      | small    | **done** (m=bt709 in zscale)
 | 4 | Tonemap curve choice      | ~0.2 core              | intentional change   | small (expose CLI flag) |
 | 5 | Cache tonemapped frames   | variable               | none                 | moderate |
-| 6 | SDL3 HDR passthrough      | ~0.3 core HLG (measured), ~2.4 PQ (est.) | more faithful HDR | moderate | **done** (phases 1-3)
+| 6 | SDL3 HDR passthrough      | ~0.3 core HLG (measured), ~2.4 PQ (est.) | more faithful HDR | moderate | **done** (phases 1-4)

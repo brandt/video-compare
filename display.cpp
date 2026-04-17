@@ -512,11 +512,19 @@ void Display::recreate_video_textures_for_current_mode() {
       SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, tex_w);
       SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, tex_h);
       SDL_SetFloatProperty(props, SDL_PROP_TEXTURE_CREATE_SDR_WHITE_POINT_FLOAT, 100.0f);
-      SDL_SetFloatProperty(props, SDL_PROP_TEXTURE_CREATE_HDR_HEADROOM_FLOAT, hdr_display_headroom_);
+      SDL_SetFloatProperty(props, SDL_PROP_TEXTURE_CREATE_HDR_HEADROOM_FLOAT, hdr_content_headroom_);
       tex = check_sdl(SDL_CreateTextureWithProperties(renderer_, props), "video texture " + label);
       SDL_DestroyProperties(props);
     } else {
-      tex = check_sdl(SDL_CreateTexture(renderer_, pixel_format, SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h), "video texture " + label);
+      // Explicitly tag SDR textures so the SRGB_LINEAR renderer applies correct gamma
+      SDL_PropertiesID props = SDL_CreateProperties();
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, pixel_format);
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, SDL_COLORSPACE_SRGB);
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING);
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, tex_w);
+      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, tex_h);
+      tex = check_sdl(SDL_CreateTextureWithProperties(renderer_, props), "video texture " + label);
+      SDL_DestroyProperties(props);
     }
 
     SDL_SetTextureScaleMode(tex, scale_mode);
@@ -3785,6 +3793,10 @@ void Display::set_hdr_passthrough(bool enabled) {
     left_planes_ = {nullptr, nullptr, nullptr};
     right_planes_ = {nullptr, nullptr, nullptr};
   }
+}
+
+void Display::set_hdr_content_headroom(float headroom) {
+  hdr_content_headroom_ = headroom;
 }
 
 bool Display::get_quit() const {

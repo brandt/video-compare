@@ -382,6 +382,16 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
   display_ = std::make_unique<Display>(config_.display_number, config_.display_mode, config_.verbose, config_.fit_window_to_usable_bounds, config_.high_dpi_allowed, config_.aspect_lock_mode, config_.aspect_view_mode, config_.use_10_bpc,
                                        use_fast_input_alignment(config_), config_.bilinear_texture_filtering, config_.window_size, max_width_, max_height_, shortest_duration_, config_.wheel_sensitivity, config_.start_in_subtraction_mode,
                                        config_.start_in_fullscreen, config_.left.file_name, right_file_name);
+  if (hdr_passthrough_active_) {
+    // Set content headroom from peak luminance (max across all sides)
+    unsigned max_peak_nits = 0;
+    for (const auto& pair : video_decoders_) {
+      const DynamicRange dr = pair.second->infer_dynamic_range("");
+      const unsigned peak = pair.second->safe_peak_luminance_nits(dr);
+      max_peak_nits = std::max(max_peak_nits, peak);
+    }
+    display_->set_hdr_content_headroom(static_cast<float>(max_peak_nits) / 100.0f);
+  }
   display_->set_hdr_passthrough(hdr_passthrough_active_);
   display_->set_num_right_videos(right_video_info_.size());
   display_->set_active_right_index(active_right_index_);
@@ -462,6 +472,15 @@ bool VideoCompare::handle_hdr_state_change() {
   recreate_format_converters(determine_sws_flags(display_->get_fast_input_alignment()));
 
   // Update display textures
+  if (hdr_passthrough_active_) {
+    unsigned max_peak_nits = 0;
+    for (const auto& pair : video_decoders_) {
+      const DynamicRange dr = pair.second->infer_dynamic_range("");
+      const unsigned peak = pair.second->safe_peak_luminance_nits(dr);
+      max_peak_nits = std::max(max_peak_nits, peak);
+    }
+    display_->set_hdr_content_headroom(static_cast<float>(max_peak_nits) / 100.0f);
+  }
   display_->set_hdr_passthrough(hdr_passthrough_active_);
 
   return true;
