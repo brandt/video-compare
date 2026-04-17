@@ -453,8 +453,12 @@ Display::Display(const int display_number,
 }
 
 Display::~Display() {
-  SDL_DestroyTexture(video_texture_linear_);
-  SDL_DestroyTexture(video_texture_nn_);
+  for (int s = 0; s < kSideCount; s++) {
+    for (int b = 0; b < kBufferCount; b++) {
+      if (side_textures_linear_[s][b]) SDL_DestroyTexture(side_textures_linear_[s][b]);
+      if (side_textures_nn_[s][b]) SDL_DestroyTexture(side_textures_nn_[s][b]);
+    }
+  }
   SDL_DestroyTexture(side_ui_[LEFT.as_simple_index()].text_texture);
   SDL_DestroyTexture(side_ui_[RIGHT.as_simple_index()].text_texture);
 
@@ -487,53 +491,51 @@ Display::~Display() {
 }
 
 void Display::recreate_video_textures_for_current_mode() {
-  if (video_texture_linear_ != nullptr) {
-    SDL_DestroyTexture(video_texture_linear_);
-    video_texture_linear_ = nullptr;
-  }
-  if (video_texture_nn_ != nullptr) {
-    SDL_DestroyTexture(video_texture_nn_);
-    video_texture_nn_ = nullptr;
+  for (int s = 0; s < kSideCount; s++) {
+    for (int b = 0; b < kBufferCount; b++) {
+      if (side_textures_linear_[s][b] != nullptr) {
+        SDL_DestroyTexture(side_textures_linear_[s][b]);
+        side_textures_linear_[s][b] = nullptr;
+      }
+      if (side_textures_nn_[s][b] != nullptr) {
+        SDL_DestroyTexture(side_textures_nn_[s][b]);
+        side_textures_nn_[s][b] = nullptr;
+      }
+    }
+    side_write_index_[s] = 0;
   }
 
-  const int tex_w = mode_ == Mode::HStack ? video_width_ * 2 : video_width_;
-  const int tex_h = mode_ == Mode::VStack ? video_height_ * 2 : video_height_;
+  // Per-side textures: each is video_width_ × video_height_ (no HStack/VStack doubling)
   const bool use_hdr_textures = hdr_display_available_ && hdr_passthrough_;
   const SDL_PixelFormat pixel_format = (requires_10_bpc() || hdr_passthrough_) ? SDL_PIXELFORMAT_ARGB2101010 : SDL_PIXELFORMAT_RGB24;
 
   auto create_video_texture = [&](SDL_ScaleMode scale_mode, const std::string& label) {
     SDL_Texture* tex;
-
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, pixel_format);
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, use_hdr_textures ? SDL_COLORSPACE_HDR10 : SDL_COLORSPACE_SRGB);
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING);
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, video_width_);
+    SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, video_height_);
     if (use_hdr_textures) {
-      SDL_PropertiesID props = SDL_CreateProperties();
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, pixel_format);
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, SDL_COLORSPACE_HDR10);
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING);
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, tex_w);
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, tex_h);
       SDL_SetFloatProperty(props, SDL_PROP_TEXTURE_CREATE_SDR_WHITE_POINT_FLOAT, 100.0f);
       SDL_SetFloatProperty(props, SDL_PROP_TEXTURE_CREATE_HDR_HEADROOM_FLOAT, hdr_content_headroom_);
-      tex = check_sdl(SDL_CreateTextureWithProperties(renderer_, props), "video texture " + label);
-      SDL_DestroyProperties(props);
-    } else {
-      // Explicitly tag SDR textures so the SRGB_LINEAR renderer applies correct gamma
-      SDL_PropertiesID props = SDL_CreateProperties();
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, pixel_format);
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, SDL_COLORSPACE_SRGB);
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING);
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, tex_w);
-      SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, tex_h);
-      tex = check_sdl(SDL_CreateTextureWithProperties(renderer_, props), "video texture " + label);
-      SDL_DestroyProperties(props);
     }
+    tex = check_sdl(SDL_CreateTextureWithProperties(renderer_, props), "video texture " + label);
+    SDL_DestroyProperties(props);
 
     SDL_SetTextureScaleMode(tex, scale_mode);
     SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
     return tex;
   };
 
-  video_texture_linear_ = create_video_texture(SDL_SCALEMODE_LINEAR, "linear");
-  video_texture_nn_ = create_video_texture(SDL_SCALEMODE_NEAREST, "nearest");
+  for (int s = 0; s < kSideCount; s++) {
+    for (int b = 0; b < kBufferCount; b++) {
+      const std::string label = std::string(s == 0 ? "left" : "right") + " buf" + std::to_string(b);
+      side_textures_linear_[s][b] = create_video_texture(SDL_SCALEMODE_LINEAR, label + " linear");
+      side_textures_nn_[s][b] = create_video_texture(SDL_SCALEMODE_NEAREST, label + " nearest");
+    }
+  }
 }
 
 void Display::apply_window_size_and_relayout(const int target_w, const int target_h, const bool force_layout_refresh) {
@@ -1567,12 +1569,49 @@ void Display::render_progress_dots(const float position, const float progress, c
   }
 }
 
-SDL_Texture* Display::get_video_texture() const {
-  return bilinear_texture_filtering_ ? video_texture_linear_ : video_texture_nn_;
+SDL_Texture* Display::get_side_texture_for_write(int side) const {
+  const int wi = side_write_index_[side];
+  return bilinear_texture_filtering_ ? side_textures_linear_[side][wi] : side_textures_nn_[side][wi];
 }
 
-void Display::update_texture(const SDL_Rect* rect, const void* pixels, int pitch, const std::string& message) {
-  check_sdl(SDL_UpdateTexture(get_video_texture(), rect, pixels, pitch), "video texture - " + message);
+SDL_Texture* Display::get_side_texture_for_render(int side) const {
+  // Render from the buffer we last finished writing to
+  const int ri = 1 - side_write_index_[side];
+  return bilinear_texture_filtering_ ? side_textures_linear_[side][ri] : side_textures_nn_[side][ri];
+}
+
+void Display::swap_side_texture(int side) {
+  side_write_index_[side] = 1 - side_write_index_[side];
+}
+
+void Display::update_side_texture(int side, const void* pixels, int pitch) {
+  SDL_Texture* tex = get_side_texture_for_write(side);
+  void* locked_pixels = nullptr;
+  int locked_pitch = 0;
+
+  // Full-frame upload (no sub-rect — each side has its own texture)
+  if (!SDL_LockTexture(tex, nullptr, &locked_pixels, &locked_pitch)) {
+    check_sdl(SDL_UpdateTexture(tex, nullptr, pixels, pitch), "side texture update fallback");
+    swap_side_texture(side);
+    return;
+  }
+
+  const uint8_t* src = static_cast<const uint8_t*>(pixels);
+  uint8_t* dst = static_cast<uint8_t*>(locked_pixels);
+
+  if (pitch == locked_pitch) {
+    memcpy(dst, src, static_cast<size_t>(locked_pitch) * video_height_);
+  } else {
+    const int row_bytes = std::min(pitch, locked_pitch);
+    for (int y = 0; y < video_height_; y++) {
+      memcpy(dst, src, row_bytes);
+      src += pitch;
+      dst += locked_pitch;
+    }
+  }
+
+  SDL_UnlockTexture(tex);
+  swap_side_texture(side);
 }
 
 int Display::round_and_clamp(const float value) {
@@ -2581,57 +2620,58 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   if (show_left_ || show_right_) {
     const int split_x = (compare_mode && mode_ == Mode::Split) ? clamp_range(std::round(video_mouse_x), 0.0F, float(video_width_)) : show_left_ ? video_width_ : 0;
 
-    // update video
-    if (show_left_ && (split_x > 0)) {
-      const SDL_Rect tex_render_quad_left = {0, 0, split_x, video_height_};
-      const SDL_FRect screen_render_quad_left = video_rect_to_drawable_transform(video_to_zoom_space(tex_render_quad_left, zoom_rect));
+    // Upload full frames to per-side textures (double-buffered)
+    if (input_received_ || has_updated_left_frame) {
+      if (requires_10_bpc()) {
+        const SDL_Rect full_rect = {0, 0, video_width_, video_height_};
+        convert_to_packed_10_bpc(planes_left, pitches_left, left_planes_, pitches_left, full_rect);
+        update_side_texture(0, left_planes_[0], pitches_left[0]);
+      } else {
+        update_side_texture(0, planes_left[0], pitches_left[0]);
+      }
+    }
 
-      if (input_received_ || has_updated_left_frame) {
+    // Subtraction mode depends on both frames; refresh when either changes
+    const bool right_needs_update = input_received_ || has_updated_right_frame || (subtraction_mode_ && has_updated_left_frame);
+
+    if (right_needs_update) {
+      if (subtraction_mode_) {
+        update_difference(planes_left, pitches_left, planes_right, pitches_right, 0);
+
         if (requires_10_bpc()) {
-          convert_to_packed_10_bpc(planes_left, pitches_left, left_planes_, pitches_left, tex_render_quad_left);
-
-          update_texture(&tex_render_quad_left, left_planes_[0], pitches_left[0], "left update (10 bpc, video mode)");
+          const SDL_Rect full_rect = {0, 0, video_width_, video_height_};
+          convert_to_packed_10_bpc(diff_planes_, diff_pitches_, right_planes_, pitches_right, full_rect);
+          update_side_texture(1, right_planes_[0], pitches_right[0]);
         } else {
-          update_texture(&tex_render_quad_left, planes_left[0], pitches_left[0], "left update (video mode)");
+          update_side_texture(1, diff_planes_[0], diff_pitches_[0]);
+        }
+      } else {
+        if (requires_10_bpc()) {
+          const SDL_Rect full_rect = {0, 0, video_width_, video_height_};
+          convert_to_packed_10_bpc(planes_right, pitches_right, right_planes_, pitches_right, full_rect);
+          update_side_texture(1, right_planes_[0], pitches_right[0]);
+        } else {
+          update_side_texture(1, planes_right[0], pitches_right[0]);
         }
       }
+    }
 
-      { const SDL_FRect src = to_frect(tex_render_quad_left); check_sdl(SDL_RenderTexture(renderer_, get_video_texture(), &src, &screen_render_quad_left), "left video texture render copy"); }
+    // Render from per-side textures to screen regions
+    if (show_left_ && (split_x > 0)) {
+      const SDL_FRect src_left = {0, 0, static_cast<float>(split_x), static_cast<float>(video_height_)};
+      const SDL_Rect video_quad_left = {0, 0, split_x, video_height_};
+      const SDL_FRect screen_quad_left = video_rect_to_drawable_transform(video_to_zoom_space(video_quad_left, zoom_rect));
+      check_sdl(SDL_RenderTexture(renderer_, get_side_texture_for_render(0), &src_left, &screen_quad_left), "left video texture render");
     }
     if (show_right_ && ((split_x < video_width_) || mode_ != Mode::Split)) {
       const int start_right = (mode_ == Mode::Split) ? std::max(split_x, 0) : 0;
       const int right_x_offset = (mode_ == Mode::HStack) ? video_width_ : 0;
       const int right_y_offset = (mode_ == Mode::VStack) ? video_height_ : 0;
 
-      const SDL_Rect tex_render_quad_right = {right_x_offset + start_right, right_y_offset, (video_width_ - start_right), video_height_};
-      const SDL_Rect roi = {start_right, 0, (video_width_ - start_right), video_height_};
-      const SDL_FRect screen_render_quad_right = video_rect_to_drawable_transform(video_to_zoom_space(tex_render_quad_right, zoom_rect));
-
-      if (input_received_ || has_updated_right_frame) {
-        if (subtraction_mode_) {
-          update_difference(planes_left, pitches_left, planes_right, pitches_right, start_right);
-
-          if (requires_10_bpc()) {
-            convert_to_packed_10_bpc(diff_planes_, diff_pitches_, right_planes_, pitches_right, roi);
-
-            update_texture(&tex_render_quad_right, right_planes_[0] + start_right, pitches_right[0], "right update (10 bpc, subtraction mode)");
-          } else {
-            const int diff_bpp = requires_10_bpc() ? 6 : (hdr_passthrough_ ? 4 : 3);
-            update_texture(&tex_render_quad_right, diff_planes_[0] + start_right * diff_bpp, diff_pitches_[0], "right update (subtraction mode)");
-          }
-        } else {
-          if (requires_10_bpc()) {
-            convert_to_packed_10_bpc(planes_right, pitches_right, right_planes_, pitches_right, roi);
-
-            update_texture(&tex_render_quad_right, right_planes_[0] + start_right, pitches_right[0], "right update (10 bpc, video mode)");
-          } else {
-            const int bpp = hdr_passthrough_ ? 4 : 3;
-            update_texture(&tex_render_quad_right, planes_right[0] + start_right * bpp, pitches_right[0], "right update (video mode)");
-          }
-        }
-      }
-
-      { const SDL_FRect src = to_frect(tex_render_quad_right); check_sdl(SDL_RenderTexture(renderer_, get_video_texture(), &src, &screen_render_quad_right), "right video texture render copy"); }
+      const SDL_FRect src_right = {static_cast<float>(start_right), 0, static_cast<float>(video_width_ - start_right), static_cast<float>(video_height_)};
+      const SDL_Rect video_quad_right = {right_x_offset + start_right, right_y_offset, video_width_ - start_right, video_height_};
+      const SDL_FRect screen_quad_right = video_rect_to_drawable_transform(video_to_zoom_space(video_quad_right, zoom_rect));
+      check_sdl(SDL_RenderTexture(renderer_, get_side_texture_for_render(1), &src_right, &screen_quad_right), "right video texture render");
     }
   }
 
