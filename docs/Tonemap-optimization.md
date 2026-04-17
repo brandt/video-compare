@@ -1,5 +1,16 @@
 # Tonemap Optimization Opportunities
 
+## Status (2026-04-17)
+
+**Superseded by libplacebo migration (`Docs/Libplacebo-design.md`).** In GPU mode (default on Apple Silicon + Vulkan/MoltenVK), the entire CPU tonemap chain is bypassed:
+- `VideoFilterer` is constructed with `gpu_color_processing = true` — tonemap filters and HLG→PQ passthrough are both skipped.
+- `FormatConverter` / `sws_scale` is bypassed in `format_convert_video` — filtered frames pass through unchanged.
+- Native YUV frames go directly to `pl_map_avframe_ex` → `pl_render_image`, which handles YUV→RGB, color primaries / transfer conversion, and tone mapping on the GPU in <1ms per frame.
+
+The optimizations below are still relevant for the SDL_Renderer fallback path (when Vulkan is unavailable).
+
+---
+
 Context: video-compare is used to compare the visual effects of different encoding settings on the same frame. Visual fidelity matters — subtle color shifts, banding, or clipping artifacts during tone mapping directly undermine the comparison. Users rely on the tool to show real differences between encodes, not differences introduced by the viewer's own processing.
 
 ## Current Filter Chain (measured)

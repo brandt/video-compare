@@ -1,5 +1,21 @@
 # libplacebo GPU Rendering Pipeline: Design Plan
 
+## Status (2026-04-17)
+
+**Phase 1 — video pipeline migration: COMPLETE.** With `--hwaccel videotoolbox`, 4K HDR 60fps plays smoothly. GPU renderer is no longer the bottleneck — software decode is, as expected.
+
+**Phase 2 — HUD overlays: COMPLETE.** All SDL_Renderer-based HUD elements re-implemented via `pl_overlay`:
+- Split line, progress dots, selection/crop rects (monochrome primitives)
+- File labels + position times (with left-edge fade-out for long paths, swap-aware)
+- Zoom factor, playback speed, frame counter (with loop-mode pulsing background), target seek position
+- Video/UI FPS counters (default on)
+- Message toast (2s hold + 1s fade)
+- Help screen and metadata panel (scrollable, multi-line)
+
+**Phase 3 — features needing RGB pixel access: NOT STARTED.** Subtraction mode, per-pixel color inspector, live PSNR/SSIM/VMAF overlay currently no-op or misbehave in GPU mode because the FrameRing holds native YUV frames. Planned fix: on-demand sws_scale only when these features are active.
+
+**Phase 4 — features needing `pl_tex_download`: NOT STARTED.** Zoom/magnifier window, save-selected-area, full-screen screenshot. Need GPU→CPU readback after `pl_render_image`.
+
 ## Goal
 
 Replace the CPU-side video processing pipeline (decode → filter → sws_scale → memcpy → SDL texture upload) with a GPU-accelerated pipeline using libplacebo's Vulkan renderer. Target: **4K HDR 60fps** on Apple Silicon, matching mpv's `vo=gpu-next` performance.
@@ -198,3 +214,60 @@ Based on mpv benchmarks on Apple Silicon with `vo=gpu-next`:
 - **Pipeline bottleneck shifts to: decoder** (software decode ~25fps per side at 4K; hardware decode via VideoToolbox removes this)
 
 Combining libplacebo rendering with `--hwaccel videotoolbox` would enable full 4K 60fps end-to-end.
+
+---
+
+## Implementation notes (learned during Phase 1 + 2)
+
+### GpuRenderer wrapper API
+
+New file `gpu_renderer.h/cpp` owns all libplacebo state: `pl_vulkan`, `pl_swapchain`, `pl_renderer`, per-side frame texture arrays (`frame_tex_[2][4]`), shared 1×1 white texture for monochrome primitives, and a slot vector of RGBA textures for text overlays (reused across frames — `pl_tex_recreate` is a no-op when dims match).
+
+Three op types passed to `render()`:
+- `SideRenderOp` — src rect in video coordinates + dst rect in FBO pixel coordinates. Caller computes dst via the existing `video_to_zoom_space` + `video_rect_to_drawable_transform` chain so zoom/split behave identically to the SDL path.
+- `OverlayOp` — solid-colored filled rect (monochrome). All batched into one `pl_overlay` with `PL_OVERLAY_MONOCHROME` referencing `white_tex_`.
+- `TextOverlayOp` — arbitrary RGBA source (e.g. SDL_ttf output) + dst position. Each becomes its own `pl_overlay` with `PL_OVERLAY_NORMAL`.
+
+### Render pipeline inside `render()`
+
+1. `pl_swapchain_start_frame`
+2. `pl_frame_from_swapchain` to fill target; optionally override `target.color` for HDR passthrough
+3. `pl_frame_clear` once with background color
+4. For each `SideRenderOp`: `pl_render_image(renderer, &image, &target, &params)` with `params.background = PL_CLEAR_SKIP; params.border = PL_CLEAR_SKIP` so sides don't clobber each other
+5. Final `pl_render_image(renderer, NULL, &target, &params)` pass composites all `target.overlays[]` (primitives first, then text)
+6. `pl_swapchain_submit_frame` + `pl_swapchain_swap_buffers`
+
+### Gotchas encountered
+
+- **Libplacebo clears target by default.** Second `pl_render_image` would erase the first. Fix: `params.border = PL_CLEAR_SKIP; params.background = PL_CLEAR_SKIP`.
+- **Zero-dim overlays trip an assertion.** libplacebo asserts `dst` extent is non-zero. Filter out degenerate rects (e.g. a just-started selection with 0×0 area) at the GpuRenderer level.
+- **`pl_map_avframe_ex` racing with FrameRing clear on seek** caused a kernel panic (MoltenVK). Fix: only call `upload_frame` inside `possibly_refresh` gated by `has_updated_*_frame`, not once-per-iteration from `compare()`.
+- **Split-view sub-pixel jitter.** When the split moves, the right-video's dst rect changes too, causing visible 1-pixel resampling jitter. Fix (Split mode only): render the right side to its FULL dst rect first, then paint the left on top clipped at `split_x`. Right side is stationary; only the left's clip changes.
+- **`PL_OVERLAY_NORMAL` ignores per-part `color[]` / alpha multiplier.** To fade a text overlay, bake the alpha multiplier into the surface's alpha channel on CPU before upload (`row[x*4 + 3] *= keep_alpha`).
+- **Libplacebo's convenience macros use C99 compound literals**, which don't compile in C++. Use named temporaries: `struct pl_vulkan_params vk_p = pl_vulkan_default_params; vk_p.surface = ...; pl_vulkan_create(log, &vk_p);`.
+- **`PL_LIBAV_IMPLEMENTATION`** in `libplacebo/utils/libav.h` needs a single C translation unit. `pl_libav_impl.c` does that with `#define PL_LIBAV_IMPLEMENTATION 1` + `#include`.
+
+### HUD layering compromise
+
+libplacebo renders overlays in array order: primitives first (one batched `pl_overlay`), then text overlays (N `pl_overlay` entries). Full-screen help/metadata panels need a dim background below text, which conflicts with HUD text needing to be above HUD-background primitives. Rather than restructure the overlay ordering (would need interleaved primitive/text groups), the GPU path **suppresses HUD rendering while help or metadata is visible**. The panel's own dim bg fully covers what HUD would have drawn. Minor behavioral delta vs SDL (which draws HUD under the dim) but visually equivalent.
+
+### Text clipping / fade (for long file paths)
+
+When a file path is wider than `max_text_width_`:
+- `clip_amount` pixels from the LEFT are hidden; a `gradient_amount` (≤24 px) ramp fades between invisible and fully-visible.
+- GPU implementation: bake the alpha gradient into the rendered SDL_Surface's alpha channel on CPU (zero for clipped-out region, ramped up across the gradient region, unchanged beyond). Upload the modified surface. Position the overlay so the visible portion lands at the requested (x, y) for left-align, or ends at `x + width` for right-align.
+- Background rect gets a hard edge; only text fades. Simpler than SDL's per-strip gradient and looks fine in practice.
+
+### Help / metadata scroll math
+
+`clamp_overlay_offsets` and `handle_scroll` both account for inter-line spacing via `count * HELP_TEXT_LINE_SPACING`. In GPU mode, `count` must be `help_surfaces_.size()` / `metadata_surfaces_.size()` (the SDL texture vectors are empty), otherwise the last section of the help screen stays stuck below the fold.
+
+### Filterer changes
+
+`VideoFilterer` takes a `gpu_color_processing` ctor flag. When set, `must_tonemap` is forced false AND the HLG→PQ passthrough filter is skipped — libplacebo handles all color conversion on the GPU. The filterer only applies structural transforms (fps, deinterlace, rotation, crop). `format_convert_video` in `video_compare.cpp` passes filtered frames through unchanged (no sws_scale) but still sets `frame_key` + `original_*` metadata since `FormatConverter` is bypassed.
+
+### Intentionally deferred / still broken in GPU mode
+
+- **Subtraction mode, per-pixel inspector, live PSNR/SSIM/VMAF** — all read `frame->data[0]` assuming RGB, but frames are native YUV in GPU mode. Phase 3 will add on-demand sws_scale for these features only.
+- **Zoom/magnifier window, save-selected-area, full-screen screenshot** — all need `SDL_RenderReadPixels` (SDL-renderer-only). Phase 4 will reimplement via `pl_tex_download` after `pl_render_image`.
+- **`format_converter.cpp/h`** is still compiled and instantiated even though it's bypassed in GPU mode — delete after Phase 3.

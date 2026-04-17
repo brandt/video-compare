@@ -1,5 +1,13 @@
 # Resource Investigation
 
+## Status (2026-04-17)
+
+**Resolved.** Root cause of the 15s → 25s CPU regression identified: commit `628eab8` linked `ffmpeg-full`, which enabled HDR tonemapping (zscale) that was previously silently skipped. Not a code bug — a feature activating.
+
+The CPU pipeline has since been fully migrated to libplacebo GPU rendering (see `Docs/Libplacebo-design.md`). With `--hwaccel videotoolbox`, 4K HDR 60fps now plays smoothly. The CPU-side optimizations below were the stepping stones before the full GPU migration.
+
+---
+
 ## Note on the baseline data
 
 The data does show a regression. Between tag `20260308` and `cff1cc7` (a short window), **user CPU jumped 15s → 25s (+67%)** and **RSS grew 3.34GB → 3.95GB (+18%)**, while everything from `20250824` through `20260308` is flat. So "compounded gradually" is partly true for RSS long-term, but there is a concrete recent CPU regression worth bisecting first.
