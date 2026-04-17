@@ -520,6 +520,7 @@ void Display::recreate_video_textures_for_current_mode() {
     }
 
     SDL_SetTextureScaleMode(tex, scale_mode);
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
     return tex;
   };
 
@@ -1064,7 +1065,7 @@ void Display::convert_to_packed_10_bpc(std::array<uint8_t*, 3> in_planes, std::a
             const uint32_t g = p_in[in_x + 1] >> 6;
             const uint32_t b = p_in[in_x + 2] >> 6;
 
-            p_out[out_x] = (3u << 30) | (r << 20) | (g << 10) | (b);
+            p_out[out_x] = (r << 20) | (g << 10) | (b);
           }
 
           p_in += in_pitches[0] / sizeof(uint16_t);

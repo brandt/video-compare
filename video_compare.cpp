@@ -658,19 +658,6 @@ void VideoCompare::format_convert_video(const Side& side) {
         }
         (*format_converters_[side])(frame_filtered.get(), frame_converted.get());
 
-        // X2RGB10LE has 2 unused high bits (= 0 = transparent in ARGB2101010).
-        // Set them to fully opaque for correct SDL rendering.
-        if (hdr_passthrough_active_ && frame_converted->format == AV_PIX_FMT_X2RGB10LE) {
-          uint32_t* pixels = reinterpret_cast<uint32_t*>(frame_converted->data[0]);
-          const int stride = frame_converted->linesize[0] / sizeof(uint32_t);
-          for (int y = 0; y < frame_converted->height; y++) {
-            for (int x = 0; x < frame_converted->width; x++) {
-              pixels[x] |= 0xC0000000u;
-            }
-            pixels += stride;
-          }
-        }
-
         converted_frame_queues_[side]->push(std::move(frame_converted));
       } else if (filtered_frame_queues_[side]->is_stopped() || is_seeking(side)) {
         // Stop filtering
@@ -1780,7 +1767,11 @@ void VideoCompare::compare() {
             const double target_time_us = std::max(1000.0, static_cast<double>(std::max(ffmpeg::frame_duration(left_display_frame), ffmpeg::frame_duration(right_display_frame))) / display_->get_playback_speed_factor());
             const double refresh_time_us = static_cast<double>(refresh_time_deque.average());
 
-            next_refresh_at += std::max(1.0 + (frame_number - next_refresh_frame_number), refresh_time_us / target_time_us);
+            // When the display refresh is slower than the content's target frame rate,
+            // display every produced frame rather than skipping to maintain real-time speed.
+            // Smooth slow-motion is preferable to choppy frame-skipping for a comparison tool.
+            const double effective_target_us = std::max(target_time_us, refresh_time_us);
+            next_refresh_at += std::max(1.0 + (frame_number - next_refresh_frame_number), refresh_time_us / effective_target_us);
           }
 
           // check if sleeping is the best option for accurate playback by taking the average refresh time into account

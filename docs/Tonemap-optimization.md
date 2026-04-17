@@ -232,10 +232,11 @@ Phases 1–3 implemented and functional. HDR content renders on HDR displays via
 - **Phase 2 (display.cpp):** HDR textures created with `SDL_CreateTextureWithProperties` using `SDL_COLORSPACE_HDR10`, `SDL_PIXELFORMAT_ARGB2101010`, headroom from display. Buffer reallocation on passthrough state change. `requires_10_bpc()` refactored to mean "needs RGB48LE→ARGB2101010 packing" (true for `--10-bpc` without HDR passthrough); HDR passthrough uses `AV_PIX_FMT_X2RGB10LE` (already packed, direct upload).
 - **Phase 3 (video_compare.cpp, video_filterer.cpp):** `probe_hdr_display()` called before filterer construction. Content-aware activation: HDR passthrough only when display supports HDR AND all video sides have HDR content. `hdr_passthrough` flag passed to `VideoFilterer` — disables `must_tonemap`. For HLG content, `zscale=t=smpte2084` inserted for HLG→PQ transfer conversion. PQ content passes through with no conversion. FormatConverter outputs `AV_PIX_FMT_X2RGB10LE` (4 bytes/pixel packed 10-bit RGB) when HDR passthrough active. Mixed HDR+SDR comparisons fall back to CPU tonemap.
 - **Bug fixes:**
-  - ARGB2101010 packing now sets alpha bits to fully opaque (`3u << 30`) — without this, the 2-bit alpha was 0 = transparent, making the texture invisible.
+  - Video textures set to `SDL_BLENDMODE_NONE` so the 2-bit alpha in ARGB2101010/X2RGB10LE is ignored by the renderer. This replaced an earlier per-pixel alpha fixup loop (`|= 0xC0000000`) that added ~16ms per 4K frame — a significant throughput hit.
   - Right-side byte offsets in split-view upload use correct bytes-per-pixel (4 for X2RGB10LE, not hardcoded 3 for RGB24).
   - `pixel_size` for screenshot/selection memcpy accounts for X2RGB10LE format.
-  - Alpha bits OR'd into X2RGB10LE frame data in `format_convert_video` (the X bits in X2RGB10LE are 0 by default = transparent in ARGB2101010).
+  - HDR frames saved as lossless JPEG-XL (via `JxlSaver`, separate from `PngSaver`) with color metadata preserved. SDR frames remain PNG.
+- **Frame-skip fix (video_compare.cpp):** The adaptive refresh skip formula `next_refresh_at += refresh_time / target_time` was dropping 2/3 of frames when the display refresh (~57ms at 4K) exceeded the content's target frame period (~16.7ms at 60fps). For a comparison tool, smooth slow-motion is preferable to choppy frame-skipping. Fixed by capping the effective target to `max(target_time, refresh_time)`, which produces ratio=1.0 (display every frame) when the display can't hit the content's target FPS. Normal-speed playback is preserved when the display can keep up.
 
 **Measured performance (4K 10-bit HLG BT.2020):**
 
@@ -258,6 +259,8 @@ The remaining ~2.1-core steady-state gap vs SDR is the HLG→PQ `zscale=t=smpte2
 2. **Headroom from content metadata** — currently uses `hdr_display_headroom_` from the display. Should use `MaxCLL / 100.0` from the content when available, so SDL can tone-map content that exceeds display headroom.
 
 3. **SDR texture colorspace tagging** — with the `SDL_COLORSPACE_SRGB_LINEAR` renderer, explicitly tag SDR textures with `SDL_COLORSPACE_SRGB` for correct gamma handling.
+
+4. **Display refresh performance** — `possibly_refresh` takes ~57ms at 4K (two 33MB texture uploads + render + VSync). This limits UI FPS to ~17fps regardless of pipeline speed. Potential improvements: `SDL_LockTexture` instead of `SDL_UpdateTexture` to avoid Metal synchronization stalls, double-buffered textures, or dirty-region tracking to upload only changed sub-rects.
 
 ## Recommended priority
 
