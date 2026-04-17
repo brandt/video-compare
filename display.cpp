@@ -2538,16 +2538,32 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     };
 
     if (show_left_ || show_right_) {
-      if (show_left_ && split_x > 0) {
-        const SDL_Rect video_quad_left = {0, 0, split_x, video_height_};
-        push_op(0, 0, 0, split_x, video_height_, video_quad_left);
-      }
-      if (show_right_ && ((split_x < video_width_) || mode_ != Mode::Split)) {
-        const int start_right = (mode_ == Mode::Split) ? std::max(split_x, 0) : 0;
-        const int right_x_offset = (mode_ == Mode::HStack) ? video_width_ : 0;
-        const int right_y_offset = (mode_ == Mode::VStack) ? video_height_ : 0;
-        const SDL_Rect video_quad_right = {right_x_offset + start_right, right_y_offset, video_width_ - start_right, video_height_};
-        push_op(1, start_right, 0, video_width_ - start_right, video_height_, video_quad_right);
+      const int right_x_offset = (mode_ == Mode::HStack) ? video_width_ : 0;
+      const int right_y_offset = (mode_ == Mode::VStack) ? video_height_ : 0;
+
+      if (mode_ == Mode::Split) {
+        // In Split mode, render the right video to its FULL area first (stable
+        // target rect, independent of split position), then paint the left
+        // video on top clipped at split_x. This keeps the right video's
+        // rendered pixels stable while the split line moves.
+        if (show_right_) {
+          const SDL_Rect video_quad_right = {0, 0, video_width_, video_height_};
+          push_op(1, 0, 0, video_width_, video_height_, video_quad_right);
+        }
+        if (show_left_ && split_x > 0) {
+          const SDL_Rect video_quad_left = {0, 0, split_x, video_height_};
+          push_op(0, 0, 0, split_x, video_height_, video_quad_left);
+        }
+      } else {
+        // HStack / VStack: sides occupy disjoint screen areas; order doesn't matter.
+        if (show_left_) {
+          const SDL_Rect video_quad_left = {0, 0, video_width_, video_height_};
+          push_op(0, 0, 0, video_width_, video_height_, video_quad_left);
+        }
+        if (show_right_) {
+          const SDL_Rect video_quad_right = {right_x_offset, right_y_offset, video_width_, video_height_};
+          push_op(1, 0, 0, video_width_, video_height_, video_quad_right);
+        }
       }
     }
 
