@@ -2785,13 +2785,15 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
     // Build render ops using the exact same coordinate chain as the SDL path:
     // video rect -> video_to_zoom_space -> video_rect_to_drawable_transform.
-    std::array<GpuRenderer::SideRenderOp, 2> ops{};
-    int op_count = 0;
+    // A vector (not a fixed array) — zoom-magnifier mode pushes extra ops on
+    // top of the main-view ops.
+    std::vector<GpuRenderer::SideRenderOp> ops;
+    ops.reserve(4);
 
     auto push_op = [&](int side, int src_x, int src_y, int src_w, int src_h,
                         const SDL_Rect& video_quad) {
       const SDL_FRect screen_rect = video_rect_to_drawable_transform(video_to_zoom_space(video_quad, zoom_rect));
-      GpuRenderer::SideRenderOp& op = ops[op_count++];
+      GpuRenderer::SideRenderOp op{};
       op.side = side;
       op.src_x0 = static_cast<float>(src_x);
       op.src_y0 = static_cast<float>(src_y);
@@ -2801,6 +2803,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       op.dst_y0 = screen_rect.y;
       op.dst_x1 = screen_rect.x + screen_rect.w;
       op.dst_y1 = screen_rect.y + screen_rect.h;
+      ops.push_back(op);
     };
 
     if (show_left_ || show_right_) {
@@ -2833,6 +2836,72 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       }
     }
 
+    // Zoom magnifier windows (bottom-left / bottom-right corners). Each
+    // active zoom renders a 64-drawable-pixel source block around the mouse,
+    // scaled up to fill half of the min(drawable_w, drawable_h). Unlike the
+    // SDL path (which reads back the composited frame), the GPU path samples
+    // directly from the per-side frame textures: zoom_left shows left-side
+    // content, zoom_right shows right-side content, independent of the
+    // current split position.
+    const int dst_zoomed_size = static_cast<int>(std::round(std::min(drawable_width_, drawable_height_) * 0.5F)) & -2;
+    const int dst_half_zoomed_size = dst_zoomed_size / 2;
+
+    if (zoom_left_ || zoom_right_) {
+      const int src_zoomed_size = 64;
+      const int src_half = src_zoomed_size / 2;
+
+      const int mouse_drawable_x = std::round(static_cast<float>(mouse_x_) * drawable_to_window_width_factor_);
+      const int mouse_drawable_y = std::round(static_cast<float>(mouse_y_) * drawable_to_window_height_factor_);
+
+      const int src_x0_draw = clamp_range(mouse_drawable_x - src_half, 0, drawable_width_ - src_zoomed_size);
+      const int src_y0_draw = clamp_range(mouse_drawable_y - src_half, 0, drawable_height_ - src_zoomed_size);
+      const int src_x1_draw = src_x0_draw + src_zoomed_size;
+      const int src_y1_draw = src_y0_draw + src_zoomed_size;
+
+      // Convert drawable corners back into video-layout coords using the
+      // existing inverse transform. Layout coords include HStack/VStack
+      // offsets — side_src_rect() strips them per side.
+      const Vector2D tl_layout = window_to_video_position(
+          static_cast<int>(std::floor(src_x0_draw / drawable_to_window_width_factor_)),
+          static_cast<int>(std::floor(src_y0_draw / drawable_to_window_height_factor_)), zoom_rect, true);
+      const Vector2D br_layout = window_to_video_position(
+          static_cast<int>(std::ceil(src_x1_draw / drawable_to_window_width_factor_)),
+          static_cast<int>(std::ceil(src_y1_draw / drawable_to_window_height_factor_)), zoom_rect, false);
+
+      auto side_src_rect = [&](int side) -> SDL_FRect {
+        const float x_off = (side == 1 && mode_ == Mode::HStack) ? static_cast<float>(video_width_) : 0.f;
+        const float y_off = (side == 1 && mode_ == Mode::VStack) ? static_cast<float>(video_height_) : 0.f;
+        const float x0 = clamp_range(tl_layout.x() - x_off, 0.f, static_cast<float>(video_width_));
+        const float x1 = clamp_range(br_layout.x() - x_off, 0.f, static_cast<float>(video_width_));
+        const float y0 = clamp_range(tl_layout.y() - y_off, 0.f, static_cast<float>(video_height_));
+        const float y1 = clamp_range(br_layout.y() - y_off, 0.f, static_cast<float>(video_height_));
+        return {x0, y0, x1 - x0, y1 - y0};
+      };
+
+      auto push_zoom_op = [&](int side, const SDL_FRect& src_video, float dst_x, float dst_y) {
+        if (src_video.w <= 0 || src_video.h <= 0) return;
+        GpuRenderer::SideRenderOp op{};
+        op.side = side;
+        op.src_x0 = src_video.x;
+        op.src_y0 = src_video.y;
+        op.src_x1 = src_video.x + src_video.w;
+        op.src_y1 = src_video.y + src_video.h;
+        op.dst_x0 = dst_x;
+        op.dst_y0 = dst_y;
+        op.dst_x1 = dst_x + static_cast<float>(dst_zoomed_size);
+        op.dst_y1 = dst_y + static_cast<float>(dst_zoomed_size);
+        ops.push_back(op);
+      };
+
+      const float zoom_dst_y = static_cast<float>(drawable_height_ - dst_zoomed_size);
+      if (zoom_left_) {
+        push_zoom_op(0, side_src_rect(0), 0.f, zoom_dst_y);
+      }
+      if (zoom_right_) {
+        push_zoom_op(1, side_src_rect(1), static_cast<float>(drawable_width_ - dst_zoomed_size), zoom_dst_y);
+      }
+    }
+
     // Build overlay list (Phase 2: primitives only, no text yet).
     std::vector<GpuRenderer::OverlayOp> overlays;
 
@@ -2854,6 +2923,22 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         const float split_drawable_x = std::round(video_texel_clamped_mouse_x * drawable_to_window_width_factor_);
         push_rect(split_drawable_x, 0, split_drawable_x + 1, static_cast<float>(drawable_height_),
                   255, 255, 255, 255);
+
+        // Center "slider" line within each active zoom window — matches the
+        // SDL path's Split-mode zoom indicator.
+        const float zoom_dst_y = static_cast<float>(drawable_height_ - dst_zoomed_size);
+        const float zoom_dst_y1 = static_cast<float>(drawable_height_);
+        if (zoom_left_) {
+          push_rect(static_cast<float>(dst_half_zoomed_size), zoom_dst_y,
+                    static_cast<float>(dst_half_zoomed_size + 1), zoom_dst_y1,
+                    255, 255, 255, 255);
+        }
+        if (zoom_right_) {
+          const int cx = drawable_width_ - dst_half_zoomed_size - 1;
+          push_rect(static_cast<float>(cx), zoom_dst_y,
+                    static_cast<float>(cx + 1), zoom_dst_y1,
+                    255, 255, 255, 255);
+        }
       }
 
       // Progress dots — alternating yellow / black strip per side showing
@@ -3384,7 +3469,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       }
     }
 
-    if (gpu_renderer_.render(ops.data(), op_count,
+    if (gpu_renderer_.render(ops.data(), static_cast<int>(ops.size()),
                               overlays.data(), static_cast<int>(overlays.size()),
                               text_ops.data(), static_cast<int>(text_ops.size()),
                               nullptr)) {
