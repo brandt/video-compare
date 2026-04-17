@@ -1922,6 +1922,7 @@ void VideoCompare::compare() {
           const float ui_fps = calculate_fps(ONE_SECOND_US, full_cycle_time_deque.average());
 
           fps_message = string_sprintf("Video/UI FPS: %.1f/%.1f", video_fps, ui_fps);
+          display_->set_current_fps(video_fps, ui_fps);
 
           full_cycle_time_deque.clear();
           unique_frame_combo_tags_processed = 0;

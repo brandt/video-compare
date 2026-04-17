@@ -243,7 +243,9 @@ class Display {
   float playback_speed_factor_{1.0F};
   bool tick_playback_{false};
   bool possibly_tick_playback_{false};
-  bool show_fps_{false};
+  bool show_fps_{true};
+  float current_video_fps_{0.0f};
+  float current_ui_fps_{0.0f};
 
   bool show_quality_metrics_{false};
   std::string last_psnr_{"n/a"};
@@ -535,6 +537,7 @@ class Display {
   bool get_tick_playback() const;
   bool get_possibly_tick_playback() const;
   bool get_show_fps() const;
+  void set_current_fps(float video_fps, float ui_fps) { current_video_fps_ = video_fps; current_ui_fps_ = ui_fps; }
 
   void update_metadata(const VideoMetadata left_metadata, const VideoMetadata right_metadata);
   void update_right_video(const std::string& right_file_name, const VideoMetadata right_metadata);

@@ -42,6 +42,8 @@ static const SDL_Color TARGET_COLOR = {200, 200, 140, 0};
 static const SDL_Color ZOOM_COLOR = {255, 165, 0, 0};
 static const SDL_Color PLAYBACK_SPEED_COLOR = {0, 192, 160, 0};
 static const SDL_Color BUFFER_COLOR = {160, 225, 192, 0};
+static const SDL_Color FPS_VIDEO_COLOR = {255, 255, 192, 0};
+static const SDL_Color FPS_UI_COLOR = {255, 120, 200, 0};
 static const int BACKGROUND_ALPHA = 100;
 
 static const int MOUSE_WHEEL_SCROLL_STEPS_TO_DOUBLE = 12;
@@ -2762,6 +2764,27 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
           push_text(right_label, small_font_, TEXT_COLOR, drawable_width_ - line1_y_ - w_label, line1_y_, TextAlign::Right);
           push_text(right_pos_str, small_font_, POSITION_COLOR, drawable_width_ - line1_y_ - w_pos, line2_y_, TextAlign::Right);
         }
+      }
+
+      // Video/UI FPS counters (persistent when show_fps_). Positioned in the
+      // bottom-center-right area, paired with a small gap between them.
+      if (show_fps_) {
+        const std::string vid_str = string_sprintf("Vid %.1f", current_video_fps_);
+        const std::string ui_str = string_sprintf("UI %.1f", current_ui_fps_);
+
+        int vid_w = 0, vid_h = 0, ui_w = 0, ui_h = 0;
+        TTF_GetStringSize(small_font_, vid_str.c_str(), 0, &vid_w, &vid_h);
+        TTF_GetStringSize(small_font_, ui_str.c_str(), 0, &ui_w, &ui_h);
+
+        const int gap = double_border_extension_ * 2;
+        const int pair_w = vid_w + double_border_extension_ + gap + ui_w + double_border_extension_;
+        const int pair_anchor_x = drawable_width_ * 2 / 3; // ~67% across
+        const int vid_x = pair_anchor_x - pair_w / 2 + border_extension_;
+        const int ui_x = vid_x + vid_w + double_border_extension_ + gap;
+        const int fps_y = drawable_height_ - line1_y_ - std::max(vid_h, ui_h);
+
+        push_text(vid_str, small_font_, FPS_VIDEO_COLOR, vid_x, fps_y, TextAlign::Left);
+        push_text(ui_str, small_font_, FPS_UI_COLOR, ui_x, fps_y, TextAlign::Left);
       }
     }
 
