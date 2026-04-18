@@ -13,6 +13,7 @@
 #include "core_types.h"
 #include "difference_processor.h"
 #include "display_types.h"
+#include "display_utils.h"
 #include "gpu_renderer.h"
 #include "image_saver.h"
 #include "metadata_panel.h"
@@ -216,6 +217,34 @@ class Display {
 
   void render_frame_gpu(const RenderContext& ctx, const std::string& current_total_browsable);
   void render_frame_sdl(const RenderContext& ctx, const std::string& current_total_browsable);
+
+  // GPU render sub-phases (called in order from render_frame_gpu).
+  bool gpu_run_cpu_work(const RenderContext& ctx);  // returns have_rgb
+  void gpu_upload_frames(const RenderContext& ctx, bool have_rgb);
+  void gpu_build_main_video_ops(const RenderContext& ctx, std::vector<GpuRenderer::SideRenderOp>& ops);
+  void gpu_build_zoom_magnifier_ops(const RenderContext& ctx,
+                                     std::vector<GpuRenderer::SideRenderOp>& ops,
+                                     float& zoom_left_slider_dx,
+                                     float& zoom_right_slider_dx);
+  // Returns a captured OSD AVFrame when a save was requested and CPU pixels
+  // are available; otherwise nullptr (the expensive GPU readback is skipped).
+  AVFramePtr gpu_capture_osd(bool have_rgb,
+                              const std::vector<GpuRenderer::SideRenderOp>& ops,
+                              const std::vector<GpuRenderer::OverlayOp>& overlays,
+                              const std::vector<GpuRenderer::TextOverlayOp>& text_ops);
+  void gpu_finalize_deferred(const RenderContext& ctx, bool have_rgb, AVFrame* osd_frame);
+
+  // SDL render sub-phases (called in order from render_frame_sdl).
+  void sdl_run_cpu_work(const RenderContext& ctx,
+                         const std::array<uint8_t*, 3>& planes_left, const std::array<size_t, 3>& pitches_left,
+                         const std::array<uint8_t*, 3>& planes_right, const std::array<size_t, 3>& pitches_right);
+  void sdl_render_video_textures(const RenderContext& ctx,
+                                  const std::array<uint8_t*, 3>& planes_left, const std::array<size_t, 3>& pitches_left,
+                                  const std::array<uint8_t*, 3>& planes_right, const std::array<size_t, 3>& pitches_right);
+  void sdl_render_zoom_magnifier(int mouse_drawable_x, int mouse_drawable_y, int dst_zoomed_size);
+  void sdl_render_hud(const RenderContext& ctx, const std::string& current_total_browsable);
+  void sdl_render_message_toast();
+  void sdl_finalize_deferred(const AVFrame* left_frame, const AVFrame* right_frame);
 
   SDL sdl_;
   TTF_Font* small_font_{nullptr};
