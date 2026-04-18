@@ -1,8 +1,26 @@
 # libplacebo GPU Rendering Pipeline: Design Plan
 
-## Status (2026-04-17)
+## Status (2026-04-17) — all four phases complete
 
-**Phase 1 — video pipeline migration: COMPLETE.** With `--hwaccel videotoolbox`, 4K HDR 60fps plays smoothly. GPU renderer is no longer the bottleneck — software decode is, as expected.
+### Scope of "complete"
+
+This migration replaces **GPU rendering and compositing**: YUV→RGB, colorspace / tonemap, scale, overlay composition, and swapchain present all run on the GPU via libplacebo. That work is done.
+
+It does **not** make the pipeline GPU-resident end-to-end. When `--hwaccel videotoolbox` (or any other hw accelerator) is used:
+
+```
+demux → GPU decode (hardware) → av_hwframe_transfer_data → CPU frame
+      → VideoFilterer (CPU, structural filters only)
+      → pl_map_avframe_ex (CPU → GPU upload)
+      → pl_render_image (GPU)
+      → pl_swapchain_submit_frame + swap_buffers
+```
+
+The GPU→CPU readback after decode and the subsequent CPU→GPU upload are **still present**. A real zero-copy path would hand the decoder's output texture (e.g. a `CVPixelBuffer`/IOSurface on macOS) directly to libplacebo via `pl_map_avframe_ex` on an `AV_PIX_FMT_VIDEOTOOLBOX` frame. That's listed under *Future work* and has not been attempted.
+
+In practice the Apple Silicon CPU absorbs the readback + upload at 4K HDR 60fps with plenty of headroom, so playback is smooth — but the performance is CPU-limited on the transfer path, not GPU-limited.
+
+**Phase 1 — video pipeline migration: COMPLETE.** GPU rendering/compositing works. With `--hwaccel videotoolbox`, 4K HDR 60fps plays smoothly (see scope note above). Without `--hwaccel`, software decode is the bottleneck, as expected.
 
 **Phase 2 — HUD overlays: COMPLETE.** All SDL_Renderer-based HUD elements re-implemented via `pl_overlay`:
 - Split line, progress dots, selection/crop rects (monochrome primitives)
@@ -12,9 +30,9 @@
 - Message toast (2s hold + 1s fade)
 - Help screen and metadata panel (scrollable, multi-line)
 
-**Phase 3 — features needing RGB pixel access: NOT STARTED.** Subtraction mode, per-pixel color inspector, live PSNR/SSIM/VMAF overlay currently no-op or misbehave in GPU mode because the FrameRing holds native YUV frames. Planned fix: on-demand sws_scale only when these features are active.
+**Phase 3 — features needing RGB pixel access: COMPLETE.** Subtraction mode, per-pixel color inspector, and live PSNR/SSIM/VMAF overlay work in GPU mode via an on-demand sws_scale cache (`rgb_frames_[kSideCount]`) populated only when at least one of those features is active. Known tradeoff: activating any of them drops framerate to ~20fps (CPU YUV→RGB per frame + CPU metrics). Future work: move to GPU via compute shaders.
 
-**Phase 4 — features needing `pl_tex_download`: NOT STARTED.** Zoom/magnifier window, save-selected-area, full-screen screenshot. Need GPU→CPU readback after `pl_render_image`.
+**Phase 4 — features needing GPU→CPU readback: COMPLETE.** Scope of original plan revised: only the full-screen screenshot's OSD capture truly needs `pl_tex_download`. Zoom magnifier is just another set of `SideRenderOp`s; save-selected-area reuses the Phase 3 `rgb_frames_` cache. All three work in GPU mode now.
 
 ## Goal
 
@@ -211,9 +229,10 @@ Based on mpv benchmarks on Apple Silicon with `vo=gpu-next`:
 - **4K HDR 60fps** with default tone mapping: achievable
 - **4K SDR 60fps**: easily achievable
 - **GPU overhead per frame**: <1ms for render, ~1ms for upload
-- **Pipeline bottleneck shifts to: decoder** (software decode ~25fps per side at 4K; hardware decode via VideoToolbox removes this)
 
-Combining libplacebo rendering with `--hwaccel videotoolbox` would enable full 4K 60fps end-to-end.
+Bottleneck depends on the decode path:
+- **Software decode**: decoder itself is the bottleneck (~25fps per side at 4K).
+- **`--hwaccel videotoolbox`**: decoder is fast, but `av_hwframe_transfer_data` + `pl_map_avframe_ex` together constitute a GPU→CPU→GPU round-trip on the hot path. CPU absorbs it at 4K60 on Apple Silicon with headroom; if that ever becomes the bottleneck, the fix is to hand the hardware frame directly to libplacebo (see *Future work*).
 
 ---
 
@@ -266,8 +285,71 @@ When a file path is wider than `max_text_width_`:
 
 `VideoFilterer` takes a `gpu_color_processing` ctor flag. When set, `must_tonemap` is forced false AND the HLG→PQ passthrough filter is skipped — libplacebo handles all color conversion on the GPU. The filterer only applies structural transforms (fps, deinterlace, rotation, crop). `format_convert_video` in `video_compare.cpp` passes filtered frames through unchanged (no sws_scale) but still sets `frame_key` + `original_*` metadata since `FormatConverter` is bypassed.
 
-### Intentionally deferred / still broken in GPU mode
+---
 
-- **Subtraction mode, per-pixel inspector, live PSNR/SSIM/VMAF** — all read `frame->data[0]` assuming RGB, but frames are native YUV in GPU mode. Phase 3 will add on-demand sws_scale for these features only.
-- **Zoom/magnifier window, save-selected-area, full-screen screenshot** — all need `SDL_RenderReadPixels` (SDL-renderer-only). Phase 4 will reimplement via `pl_tex_download` after `pl_render_image`.
-- **`format_converter.cpp/h`** is still compiled and instantiated even though it's bypassed in GPU mode — delete after Phase 3.
+## Phase 3 implementation notes
+
+### On-demand RGB cache (`ensure_rgb_frames`)
+
+GPU-mode FrameRing holds native YUV frames. Features that still need CPU pixel access — subtraction mode, per-pixel inspector, live PSNR/SSIM/VMAF — are wired to a lazy per-side `FormatConverter` + packed-RGB destination frame keyed by `frame_key`:
+
+- Cache is only populated when at least one RGB-dependent feature is active (`need_rgb` gate at the top of `possibly_refresh`'s GPU path). Otherwise the pipeline stays YUV-only and GPU-fast.
+- Dest format mirrors `requires_10_bpc() ? RGB48LE : RGB24` so existing helpers (`update_difference`, `get_rgb_pixel`, `rgb_to_grayscale`, `crop_rgb_frame`) work unchanged.
+- `color_primaries` and `color_trc` are copied from the src frame to the dst so downstream savers (JxlSaver) preserve HDR metadata on saved output.
+
+### Subtraction in GPU mode
+
+`diff_buffer_` (already allocated by `reinitialize_video_dimensions`) is filled by `update_difference` from the two RGB frames, then handed to the GPU renderer via a reusable `diff_upload_frame_` AVFrame shell whose `data[0]` aliases `diff_buffer_`. Uploaded in place of the right frame; `right_needs_update` gates both the diff recompute and the upload (matches SDL path cadence).
+
+### Quality metrics overlay
+
+Live PSNR/SSIM is recomputed every frame the feature is on; VMAF is only computed on paused frames (it's slow) and cached until the frame changes. The three lines are rendered as a background `OverlayOp` + three `TextOverlayOp`s at the top-right; suppressed while help/metadata panels are visible, same as other HUD.
+
+### Known perf hit
+
+Activating subtraction or quality metrics drops framerate to ~20fps even with `--hwaccel videotoolbox` — the CPU pays for both sws_scale conversion and the metric computations. Acceptable for now; real fix is compute-shader-based subtraction/metrics (see *Future work* below).
+
+---
+
+## Phase 4 implementation notes
+
+### Zoom magnifier (no readback needed)
+
+Each active zoom pushes additional `SideRenderOp`s that sample directly from the per-side frame textures into bottom-corner dst boxes. Both corners show the same composited view (Split: right full + left clipped at `split_x`; HStack/VStack: split at the stack boundary when the src straddles it) so the user can switch corners when one obscures the area being inspected.
+
+Gotchas worth remembering:
+
+- **`ops` storage.** Fixed `std::array<SideRenderOp, 2>` became `std::vector` with `reserve(8)` — zoom can push up to 4 extra (2 sides × up to 2 slices each).
+- **Sub-pixel jitter.** Initial implementation computed the src rect via `window_to_video_position` (floor/ceil to int video coords); as the mouse moved, the src width could fluctuate by 1 video pixel, amplified by dst scale → visible right-frame jitter. Fix: compute a *fixed* video-coord src extent (64 drawable pixels × current zoom factor), centered on the raw mouse — float only, no integer snaps.
+- **Slider-line alignment.** The slider was drawn at the dst center; but the src is centered on the raw mouse while `split_x` is rounded to an integer video texel, so the true left/right boundary in the zoom was up to ~half-a-video-pixel × dst-scale drawable pixels off. Fix: draw the slider at `mx(split_x)` (`split_x` mapped through the zoom's src→dst transform) rather than at dst center.
+
+### Save selected area (reuses Phase 3 RGB cache)
+
+`save_selected_area_` was added to the `need_rgb` trigger; the GPU deferred block calls `possibly_save_selected_area(rgb_frames_[0], rgb_frames_[1])`. Bugs fixed along the way:
+
+- **`file_stem` never populated in GPU mode.** It was assigned inside `rebuild_side_ui_textures`, which early-returned for GPU → save files came out named `__cutout_…`. Moved the stem assignment ahead of the GPU return (used by both paths for save filenames).
+- **`update_right_video` latent crash in GPU mode** (SDL texture creation with `renderer_=nullptr`) — now guarded.
+- **`save_selected_area` pixel_size** was inferred from display flags (`hdr_passthrough_`, `requires_10_bpc()`); wrong for GPU-mode RGB cache frames under HDR passthrough. Switched to `switch(frame->format)` — RGB24→3, RGB48LE→6, X2RGB10LE→4.
+- **HDR extension detection generalised:** `.jxl` when `format == X2RGB10LE` **or** `color_trc ∈ {PQ, HLG}`. Previously only X2RGB10LE triggered it, and GPU mode's RGB cache is never X2RGB10LE → HDR content would have saved as 16-bit PNG (big and loses HDR metadata). Fix applied to both `save_image_frames` and `save_selected_area`.
+
+### Full-screen screenshot (the one feature that truly needs `pl_tex_download`)
+
+- **`GpuRenderer::render` was refactored** to extract a private `compose_frame(target, fbo_w, fbo_h, ops, overlays, text_overlays)` helper that does the overlay build + per-side renders + final overlay pass. Both `render()` (swapchain target) and the new `capture_osd()` call it. No behavioral change to `render()`.
+- **`GpuRenderer::capture_osd(out_rgb24, pitch, w, h, ops, overlays, text_overlays)`** lazy-creates a host-readable RGBA8 `osd_capture_tex_` matching the current swapchain size, re-composes the same scene onto it with sRGB color (so HDR content tonemaps to SDR for the screenshot), then `pl_tex_download`s and packs RGB24 into the caller's buffer.
+- **Target tex params needed `sampleable=true`, `renderable=true`, `host_readable=true`, `blit_dst=true`** — and the matching `pl_find_fmt` caps. Initial attempt missed `blit_dst` and failed `pl_frame_clear` validation (the clear uses a blit under the hood).
+- **`pl_find_fmt` caps** must be cast to `pl_fmt_caps` in C++ (enum vs int signature — C99 compound literal workaround again).
+- **OSD capture runs inside `possibly_refresh` BEFORE text `SDL_Surface`s are destroyed.** `TextOverlayOp.rgba_data` points at surface pixels; capture must run while they're still alive. Surfaces are destroyed immediately after.
+- **`Display::save_image_frames`** was split into a thin public SDL wrapper (builds OSD via `SDL_RenderReadPixels`) and a shared `save_image_frames_core(left, right, osd)` that both paths call. GPU deferred block builds the OSD AVFrame via `capture_osd` then invokes the core.
+- **OSD file extension is always `.png`** — matches SDL behavior; the OSD has already been tonemapped to SDR.
+- **User-visible cost:** brief stall on the capture frame (extra full-res render + GPU→CPU download of `drawable_w × drawable_h × 4` bytes). One-shot, so acceptable.
+
+---
+
+## Future work (orthogonal to the migration)
+
+- **GPU-resident hardware decode.** Today `av_hwframe_transfer_data` pulls decoded frames back to system memory before libplacebo re-uploads them. Skipping the readback by passing the hw-frame (e.g. `AV_PIX_FMT_VIDEOTOOLBOX` / `CVPixelBuffer`) straight to `pl_map_avframe_ex` would be a true zero-copy path. Requires libplacebo/MoltenVK support for importing the platform-specific surface — viable on macOS via IOSurface, and on Linux via VAAPI/DRM-PRIME. This is the biggest remaining optimization for hwaccel users.
+- **GPU-side subtraction / metrics** — the Phase 3 ~20fps regression is pure CPU load. A compute-shader diff (or pl_shader custom hook) would bring the performance cost close to zero while the feature is active.
+- **CLI flag for tone mapping algorithm** — expose `pl_tone_map_function` (hable, mobius, reinhard, bt2390, clip, spline).
+- **`pl_cache`** — persistent shader cache to avoid first-frame shader-compile stutter on startup.
+- **`pl_peak_detect_params`** — GPU histogram-based peak detection for HDR tonemapping when `MaxCLL` metadata is missing.
+- **Delete `format_converter.cpp/h` passthrough path.** It's bypassed in GPU mode but still compiled/instantiated. The SDL renderer path needs it, but a refactor could limit instantiation to SDL-path only.
