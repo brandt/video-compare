@@ -14,11 +14,13 @@
 #include "difference_processor.h"
 #include "display_types.h"
 #include "gpu_renderer.h"
+#include "image_saver.h"
 #include "pixel_format_utils.h"
 #include "playback_controller.h"
 #include "rgb_frame_cache.h"
 #include "row_workers.h"
 #include "scope_window.h"
+#include "selection_manager.h"
 #include "view_transform.h"
 extern "C" {
 #include <libavutil/frame.h>
@@ -148,7 +150,6 @@ class Display {
   bool start_in_fullscreen_{false};
   bool is_fullscreen_{false};
   bool pending_verbose_print_{false};
-  bool save_image_frames_{false};
   bool print_mouse_position_and_color_{false};
   bool print_image_similarity_metrics_{false};
   bool mouse_is_inside_window_{false};
@@ -166,17 +167,8 @@ class Display {
   // Scope windows toggle requests
   std::array<bool, ScopeWindow::kNumScopes> toggle_scope_window_requested_{{false, false, false}};
 
-  // Rectangle selection state
-  enum class SelectionState { None, Started, Completed };
-  enum class CropTargetSide { Undefined, Left, Right, Both };
-  SelectionState selection_state_{SelectionState::None};
-  Vector2D selection_start_{0.0F, 0.0F};
-  Vector2D selection_end_{0.0F, 0.0F};
-  bool selection_wrap_{false};
-  bool save_selected_area_{false};
-  bool crop_mode_{false};
-  CropTargetSide crop_target_side_{CropTargetSide::Undefined};
-  PendingCropRequest pending_crop_request_;
+  SelectionManager selection_;
+  ImageSaver image_saver_;
 
   bool input_received_{true};
   int64_t previous_left_frame_pts_;
@@ -262,9 +254,6 @@ class Display {
   float mouse_y_;
   float wheel_sensitivity_;
 
-  int saved_image_number_{1};
-  int saved_selected_image_number_{1};
-
   std::vector<SDL_Texture*> metadata_textures_;
   std::vector<SDL_Surface*> metadata_surfaces_;  // RGBA surfaces (GPU renderer path)
   int metadata_total_height_{0};
@@ -307,13 +296,11 @@ class Display {
   void handle_window_resize(bool reset_forced_size_guard = false, bool force_layout_refresh = false);
   void recreate_video_textures_for_current_mode();
 
-  void save_image_frames(const AVFrame* left_frame, const AVFrame* right_frame);
-
-  // Shared save pipeline: writes left, right, and an on-screen-display frame
-  // to three image files. The public save_image_frames() wraps this with an
-  // SDL_RenderReadPixels-based OSD capture; the GPU path constructs the OSD
-  // frame itself via GpuRenderer::capture_osd.
-  void save_image_frames_core(const AVFrame* left_frame, const AVFrame* right_frame, const AVFrame* osd_frame);
+  // SDL-path OSD capture: reads back via SDL_RenderReadPixels, packs into
+  // an AVFrame, then delegates to ImageSaver::save_frames_with_osd. The GPU
+  // path builds the OSD via GpuRenderer::capture_osd and calls ImageSaver
+  // directly.
+  void save_image_frames_sdl(const AVFrame* left_frame, const AVFrame* right_frame);
 
   inline int static round(const float value) { return static_cast<int>(std::round(value)); }
 
@@ -346,13 +333,10 @@ class Display {
   void update_window_title_with_current_roi();
   void ensure_metadata_textures_current();
 
-  SDL_Rect get_left_selection_rect() const;
-  Vector2D wrap_to_left_frame(const Vector2D& video_position) const;
   void refresh_selection_end_from_mouse();
   void draw_selection_rect();
   void possibly_save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame);
   void possibly_apply_crop();
-  void save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame, const SDL_Rect& selection_rect);
 
   using ZoomRect = ViewTransform::ZoomRect;
 

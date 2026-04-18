@@ -78,6 +78,7 @@ Display::Display(const int display_number,
       diff_processor_(row_workers_, start_in_subtraction_mode),
       wheel_sensitivity_{wheel_sensitivity} {
   view_transform_.set_on_change([this]() { refresh_selection_end_from_mouse(); });
+  image_saver_.set_notifier([this](const std::string& msg) { notify_user(msg); });
   const int auto_width = mode == Mode::HStack ? width * 2 : width;
   const int auto_height = mode == Mode::VStack ? height * 2 : height;
 
@@ -911,23 +912,10 @@ void Display::handle_window_resize(const bool reset_forced_size_guard, const boo
   }
 }
 
-void save_frame_image(const AVFrame* frame, const std::string& filename, std::atomic_bool& error_occurred) {
-  try {
-    JxlSaver::save(frame, filename);
-  } catch (const std::ios_base::failure& e) {
-    std::cerr << "Error saving image to file: " << filename << std::endl;
-    error_occurred = true;
-  } catch (const std::runtime_error& e) {
-    std::cerr << "Error saving image: " << e.what() << std::endl;
-    error_occurred = true;
-  }
-};
-
-void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_frame) {
+void Display::save_image_frames_sdl(const AVFrame* left_frame, const AVFrame* right_frame) {
   // SDL renderer path — build the OSD via SDL_RenderReadPixels, then defer
-  // to the shared save core. The GPU renderer path builds its OSD frame
-  // directly via GpuRenderer::capture_osd and calls save_image_frames_core
-  // itself.
+  // to the shared ImageSaver pipeline. The GPU renderer path builds its OSD
+  // via GpuRenderer::capture_osd and calls the saver directly.
   const size_t pitch = requires_10_bpc() ? drawable_width_ * 3 * sizeof(uint16_t) : drawable_width_ * 3;
   uint8_t* pixels = reinterpret_cast<uint8_t*>(av_malloc(pitch * drawable_height_));
 
@@ -973,34 +961,9 @@ void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_
   osd->linesize[0] = pitch;
   AVFramePtr osd_frame(osd);
 
-  save_image_frames_core(left_frame, right_frame, osd_frame.get());
-}
-
-void Display::save_image_frames_core(const AVFrame* left_frame, const AVFrame* right_frame, const AVFrame* osd_frame) {
-  std::atomic_bool error_occurred(false);
-
   const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
   const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
-  const bool stems_equal = (left_stem == right_stem);
-  const std::string left_filename = string_sprintf("%s%s_%04d.jxl", left_stem.c_str(), stems_equal ? "_left" : "", saved_image_number_);
-  const std::string right_filename = string_sprintf("%s%s_%04d.jxl", right_stem.c_str(), stems_equal ? "_right" : "", saved_image_number_);
-  const std::string osd_filename = string_sprintf("%s_%s_osd_%04d.jxl", left_stem.c_str(), right_stem.c_str(), saved_image_number_);
-
-  auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return save_frame_image(frame, filename, error_occurred); };
-
-  std::thread save_left_frame_thread(save_frame, left_frame, left_filename);
-  std::thread save_right_frame_thread(save_frame, right_frame, right_filename);
-  std::thread save_osd_frame_thread(save_frame, osd_frame, osd_filename);
-
-  save_left_frame_thread.join();
-  save_right_frame_thread.join();
-  save_osd_frame_thread.join();
-
-  if (!error_occurred) {
-    notify_user(string_sprintf("Saved %s, %s and %s", left_filename.c_str(), right_filename.c_str(), osd_filename.c_str()));
-
-    saved_image_number_++;
-  }
+  image_saver_.save_frames_with_osd(left_frame, right_frame, osd_frame.get(), left_stem, right_stem);
 }
 
 void Display::render_text(const int x, const int y, SDL_Texture* texture, const int texture_width, const int texture_height, const int border_extension, const bool left_adjust) {
@@ -1509,108 +1472,72 @@ void Display::ensure_metadata_textures_current() {
   }
 }
 
-SDL_Rect Display::get_left_selection_rect() const {
-  const int x = std::min(selection_start_.x(), selection_end_.x());
-  const int y = std::min(selection_start_.y(), selection_end_.y());
-  const int w = std::abs(selection_end_.x() - selection_start_.x());
-  const int h = std::abs(selection_end_.y() - selection_start_.y());
-
-  const int clipped_x = std::max(0, x);
-  const int clipped_y = std::max(0, y);
-  const int clipped_w = std::min(w - (clipped_x - x), video_width_ - clipped_x);
-  const int clipped_h = std::min(h - (clipped_y - y), video_height_ - clipped_y);
-
-  return {clipped_x, clipped_y, clipped_w, clipped_h};
-}
-
-Vector2D Display::wrap_to_left_frame(const Vector2D& video_position) const {
-  switch (mode_) {
-    case Mode::HStack:
-      return video_position - Vector2D(video_width_, 0);
-    case Mode::VStack:
-      return video_position - Vector2D(0, video_height_);
-    default:
-      break;
-  }
-
-  return video_position;
-}
-
 void Display::refresh_selection_end_from_mouse() {
-  if (selection_state_ != SelectionState::Started) {
+  if (selection_.state() != SelectionState::Started) {
     return;
   }
 
   SDL_GetMouseState(&mouse_x_, &mouse_y_);
-  selection_end_ = view_transform_.window_to_video_position(mouse_x_, mouse_y_, view_transform_.compute_zoom_rect());
+  Vector2D end_video_pos = view_transform_.window_to_video_position(mouse_x_, mouse_y_, view_transform_.compute_zoom_rect());
 
-  if (selection_wrap_) {
-    selection_end_ = wrap_to_left_frame(selection_end_);
+  if (selection_.wrap()) {
+    end_video_pos = SelectionManager::wrap_to_left_frame(end_video_pos, mode_, video_width_, video_height_);
   }
+
+  selection_.set_end(end_video_pos);
 }
 
 void Display::draw_selection_rect() {
-  if (selection_state_ != SelectionState::Started) {
+  if (selection_.state() != SelectionState::Started) {
     return;
   }
 
   const auto zoom_rect = view_transform_.compute_zoom_rect();
 
   auto draw_rect = [this](const SDL_FRect& r, Uint8 r_val, Uint8 g_val, Uint8 b_val, int alpha_divider = 1) {
-    // Draw semi-transparent overlay
     SDL_SetRenderDrawColor(renderer_, r_val / 2, g_val / 2, b_val / 2, 128 / alpha_divider);
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
     SDL_RenderFillRect(renderer_, &r);
 
-    // Draw border
     SDL_SetRenderDrawColor(renderer_, r_val, g_val, b_val, 255 / alpha_divider);
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
     SDL_RenderRect(renderer_, &r);
   };
 
-  SDL_Rect selection_rect = get_left_selection_rect();
+  SDL_Rect selection_rect = selection_.get_left_selection_rect(video_width_, video_height_);
   SDL_FRect drawable_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(selection_rect, zoom_rect));
 
+  const bool crop_mode = selection_.crop_mode();
+  const CropTargetSide side = selection_.crop_target_side();
+
   if (mode_ == Mode::Split) {
-    if (crop_mode_) {
-      switch (crop_target_side_) {
-        case CropTargetSide::Right:
-          draw_rect(drawable_rect, 128, 128, 255);
-          break;
-        case CropTargetSide::Both:
-          draw_rect(drawable_rect, 255, 255, 255);
-          break;
-        default:
-          draw_rect(drawable_rect, 255, 128, 128);
-          break;
+    if (crop_mode) {
+      switch (side) {
+        case CropTargetSide::Right: draw_rect(drawable_rect, 128, 128, 255); break;
+        case CropTargetSide::Both:  draw_rect(drawable_rect, 255, 255, 255); break;
+        default:                    draw_rect(drawable_rect, 255, 128, 128); break;
       }
     } else {
       draw_rect(drawable_rect, 255, 255, 255);
     }
     return;
   } else {
-    if (!crop_mode_ || crop_target_side_ == CropTargetSide::Left || crop_target_side_ == CropTargetSide::Both) {
+    if (!crop_mode || side == CropTargetSide::Left || side == CropTargetSide::Both) {
       draw_rect(drawable_rect, 255, 128, 128);
     } else {
       draw_rect(drawable_rect, 96, 96, 96, 3);
     }
   }
 
-  // Draw right rectangle with appropriate offset
   switch (mode_) {
-    case Mode::HStack:
-      selection_rect.x += video_width_;
-      break;
-    case Mode::VStack:
-      selection_rect.y += video_height_;
-      break;
-    default:
-      break;
+    case Mode::HStack: selection_rect.x += video_width_; break;
+    case Mode::VStack: selection_rect.y += video_height_; break;
+    default: break;
   }
 
   drawable_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(selection_rect, zoom_rect));
 
-  if (!crop_mode_ || crop_target_side_ == CropTargetSide::Right || crop_target_side_ == CropTargetSide::Both) {
+  if (!crop_mode || side == CropTargetSide::Right || side == CropTargetSide::Both) {
     draw_rect(drawable_rect, 128, 128, 255);
   } else {
     draw_rect(drawable_rect, 96, 96, 96, 3);
@@ -1618,137 +1545,58 @@ void Display::draw_selection_rect() {
 }
 
 void Display::possibly_save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame) {
-  if (selection_state_ != SelectionState::Completed) {
+  if (selection_.state() != SelectionState::Completed) {
     return;
   }
 
-  const SDL_Rect selection_rect = get_left_selection_rect();
+  const SDL_Rect selection_rect = selection_.get_left_selection_rect(video_width_, video_height_);
 
   if (selection_rect.w <= 0 || selection_rect.h <= 0) {
     std::cerr << "Selection rectangle is empty. Please make a valid selection." << std::endl;
   } else {
-    save_selected_area(left_frame, right_frame, selection_rect);
+    const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
+    const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
+    image_saver_.save_selected_area(left_frame, right_frame, selection_rect, left_stem, right_stem);
   }
 
-  selection_state_ = SelectionState::None;
-  save_selected_area_ = false;
+  selection_.cancel_save_selected_area();
 }
 
 void Display::possibly_apply_crop() {
-  if (selection_state_ != SelectionState::Completed) {
+  if (selection_.state() != SelectionState::Completed) {
     return;
   }
 
-  const SDL_Rect selection_rect = get_left_selection_rect();
+  const SDL_Rect selection_rect = selection_.get_left_selection_rect(video_width_, video_height_);
 
-  pending_crop_request_ = PendingCropRequest{};
-
+  PendingCropRequest request;
   if (selection_rect.w <= 0 || selection_rect.h <= 0) {
     std::cerr << "Crop rectangle is empty. Please make a valid selection." << std::endl;
   } else {
-    pending_crop_request_.rect = selection_rect;
-    pending_crop_request_.valid = true;
+    request.rect = selection_rect;
+    request.valid = true;
 
-    switch (crop_target_side_) {
+    switch (selection_.crop_target_side()) {
       case CropTargetSide::Left:
-        pending_crop_request_.apply_left = true;
+        request.apply_left = true;
         break;
       case CropTargetSide::Right:
-        pending_crop_request_.apply_right = true;
-        pending_crop_request_.right_target_index = active_right_index_;
+        request.apply_right = true;
+        request.right_target_index = active_right_index_;
         break;
       case CropTargetSide::Both:
-        pending_crop_request_.apply_left = true;
-        pending_crop_request_.apply_right = true;
-        pending_crop_request_.right_target_index = active_right_index_;
+        request.apply_left = true;
+        request.apply_right = true;
+        request.right_target_index = active_right_index_;
         break;
       case CropTargetSide::Undefined:
-        pending_crop_request_.valid = false;
+        request.valid = false;
         break;
     }
   }
 
-  selection_state_ = SelectionState::None;
-  crop_mode_ = false;
-  crop_target_side_ = CropTargetSide::Undefined;
-}
-
-void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame, const SDL_Rect& selection_rect) {
-  std::atomic_bool error_occurred(false);
-
-  // Lambda for creating and initializing frames
-  auto create_frame = [&](const int width, const int height, const AVFrame* source_frame) -> AVFrame* {
-    AVFrame* frame = av_frame_alloc();
-    frame->format = source_frame->format;
-    frame->width = width;
-    frame->height = height;
-    frame->colorspace = source_frame->colorspace;
-    frame->color_range = source_frame->color_range;
-    av_frame_get_buffer(frame, 0);
-    return frame;
-  };
-
-  AVFrame* left_selected = create_frame(selection_rect.w, selection_rect.h, left_frame);
-  AVFrame* right_selected = create_frame(selection_rect.w, selection_rect.h, right_frame);
-  AVFrame* concatenated = create_frame(selection_rect.w * 2, selection_rect.h, left_frame);
-
-  // Packed-RGB bytes per pixel derived from frame format so GPU-mode RGB
-  // cache frames (RGB24 / RGB48LE) save correctly even when display flags
-  // (hdr_passthrough_, use_10_bpc_) would have suggested a different size.
-  int pixel_size;
-  switch (left_frame->format) {
-    case AV_PIX_FMT_RGB24:      pixel_size = 3; break;
-    case AV_PIX_FMT_RGB48LE:    pixel_size = 6; break;
-    case AV_PIX_FMT_X2RGB10LE:  pixel_size = 4; break;
-    default:
-      std::cerr << "save_selected_area: unsupported pixel format " << left_frame->format << std::endl;
-      av_frame_free(&left_selected);
-      av_frame_free(&right_selected);
-      av_frame_free(&concatenated);
-      return;
-  }
-
-  for (int y = 0; y < selection_rect.h; y++) {
-    const int src_y = selection_rect.y + y;
-    const int dst_y = y;
-
-    // Copy left frame data
-    memcpy(left_selected->data[0] + dst_y * left_selected->linesize[0], left_frame->data[0] + src_y * left_frame->linesize[0] + selection_rect.x * pixel_size, selection_rect.w * pixel_size);
-
-    // Copy right frame data
-    memcpy(right_selected->data[0] + dst_y * right_selected->linesize[0], right_frame->data[0] + src_y * right_frame->linesize[0] + selection_rect.x * pixel_size, selection_rect.w * pixel_size);
-
-    // Copy to concatenated frame
-    memcpy(concatenated->data[0] + dst_y * concatenated->linesize[0], left_frame->data[0] + src_y * left_frame->linesize[0] + selection_rect.x * pixel_size, selection_rect.w * pixel_size);
-    memcpy(concatenated->data[0] + dst_y * concatenated->linesize[0] + selection_rect.w * pixel_size, right_frame->data[0] + src_y * right_frame->linesize[0] + selection_rect.x * pixel_size, selection_rect.w * pixel_size);
-  }
-
-  const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
-  const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
-  const bool stems_equal = (left_stem == right_stem);
-  const std::string left_filename = string_sprintf("%s%s_cutout_%04d.jxl", left_stem.c_str(), stems_equal ? "_left" : "", saved_selected_image_number_);
-  const std::string right_filename = string_sprintf("%s%s_cutout_%04d.jxl", right_stem.c_str(), stems_equal ? "_right" : "", saved_selected_image_number_);
-  const std::string concatenated_filename = string_sprintf("%s_%s_cutout_concat_%04d.jxl", left_stem.c_str(), right_stem.c_str(), saved_selected_image_number_);
-
-  auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return save_frame_image(frame, filename, error_occurred); };
-
-  std::thread save_left_thread(save_frame, left_selected, left_filename);
-  std::thread save_right_thread(save_frame, right_selected, right_filename);
-  std::thread save_concatenated_thread(save_frame, concatenated, concatenated_filename);
-
-  save_left_thread.join();
-  save_right_thread.join();
-  save_concatenated_thread.join();
-
-  av_frame_free(&left_selected);
-  av_frame_free(&right_selected);
-  av_frame_free(&concatenated);
-
-  if (!error_occurred) {
-    std::cout << "Saved " << string_sprintf("%s, %s and %s", left_filename.c_str(), right_filename.c_str(), concatenated_filename.c_str()) << std::endl;
-
-    saved_selected_image_number_++;
-  }
+  selection_.set_pending_crop_request(request);
+  selection_.reset_crop_mode();
 }
 
 bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_frame, const std::string& current_total_browsable) {
@@ -1776,7 +1624,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // GPU-fast.
     const bool need_rgb = diff_processor_.subtraction_mode() || print_mouse_position_and_color_ ||
                           print_image_similarity_metrics_ || show_quality_metrics_ ||
-                          save_selected_area_ || save_image_frames_;
+                          selection_.save_selected_area_requested() || image_saver_.save_frames_requested();
     bool have_rgb = false;
     if (need_rgb) {
       have_rgb = rgb_cache_.ensure(left_frame, right_frame, video_width_, video_height_, requires_10_bpc());
@@ -2535,14 +2383,12 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
     // Selection / crop rect — shown whenever a selection is in progress,
     // independent of show_hud_ (matching draw_selection_rect in the SDL path).
-    if (selection_state_ == SelectionState::Started) {
+    if (selection_.state() == SelectionState::Started) {
       auto push_selection_rect = [&](const SDL_FRect& r, uint8_t r_val, uint8_t g_val, uint8_t b_val, int alpha_divider = 1) {
-        // Semi-transparent fill (half-intensity color).
         push_rect(r.x, r.y, r.x + r.w, r.y + r.h,
                   r_val / 2, g_val / 2, b_val / 2,
                   static_cast<uint8_t>(128 / alpha_divider));
 
-        // Outline: four 1-pixel-thick edges.
         const uint8_t border_a = static_cast<uint8_t>(255 / alpha_divider);
         push_rect(r.x, r.y,                r.x + r.w, r.y + 1,         r_val, g_val, b_val, border_a); // top
         push_rect(r.x, r.y + r.h - 1,      r.x + r.w, r.y + r.h,       r_val, g_val, b_val, border_a); // bottom
@@ -2550,12 +2396,15 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         push_rect(r.x + r.w - 1, r.y,      r.x + r.w, r.y + r.h,       r_val, g_val, b_val, border_a); // right
       };
 
-      SDL_Rect selection_rect = get_left_selection_rect();
+      SDL_Rect selection_rect = selection_.get_left_selection_rect(video_width_, video_height_);
       SDL_FRect drawable_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(selection_rect, zoom_rect));
 
+      const bool crop_mode = selection_.crop_mode();
+      const CropTargetSide side = selection_.crop_target_side();
+
       if (mode_ == Mode::Split) {
-        if (crop_mode_) {
-          switch (crop_target_side_) {
+        if (crop_mode) {
+          switch (side) {
             case CropTargetSide::Right: push_selection_rect(drawable_rect, 128, 128, 255); break;
             case CropTargetSide::Both:  push_selection_rect(drawable_rect, 255, 255, 255); break;
             default:                    push_selection_rect(drawable_rect, 255, 128, 128); break;
@@ -2564,18 +2413,17 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
           push_selection_rect(drawable_rect, 255, 255, 255);
         }
       } else {
-        if (!crop_mode_ || crop_target_side_ == CropTargetSide::Left || crop_target_side_ == CropTargetSide::Both) {
+        if (!crop_mode || side == CropTargetSide::Left || side == CropTargetSide::Both) {
           push_selection_rect(drawable_rect, 255, 128, 128);
         } else {
           push_selection_rect(drawable_rect, 96, 96, 96, 3);
         }
 
-        // Right-side rect offset by the stack gap.
         if (mode_ == Mode::HStack) selection_rect.x += video_width_;
         else if (mode_ == Mode::VStack) selection_rect.y += video_height_;
 
         drawable_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(selection_rect, zoom_rect));
-        if (!crop_mode_ || crop_target_side_ == CropTargetSide::Right || crop_target_side_ == CropTargetSide::Both) {
+        if (!crop_mode || side == CropTargetSide::Right || side == CropTargetSide::Both) {
           push_selection_rect(drawable_rect, 128, 128, 255);
         } else {
           push_selection_rect(drawable_rect, 96, 96, 96, 3);
@@ -2723,7 +2571,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // AVFrame, then save left/right/osd together. Done here so the surfaces
     // haven't been destroyed yet.
     AVFramePtr osd_frame(nullptr);
-    if (save_image_frames_ && have_rgb) {
+    if (image_saver_.save_frames_requested() && have_rgb) {
       const size_t pitch = static_cast<size_t>(drawable_width_) * 3;
       uint8_t* pixels = reinterpret_cast<uint8_t*>(av_malloc(pitch * static_cast<size_t>(drawable_height_)));
       if (pixels &&
@@ -2751,24 +2599,25 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // for left/right. `save_selected_area` also works via rgb_frames_.
     // `possibly_apply_crop` just sets a pending request the main loop
     // consumes.
-    if (save_image_frames_) {
+    if (image_saver_.save_frames_requested()) {
       if (have_rgb && osd_frame) {
-        save_image_frames_core(rgb_cache_.left(), rgb_cache_.right(), osd_frame.get());
+        const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
+        const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
+        image_saver_.save_frames_with_osd(rgb_cache_.left(), rgb_cache_.right(), osd_frame.get(), left_stem, right_stem);
       } else {
         std::cerr << "Save image frames: OSD or RGB capture unavailable." << std::endl;
       }
-      save_image_frames_ = false;
+      image_saver_.clear_save_frames_request();
     }
-    if (save_selected_area_) {
+    if (selection_.save_selected_area_requested()) {
       if (have_rgb) {
         possibly_save_selected_area(rgb_cache_.left(), rgb_cache_.right());
       } else {
         std::cerr << "Save selected area: RGB conversion unavailable." << std::endl;
-        save_selected_area_ = false;
-        selection_state_ = SelectionState::None;
+        selection_.cancel_save_selected_area();
       }
     }
-    if (crop_mode_) {
+    if (selection_.crop_mode()) {
       possibly_apply_crop();
     }
 
@@ -3291,15 +3140,15 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     render_help();
   }
 
-  if (save_image_frames_) {
-    save_image_frames(left_frame, right_frame);
-    save_image_frames_ = false;
+  if (image_saver_.save_frames_requested()) {
+    save_image_frames_sdl(left_frame, right_frame);
+    image_saver_.clear_save_frames_request();
   }
 
-  if (save_selected_area_) {
+  if (selection_.save_selected_area_requested()) {
     possibly_save_selected_area(left_frame, right_frame);
   }
-  if (crop_mode_) {
+  if (selection_.crop_mode()) {
     possibly_apply_crop();
   }
 
@@ -3474,7 +3323,7 @@ void Display::handle_event(const SDL_Event& event) {
 
     if (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_RMASK) {
       cursor = pan_mode_cursor_;
-    } else if ((save_selected_area_ || crop_mode_) && selection_state_ != SelectionState::Completed) {
+    } else if (selection_.has_active_cursor_mode() && selection_.state() != SelectionState::Completed) {
       cursor = selection_mode_cursor_;
     } else {
       cursor = normal_mode_cursor_;
@@ -3561,18 +3410,9 @@ void Display::handle_event(const SDL_Event& event) {
       }
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
-      if (event_.button.button == SDL_BUTTON_LEFT && (save_selected_area_ || crop_mode_) && selection_state_ == SelectionState::None) {
-        selection_state_ = SelectionState::Started;
-        selection_start_ = view_transform_.window_to_video_position(mouse_x_, mouse_y_, view_transform_.compute_zoom_rect());
-
-        // Check if the selection is outside the left video frame
-        selection_wrap_ = (mode_ == Mode::HStack && selection_start_.x() >= video_width_) || (mode_ == Mode::VStack && selection_start_.y() >= video_height_);
-
-        if (selection_wrap_) {
-          selection_start_ = wrap_to_left_frame(selection_start_);
-        }
-
-        selection_end_ = selection_start_;
+      if (event_.button.button == SDL_BUTTON_LEFT && selection_.has_active_cursor_mode() && selection_.state() == SelectionState::None) {
+        const Vector2D start_pos = view_transform_.window_to_video_position(mouse_x_, mouse_y_, view_transform_.compute_zoom_rect());
+        selection_.begin_selection(start_pos, mode_, video_width_, video_height_);
       } else if (event_.button.button != SDL_BUTTON_RIGHT) {
         playback_.set_seek_relative(static_cast<float>(mouse_x_) / static_cast<float>(window_width_));
         playback_.set_seek_from_start(true);
@@ -3580,8 +3420,8 @@ void Display::handle_event(const SDL_Event& event) {
       update_cursor();
       break;
     case SDL_EVENT_MOUSE_BUTTON_UP:
-      if (event_.button.button == SDL_BUTTON_LEFT && selection_state_ == SelectionState::Started) {
-        selection_state_ = SelectionState::Completed;
+      if (event_.button.button == SDL_BUTTON_LEFT && selection_.state() == SelectionState::Started) {
+        selection_.complete_selection();
       }
       update_cursor();
       break;
@@ -3603,25 +3443,13 @@ void Display::handle_event(const SDL_Event& event) {
 #endif
       };
 
-      auto start_crop_mode_for_side = [&](const CropTargetSide side) {
-        save_selected_area_ = false;
-        crop_target_side_ = side;
-        crop_mode_ = true;
-        selection_state_ = SelectionState::None;
-        update_cursor();
-      };
       auto reset_crop_mode = [&]() {
-        crop_mode_ = false;
-        crop_target_side_ = CropTargetSide::Undefined;
-        selection_state_ = SelectionState::None;
+        selection_.reset_crop_mode();
         update_cursor();
       };
       auto toggle_crop_mode_for_side = [&](const CropTargetSide side) {
-        if (crop_mode_) {
-          reset_crop_mode();
-        } else {
-          start_crop_mode_for_side(side);
-        }
+        selection_.toggle_crop_for_side(side);
+        update_cursor();
       };
       auto restore_window_size = [&](const std::array<int, 2>& size) {
         const int target_w = std::max(MIN_WINDOW_WIDTH, size[0]);
@@ -3660,9 +3488,8 @@ void Display::handle_event(const SDL_Event& event) {
           quit_ = true;
           break;
         case SDLK_BACKSPACE:
-          pending_crop_request_ = PendingCropRequest{};
-          pending_crop_request_.clear_requested = true;
-          reset_crop_mode();
+          selection_.request_clear_crop();
+          update_cursor();
           break;
         case SDLK_RETURN:
         case SDLK_KP_ENTER:
@@ -3830,16 +3657,15 @@ void Display::handle_event(const SDL_Event& event) {
         }
         case SDLK_F:
           if (is_shift_down) {
-            if (!save_selected_area_) {
-              reset_crop_mode();
-              save_selected_area_ = true;
+            if (!selection_.save_selected_area_requested()) {
+              selection_.reset_crop_mode();
+              selection_.request_save_selected_area();
             } else {
-              save_selected_area_ = false;
-              selection_state_ = SelectionState::None;
+              selection_.cancel_save_selected_area();
             }
             update_cursor();
           } else {
-            save_image_frames_ = true;
+            image_saver_.request_save_frames();
           }
           break;
         case SDLK_P:
@@ -4153,9 +3979,7 @@ bool Display::get_toggle_scope_window_requested(const ScopeWindow::Type type) co
 }
 
 PendingCropRequest Display::get_and_clear_pending_crop_request() {
-  const PendingCropRequest request = pending_crop_request_;
-  pending_crop_request_ = PendingCropRequest{};
-  return request;
+  return selection_.get_and_clear_pending_crop_request();
 }
 
 void Display::set_num_right_videos(const size_t num_right_videos) {

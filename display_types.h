@@ -86,3 +86,5 @@ enum class DisplayLoop { Off, ForwardOnly, PingPong };
 enum class DisplayAspectLockMode { Off, Window, Content };
 enum class DisplayAspectViewMode { Stretch, Original, Preset16x9, Preset4x3, Preset1x1 };
 enum class DisplayDiffMode { LegacyAbs, AbsLinear, AbsSqrt, SignedDiverging };
+enum class SelectionState { None, Started, Completed };
+enum class CropTargetSide { Undefined, Left, Right, Both };
