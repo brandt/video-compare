@@ -843,6 +843,12 @@ void Display::rebuild_fonts() {
 }
 
 void Display::rebuild_side_ui_textures() {
+  // file_stem is used by save_selected_area / save_image_frames in both
+  // renderer paths — always refresh it, even in GPU mode where the SDL
+  // label textures aren't rebuilt.
+  side_ui_[LEFT.as_simple_index()].file_stem = strip_ffmpeg_patterns(get_file_stem(left_file_name_));
+  side_ui_[RIGHT.as_simple_index()].file_stem = strip_ffmpeg_patterns(get_file_stem(right_file_name_));
+
   if (gpu_renderer_active_) return; // no SDL textures in GPU renderer mode
   auto rebuild_side = [&](Side side, const std::string& label) {
     auto& ui = side_ui_[side.as_simple_index()];
@@ -857,9 +863,6 @@ void Display::rebuild_side_ui_textures() {
     ui.text_height = text_surface->h;
     SDL_DestroySurface(text_surface);
   };
-
-  side_ui_[LEFT.as_simple_index()].file_stem = strip_ffmpeg_patterns(get_file_stem(left_file_name_));
-  side_ui_[RIGHT.as_simple_index()].file_stem = strip_ffmpeg_patterns(get_file_stem(right_file_name_));
 
   rebuild_side(LEFT, left_file_name_);
   rebuild_side(RIGHT, format_right_file_label(left_file_name_, right_file_name_, active_right_index_ + 1));
@@ -1549,7 +1552,12 @@ void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_
   const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
   const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
   const bool stems_equal = (left_stem == right_stem);
-  const char* frame_ext = (left_frame->format == AV_PIX_FMT_X2RGB10LE) ? "jxl" : "png";
+  // JXL for HDR content (X2RGB10LE in SDL passthrough, or any frame carrying
+  // PQ / HLG transfer on the GPU-mode RGB cache). PNG otherwise.
+  const bool is_hdr_output = (left_frame->format == AV_PIX_FMT_X2RGB10LE) ||
+                             left_frame->color_trc == AVCOL_TRC_SMPTE2084 ||
+                             left_frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
+  const char* frame_ext = is_hdr_output ? "jxl" : "png";
   const std::string left_filename = string_sprintf("%s%s_%04d.%s", left_stem.c_str(), stems_equal ? "_left" : "", saved_image_number_, frame_ext);
   const std::string right_filename = string_sprintf("%s%s_%04d.%s", right_stem.c_str(), stems_equal ? "_right" : "", saved_image_number_, frame_ext);
   const std::string osd_filename = string_sprintf("%s_%s_osd_%04d.png", left_stem.c_str(), right_stem.c_str(), saved_image_number_);
@@ -2208,20 +2216,22 @@ void Display::update_right_video(const std::string& right_file_name, const Video
   metadata_dirty_ = true;
   right_file_name_ = right_file_name;
 
-  // Update right file stem
+  // Update right file stem (used by both renderer paths for save filenames)
   side_ui_[RIGHT.as_simple_index()].file_stem = strip_ffmpeg_patterns(get_file_stem(right_file_name));
 
-  // Destroy old right texture
+  // Destroy old right texture (SDL path only — GPU renders labels inline)
   if (side_ui_[RIGHT.as_simple_index()].text_texture != nullptr) {
     SDL_DestroyTexture(side_ui_[RIGHT.as_simple_index()].text_texture);
+    side_ui_[RIGHT.as_simple_index()].text_texture = nullptr;
   }
 
-  // Create new right texture
-  SDL_Surface* text_surface = render_text_with_fallback(format_right_file_label(left_file_name_, right_file_name, active_right_index_ + 1));
-  side_ui_[RIGHT.as_simple_index()].text_texture = SDL_CreateTextureFromSurface(renderer_, text_surface);
-  side_ui_[RIGHT.as_simple_index()].text_width = text_surface->w;
-  side_ui_[RIGHT.as_simple_index()].text_height = text_surface->h;
-  SDL_DestroySurface(text_surface);
+  if (!gpu_renderer_active_) {
+    SDL_Surface* text_surface = render_text_with_fallback(format_right_file_label(left_file_name_, right_file_name, active_right_index_ + 1));
+    side_ui_[RIGHT.as_simple_index()].text_texture = SDL_CreateTextureFromSurface(renderer_, text_surface);
+    side_ui_[RIGHT.as_simple_index()].text_width = text_surface->w;
+    side_ui_[RIGHT.as_simple_index()].text_height = text_surface->h;
+    SDL_DestroySurface(text_surface);
+  }
 
   // Update window title (may include ROI)
   update_window_title_with_current_roi();
@@ -2482,7 +2492,21 @@ void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right
   AVFrame* right_selected = create_frame(selection_rect.w, selection_rect.h, right_frame);
   AVFrame* concatenated = create_frame(selection_rect.w * 2, selection_rect.h, left_frame);
 
-  const int pixel_size = hdr_passthrough_ ? 4 : (requires_10_bpc() ? 3 * sizeof(uint16_t) : 3);
+  // Packed-RGB bytes per pixel derived from frame format so GPU-mode RGB
+  // cache frames (RGB24 / RGB48LE) save correctly even when display flags
+  // (hdr_passthrough_, use_10_bpc_) would have suggested a different size.
+  int pixel_size;
+  switch (left_frame->format) {
+    case AV_PIX_FMT_RGB24:      pixel_size = 3; break;
+    case AV_PIX_FMT_RGB48LE:    pixel_size = 6; break;
+    case AV_PIX_FMT_X2RGB10LE:  pixel_size = 4; break;
+    default:
+      std::cerr << "save_selected_area: unsupported pixel format " << left_frame->format << std::endl;
+      av_frame_free(&left_selected);
+      av_frame_free(&right_selected);
+      av_frame_free(&concatenated);
+      return;
+  }
 
   for (int y = 0; y < selection_rect.h; y++) {
     const int src_y = selection_rect.y + y;
@@ -2502,7 +2526,12 @@ void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right
   const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
   const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
   const bool stems_equal = (left_stem == right_stem);
-  const char* cutout_ext = (left_frame->format == AV_PIX_FMT_X2RGB10LE) ? "jxl" : "png";
+  // JXL for HDR content (X2RGB10LE in SDL passthrough, or any frame carrying
+  // PQ / HLG transfer on the GPU-mode RGB cache). PNG otherwise.
+  const bool is_hdr_output = (left_frame->format == AV_PIX_FMT_X2RGB10LE) ||
+                             left_frame->color_trc == AVCOL_TRC_SMPTE2084 ||
+                             left_frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
+  const char* cutout_ext = is_hdr_output ? "jxl" : "png";
   const std::string left_filename = string_sprintf("%s%s_cutout_%04d.%s", left_stem.c_str(), stems_equal ? "_left" : "", saved_selected_image_number_, cutout_ext);
   const std::string right_filename = string_sprintf("%s%s_cutout_%04d.%s", right_stem.c_str(), stems_equal ? "_right" : "", saved_selected_image_number_, cutout_ext);
   const std::string concatenated_filename = string_sprintf("%s_%s_cutout_concat_%04d.%s", left_stem.c_str(), right_stem.c_str(), saved_selected_image_number_, cutout_ext);
@@ -2583,10 +2612,14 @@ bool Display::ensure_rgb_frames(const AVFrame* left_frame, const AVFrame* right_
           src->colorspace, src->color_range);
     }
 
-    // Copy color/CLL props and invoke the converter. The converter sets
-    // frame_key metadata on dst from src automatically.
+    // Copy color props and invoke the converter. The converter sets
+    // frame_key metadata on dst from src automatically. color_primaries and
+    // color_trc are propagated so that downstream savers (JxlSaver) can
+    // preserve HDR metadata on saved output.
     rgb_frames_[side]->colorspace = src->colorspace;
     rgb_frames_[side]->color_range = src->color_range;
+    rgb_frames_[side]->color_primaries = src->color_primaries;
+    rgb_frames_[side]->color_trc = src->color_trc;
     (*rgb_converter_[side])(const_cast<AVFrame*>(src), rgb_frames_[side]);
     cache_key = new_key;
     return true;
@@ -2621,7 +2654,8 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // conversion. Skipped entirely when none are active to keep the pipeline
     // GPU-fast.
     const bool need_rgb = subtraction_mode_ || print_mouse_position_and_color_ ||
-                          print_image_similarity_metrics_ || show_quality_metrics_;
+                          print_image_similarity_metrics_ || show_quality_metrics_ ||
+                          save_selected_area_;
     bool have_rgb = false;
     if (need_rgb) {
       have_rgb = ensure_rgb_frames(left_frame, right_frame);
@@ -3568,18 +3602,22 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // Surfaces are no longer referenced by libplacebo after render() returns.
     for (SDL_Surface* s : text_surfaces) SDL_DestroySurface(s);
 
-    // Deferred actions. `save_image_frames` needs `SDL_RenderReadPixels` and
-    // `save_selected_area` expects RGB frame data — both are SDL-path only
-    // for now. `possibly_apply_crop` just sets a pending request that the
-    // main loop consumes, so it works in both paths.
+    // Deferred actions. `save_image_frames` still needs `pl_tex_download`
+    // for the OSD capture (Phase 4 remaining). `save_selected_area` works
+    // via the Phase 3 RGB cache — `need_rgb` included it above so
+    // `rgb_frames_` are already populated when we get here.
     if (save_image_frames_) {
       std::cerr << "Save image frames: not supported in GPU renderer mode yet." << std::endl;
       save_image_frames_ = false;
     }
     if (save_selected_area_) {
-      std::cerr << "Save selected area: not supported in GPU renderer mode yet." << std::endl;
-      save_selected_area_ = false;
-      selection_state_ = SelectionState::None;
+      if (have_rgb) {
+        possibly_save_selected_area(rgb_frames_[0], rgb_frames_[1]);
+      } else {
+        std::cerr << "Save selected area: RGB conversion unavailable." << std::endl;
+        save_selected_area_ = false;
+        selection_state_ = SelectionState::None;
+      }
     }
     if (crop_mode_) {
       possibly_apply_crop();
