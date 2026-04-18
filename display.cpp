@@ -1877,7 +1877,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         delete[] left_gray;
         delete[] right_gray;
 
-        if (!play_) {
+        if (!playback_.play()) {
           if (left_frame->pts != last_vmaf_left_pts_ || right_frame->pts != last_vmaf_right_pts_) {
             last_vmaf_ = VMAFCalculator::instance().compute(rgb_cache_.left(), rgb_cache_.right());
             last_vmaf_left_pts_ = left_frame->pts;
@@ -2410,7 +2410,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       // when a manual speed level has been applied.
       {
         std::string speed_str, speed_factor_str;
-        const float playback_speed = 1000000.0f * playback_speed_factor_ /
+        const float playback_speed = 1000000.0f * playback_.playback_speed_factor() /
                                       float(std::max(ffmpeg::frame_duration(left_frame), ffmpeg::frame_duration(right_frame)));
         const uint64_t ps_r = lrintf(playback_speed * 1000);
         if (ps_r < 1000) {
@@ -2421,11 +2421,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         } else {
           speed_str = string_sprintf("%1.0f", playback_speed);
         }
-        if (playback_speed_level_ != 0) {
-          if (lrintf(playback_speed_factor_ * 100) < 10)
-            speed_factor_str = string_sprintf("|%1.1f%%", playback_speed_factor_ * 100);
+        if (playback_.playback_speed_modified()) {
+          if (lrintf(playback_.playback_speed_factor() * 100) < 10)
+            speed_factor_str = string_sprintf("|%1.1f%%", playback_.playback_speed_factor() * 100);
           else
-            speed_factor_str = string_sprintf("|%1.0f%%", playback_speed_factor_ * 100);
+            speed_factor_str = string_sprintf("|%1.0f%%", playback_.playback_speed_factor() * 100);
         }
         const std::string united = string_sprintf("@%s%s", speed_str.c_str(), speed_factor_str.c_str());
         int sw = 0, sh = 0;
@@ -2446,10 +2446,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
         SDL_Color bg_color = LOOP_OFF_LABEL_COLOR;
         int bg_alpha = BACKGROUND_ALPHA;
-        if (buffer_play_loop_mode_ != Loop::Off) {
+        if (playback_.loop_mode() != Loop::Off) {
           bg_alpha = static_cast<int>(bg_alpha * (1.0 + std::sin(float(SDL_GetTicks()) / 180.0) * 0.6));
           bg_alpha = clamp_range(bg_alpha, 0, 255);
-          switch (buffer_play_loop_mode_) {
+          switch (playback_.loop_mode()) {
             case Loop::ForwardOnly: bg_color = LOOP_FW_LABEL_COLOR; break;
             case Loop::PingPong:    bg_color = LOOP_PP_LABEL_COLOR; break;
             default: break;
@@ -2905,7 +2905,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     delete[] left_gray;
     delete[] right_gray;
 
-    if (!play_) {
+    if (!playback_.play()) {
       if (left_frame->pts != last_vmaf_left_pts_ || right_frame->pts != last_vmaf_right_pts_) {
         last_vmaf_ = VMAFCalculator::instance().compute(left_frame, right_frame);
         last_vmaf_left_pts_ = left_frame->pts;
@@ -3146,7 +3146,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     std::string playback_speed_str;
     std::string playback_speed_factor_str;
 
-    const float playback_speed = 1000000.0f * playback_speed_factor_ / float(std::max(ffmpeg::frame_duration(left_frame), ffmpeg::frame_duration(right_frame)));
+    const float playback_speed = 1000000.0f * playback_.playback_speed_factor() / float(std::max(ffmpeg::frame_duration(left_frame), ffmpeg::frame_duration(right_frame)));
     const uint64_t playback_speed_rounded = lrintf(playback_speed * 1000);
 
     if (playback_speed_rounded < 1000) {
@@ -3161,11 +3161,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       playback_speed_str = string_sprintf("%1.0f", playback_speed);
     }
 
-    if (playback_speed_level_ != 0) {
-      if (lrintf(playback_speed_factor_ * 100) < 10) {
-        playback_speed_factor_str = string_sprintf("|%1.1f%%", playback_speed_factor_ * 100);
+    if (playback_.playback_speed_modified()) {
+      if (lrintf(playback_.playback_speed_factor() * 100) < 10) {
+        playback_speed_factor_str = string_sprintf("|%1.1f%%", playback_.playback_speed_factor() * 100);
       } else {
-        playback_speed_factor_str = string_sprintf("|%1.0f%%", playback_speed_factor_ * 100);
+        playback_speed_factor_str = string_sprintf("|%1.0f%%", playback_.playback_speed_factor() * 100);
       }
     } else {
       playback_speed_factor_str = "";
@@ -3200,10 +3200,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     SDL_Color label_color = LOOP_OFF_LABEL_COLOR;
     int label_alpha = BACKGROUND_ALPHA;
 
-    if (buffer_play_loop_mode_ != Display::Loop::Off) {
+    if (playback_.loop_mode() != Display::Loop::Off) {
       label_alpha *= 1.0 + sin(float(SDL_GetTicks()) / 180.0) * 0.6;
 
-      switch (buffer_play_loop_mode_) {
+      switch (playback_.loop_mode()) {
         case Display::Loop::ForwardOnly:
           label_color = LOOP_FW_LABEL_COLOR;
           break;
@@ -3517,25 +3517,8 @@ SDL_Rect Display::get_visible_roi_in_single_frame_coordinates() const {
   return left_roi;
 }
 
-void Display::update_playback_speed(const float playback_speed_level_delta) {
-  const float playback_speed_level = playback_speed_level_ + playback_speed_level_delta;
-
-  // allow 128x change of playback speed
-  if (std::abs(playback_speed_level) <= static_cast<float>(PLAYBACK_SPEED_KEY_PRESSES_TO_DOUBLE * 7)) {
-    playback_speed_level_ = playback_speed_level;
-    playback_speed_factor_ = pow(PLAYBACK_SPEED_STEP_SIZE, playback_speed_level);
-  }
-}
-
 void Display::begin_input_frame() {
-  seek_relative_ = 0.0F;
-  seek_from_start_ = false;
-  frame_buffer_offset_delta_ = 0;
-  frame_navigation_delta_ = 0;
-  shift_right_frames_ = 0;
-  auto_align_requested_ = false;
-  tick_playback_ = false;
-  possibly_tick_playback_ = false;
+  playback_.clear_transient_state();
   toggle_scope_window_requested_.fill(false);
 }
 
@@ -3652,8 +3635,8 @@ void Display::handle_event(const SDL_Event& event) {
 
         selection_end_ = selection_start_;
       } else if (event_.button.button != SDL_BUTTON_RIGHT) {
-        seek_relative_ = static_cast<float>(mouse_x_) / static_cast<float>(window_width_);
-        seek_from_start_ = true;
+        playback_.set_seek_relative(static_cast<float>(mouse_x_) / static_cast<float>(window_width_));
+        playback_.set_seek_from_start(true);
       }
       update_cursor();
       break;
@@ -3770,16 +3753,14 @@ void Display::handle_event(const SDL_Event& event) {
           break;
         }
         case SDLK_SPACE:
-          play_ = !play_;
-          buffer_play_loop_mode_ = Loop::Off;
-          tick_playback_ = play_;
+          playback_.toggle_play();
           break;
         case SDLK_COMMA:
         case SDLK_KP_COMMA:
-          set_buffer_play_loop_mode(buffer_play_loop_mode_ != Loop::PingPong ? Loop::PingPong : Loop::Off);
+          set_buffer_play_loop_mode(playback_.loop_mode() != Loop::PingPong ? Loop::PingPong : Loop::Off);
           break;
         case SDLK_PERIOD:
-          set_buffer_play_loop_mode(buffer_play_loop_mode_ != Loop::ForwardOnly ? Loop::ForwardOnly : Loop::Off);
+          set_buffer_play_loop_mode(playback_.loop_mode() != Loop::ForwardOnly ? Loop::ForwardOnly : Loop::Off);
           break;
         case SDLK_F1:
           toggle_scope_window_requested_[ScopeWindow::index(ScopeWindow::Type::Histogram)] = true;
@@ -3856,8 +3837,8 @@ void Display::handle_event(const SDL_Event& event) {
               std::string timestamp = match.str();
               notify_user(string_sprintf("Timestamp pasted: %s", timestamp.c_str()));
 
-              seek_relative_ = parse_timestamps_to_seconds(timestamp) / static_cast<float>(duration_);
-              seek_from_start_ = true;
+              playback_.set_seek_relative(parse_timestamps_to_seconds(timestamp) / static_cast<float>(duration_));
+              playback_.set_seek_from_start(true);
             } else {
               notify_user("No valid timestamp found in clipboard.");
             }
@@ -3868,16 +3849,16 @@ void Display::handle_event(const SDL_Event& event) {
         }
         case SDLK_A:
           if (is_shift_down) {
-            --frame_navigation_delta_;
+            playback_.adjust_frame_navigation_delta(-1);
           } else {
-            frame_buffer_offset_delta_++;
+            playback_.adjust_frame_buffer_offset_delta(1);
           }
           break;
         case SDLK_D:
           if (is_shift_down) {
-            frame_navigation_delta_++;
+            playback_.adjust_frame_navigation_delta(1);
           } else {
-            frame_buffer_offset_delta_--;
+            playback_.adjust_frame_buffer_offset_delta(-1);
           }
           break;
         case SDLK_I:
@@ -3952,7 +3933,7 @@ void Display::handle_event(const SDL_Event& event) {
           show_quality_metrics_ = !show_quality_metrics_;
           break;
         case SDLK_GRAVE:
-          auto_align_requested_ = true;
+          playback_.request_auto_align();
           break;
         case SDLK_4:
         case SDLK_KP_4:
@@ -3998,33 +3979,33 @@ void Display::handle_event(const SDL_Event& event) {
           }
           break;
         case SDLK_LEFT:
-          seek_relative_ -= 1.0F * relative_seek_scale;
+          playback_.add_seek_relative(-1.0F * relative_seek_scale);
           break;
         case SDLK_DOWN:
-          seek_relative_ -= 10.0F * relative_seek_scale;
+          playback_.add_seek_relative(-10.0F * relative_seek_scale);
           break;
         case SDLK_PAGEDOWN:
-          seek_relative_ -= 600.0F * relative_seek_scale;
+          playback_.add_seek_relative(-600.0F * relative_seek_scale);
           break;
         case SDLK_RIGHT:
-          seek_relative_ += 1.0F * relative_seek_scale;
+          playback_.add_seek_relative(1.0F * relative_seek_scale);
           break;
         case SDLK_UP:
-          seek_relative_ += 10.0F * relative_seek_scale;
+          playback_.add_seek_relative(10.0F * relative_seek_scale);
           break;
         case SDLK_PAGEUP:
-          seek_relative_ += 600.0F * relative_seek_scale;
+          playback_.add_seek_relative(600.0F * relative_seek_scale);
           break;
         case SDLK_J:
-          update_playback_speed(-1.0F * playback_speed_scale);
-          possibly_tick_playback_ = true;
+          playback_.update_playback_speed(-1.0F * playback_speed_scale);
+          playback_.set_possibly_tick_playback(true);
           break;
         case SDLK_L:
           if (is_shift_down) {
             toggle_crop_mode_for_side(CropTargetSide::Left);
           } else {
-            update_playback_speed(1.0F * playback_speed_scale);
-            tick_playback_ = true;
+            playback_.update_playback_speed(1.0F * playback_speed_scale);
+            playback_.set_tick_playback(true);
           }
           break;
         case SDLK_B:
@@ -4043,21 +4024,21 @@ void Display::handle_event(const SDL_Event& event) {
         case SDLK_KP_PLUS:
         case SDLK_EQUALS:  // for tenkeyless keyboards
           if (is_alt_down) {
-            shift_right_frames_ += 100;
+            playback_.adjust_shift_right_frames(100);
           } else if (is_ctrl_down) {
-            shift_right_frames_ += 10;
+            playback_.adjust_shift_right_frames(10);
           } else {
-            shift_right_frames_++;
+            playback_.adjust_shift_right_frames(1);
           }
           break;
         case SDLK_MINUS:
         case SDLK_KP_MINUS:
           if (is_alt_down) {
-            shift_right_frames_ -= 100;
+            playback_.adjust_shift_right_frames(-100);
           } else if (is_ctrl_down) {
-            shift_right_frames_ -= 10;
+            playback_.adjust_shift_right_frames(-10);
           } else {
-            shift_right_frames_--;
+            playback_.adjust_shift_right_frames(-1);
           }
           break;
         case SDLK_Y: {
@@ -4158,29 +4139,23 @@ bool Display::get_quit() const {
 }
 
 bool Display::get_play() const {
-  return play_;
+  return playback_.play();
 }
 
 Display::Loop Display::get_buffer_play_loop_mode() const {
-  return buffer_play_loop_mode_;
+  return playback_.loop_mode();
 }
 
 void Display::set_buffer_play_loop_mode(const Display::Loop& mode) {
-  buffer_play_loop_mode_ = mode;
-  play_ = false;
-  tick_playback_ = true;
-
-  if (mode == Loop::ForwardOnly) {
-    buffer_play_forward_ = true;
-  }
+  playback_.set_loop_mode(mode);
 }
 
 bool Display::get_buffer_play_forward() const {
-  return buffer_play_forward_;
+  return playback_.forward();
 }
 
 void Display::toggle_buffer_play_direction() {
-  buffer_play_forward_ = !buffer_play_forward_;
+  playback_.toggle_direction();
 }
 
 bool Display::get_fast_input_alignment() const {
@@ -4192,27 +4167,27 @@ bool Display::get_swap_left_right() const {
 }
 
 float Display::get_seek_relative() const {
-  return seek_relative_;
+  return playback_.seek_relative();
 }
 
 bool Display::get_seek_from_start() const {
-  return seek_from_start_;
+  return playback_.seek_from_start();
 }
 
 int Display::get_frame_buffer_offset_delta() const {
-  return frame_buffer_offset_delta_;
+  return playback_.frame_buffer_offset_delta();
 }
 
 int Display::get_frame_navigation_delta() const {
-  return frame_navigation_delta_;
+  return playback_.frame_navigation_delta();
 }
 
 int Display::get_shift_right_frames() const {
-  return shift_right_frames_;
+  return playback_.shift_right_frames();
 }
 
 bool Display::get_auto_align_requested() const {
-  return auto_align_requested_;
+  return playback_.auto_align_requested();
 }
 
 float Display::compute_frame_psnr(const AVFrame* left_frame, const AVFrame* right_frame) {
@@ -4220,15 +4195,15 @@ float Display::compute_frame_psnr(const AVFrame* left_frame, const AVFrame* righ
 }
 
 float Display::get_playback_speed_factor() const {
-  return playback_speed_factor_;
+  return playback_.playback_speed_factor();
 }
 
 bool Display::get_tick_playback() const {
-  return tick_playback_;
+  return playback_.tick_playback();
 }
 
 bool Display::get_possibly_tick_playback() const {
-  return possibly_tick_playback_;
+  return playback_.possibly_tick_playback();
 }
 
 bool Display::get_show_fps() const {
