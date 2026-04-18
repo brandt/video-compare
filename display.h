@@ -373,19 +373,6 @@ class Display {
 
   int round_and_clamp(const float value);
 
-  const std::array<int, 3> get_rgb_pixel(uint8_t* rgb_plane, const size_t pitch, const int x, const int y);
-  const std::array<int, 3> convert_rgb_to_yuv(const std::array<int, 3> rgb, const AVPixelFormat rgb_format, const AVColorSpace color_space, const AVColorRange color_range);
-
-  std::string format_pixel(const std::array<int, 3>& rgb);
-  std::string get_and_format_rgb_yuv_pixel(uint8_t* rgb_plane, const size_t pitch, const AVFrame* frame, const int x, const int y);
-
-  float* rgb_to_grayscale(const uint8_t* plane, const size_t pitch, const int width, const int height);
-
-  float compute_ssim_block(const float* left_plane, const float* right_plane, const int width, const int x_offset, const int y_offset, const int block_size);
-  std::string compute_ssim(const float* left_plane, const float* right_plane, const int width, const int height);
-
-  std::string compute_psnr(const float* left_plane, const float* right_plane, const int width, const int height);
-
   void render_help();
   void render_metadata_overlay();
   void render_quality_metrics_overlay();

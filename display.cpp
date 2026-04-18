@@ -14,9 +14,11 @@
 #include <string>
 #include <thread>
 #include "controls.h"
+#include "display_utils.h"
 #include "ffmpeg.h"
 #include "format_converter.h"
 #include "jxl_saver.h"
+#include "metrics_calculator.h"
 #include "pixel_format_utils.h"
 #include "scope_window.h"
 #include "source_code_pro_regular_ttf.h"
@@ -29,169 +31,6 @@ extern "C" {
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
-
-static const SDL_Color BACKGROUND_COLOR = {54, 69, 79, 0};
-static const SDL_Color LOOP_OFF_LABEL_COLOR = {0, 0, 0, 0};
-static const SDL_Color LOOP_FW_LABEL_COLOR = {80, 127, 255, 0};
-static const SDL_Color LOOP_PP_LABEL_COLOR = {191, 95, 60, 0};
-static const SDL_Color TEXT_COLOR = {255, 255, 255, 0};
-static const SDL_Color HELP_TEXT_PRIMARY_COLOR = {255, 255, 255, 0};
-static const SDL_Color HELP_TEXT_ALTERNATE_COLOR = {255, 255, 192, 0};
-static const SDL_Color POSITION_COLOR = {255, 255, 192, 0};
-static const SDL_Color TARGET_COLOR = {200, 200, 140, 0};
-static const SDL_Color ZOOM_COLOR = {255, 165, 0, 0};
-static const SDL_Color PLAYBACK_SPEED_COLOR = {0, 192, 160, 0};
-static const SDL_Color BUFFER_COLOR = {160, 225, 192, 0};
-static const SDL_Color FPS_VIDEO_COLOR = {255, 255, 192, 0};
-static const SDL_Color FPS_UI_COLOR = {255, 120, 200, 0};
-static const int BACKGROUND_ALPHA = 100;
-
-static const int MOUSE_WHEEL_SCROLL_STEPS_TO_DOUBLE = 12;
-static const float ZOOM_STEP_SIZE = pow(2.0F, 1.0F / float(MOUSE_WHEEL_SCROLL_STEPS_TO_DOUBLE));
-static const float ZOOM_SLOWDOWN_RATIO = 3.0F;
-
-static const int PLAYBACK_SPEED_KEY_PRESSES_TO_DOUBLE = 6;
-static const float PLAYBACK_SPEED_STEP_SIZE = pow(2.0F, 1.0F / float(PLAYBACK_SPEED_KEY_PRESSES_TO_DOUBLE));
-static const float PLAYBACK_SPEED_SLOWDOWN_RATIO = 5.0F;
-
-static const float RELATIVE_SEEK_SLOWDOWN_RATIO = 4.0F;
-
-static const int HELP_TEXT_LINE_SPACING = 1;
-static const int HELP_TEXT_HORIZONTAL_MARGIN = 26;
-
-static const int MIN_WINDOW_WIDTH = 4;
-static const int MIN_WINDOW_HEIGHT = 1;
-
-auto frame_deleter = [](AVFrame* frame) {
-  av_freep(&frame->data[0]);
-  av_frame_free(&frame);
-};
-using AVFramePtr = std::unique_ptr<AVFrame, decltype(frame_deleter)>;
-
-template <typename T>
-inline T check_sdl(T value, const std::string& message) {
-  if (!value) {
-    throw std::runtime_error{"SDL " + message + " - " + SDL_GetError()};
-  }
-  return value;
-}
-
-template <typename T>
-inline T clamp_range(T v, T lo, T hi) {
-  return (v < lo) ? lo : (v > hi) ? hi : v;
-}
-
-inline int luma709(int r, int g, int b) {
-  return (217 * r + 733 * g + 74 * b) >> 10;
-}
-
-inline SDL_FRect to_frect(const SDL_Rect& r) {
-  return {static_cast<float>(r.x), static_cast<float>(r.y), static_cast<float>(r.w), static_cast<float>(r.h)};
-}
-
-inline SDL_FRect make_frect(int x, int y, int w, int h) {
-  return {static_cast<float>(x), static_cast<float>(y), static_cast<float>(w), static_cast<float>(h)};
-}
-
-static SDL_DisplayID display_id_for_index(int index) {
-  int count = 0;
-  SDL_DisplayID* displays = SDL_GetDisplays(&count);
-  if (!displays || count == 0) {
-    return SDL_GetPrimaryDisplay();
-  }
-  if (index < 0 || index >= count) {
-    index = 0;
-  }
-  SDL_DisplayID id = displays[index];
-  SDL_free(displays);
-  return id;
-}
-
-// Credits to Kemin Zhou for this approach which does not require Boost or C++17
-// https://stackoverflow.com/questions/4430780/how-can-i-extract-the-file-name-and-extension-from-a-path-in-c
-std::string get_file_name_and_extension(const std::string& file_path) {
-  char* buff = new char[file_path.size() + 1];
-  strcpy(buff, file_path.c_str());
-
-  const std::string result = std::string(basename(buff));
-
-  delete[] buff;
-
-  return result;
-}
-
-std::string get_file_stem(const std::string& file_path) {
-  std::string tmp = get_file_name_and_extension(file_path);
-
-  const std::string::size_type i = tmp.rfind('.');
-
-  if (i != std::string::npos) {
-    tmp = tmp.substr(0, i);
-  }
-
-  return tmp;
-}
-
-static bool should_suffix_right_file_number_1(const std::string& left_file_name, const std::string& right_file_name) {
-  return get_file_name_and_extension(left_file_name) == get_file_name_and_extension(right_file_name);
-}
-
-static std::string format_right_file_label(const std::string& left_file_name, const std::string& right_file_name, const size_t right_file_number) {
-  if (right_file_number >= 2 || (right_file_number == 1 && should_suffix_right_file_number_1(left_file_name, right_file_name))) {
-    return right_file_name + string_sprintf(" <%zu>", right_file_number);
-  }
-
-  return right_file_name;
-}
-
-std::string format_window_title(const std::string& left_file_name, const std::string& right_file_name) {
-  return string_sprintf("%s  |  %s", get_file_name_and_extension(left_file_name).c_str(), get_file_name_and_extension(right_file_name).c_str());
-}
-
-std::string strip_ffmpeg_patterns(const std::string& input) {
-  static const std::regex pattern_regex(R"(%\d*d|\*|\?)");
-
-  return std::regex_replace(input, pattern_regex, "");
-};
-
-inline float round_3(float value) {
-  return std::round(value * 1000.0F) / 1000.0F;
-}
-
-static std::string format_position_difference(const float position1, const float position2) {
-  // round both for the sake of consistency with the displayed positions
-  const float position1_rounded = round_3(position1);
-  const float position2_rounded = round_3(position2);
-
-  // absolute difference very close to 0.001 -> we are in sync!
-  if (std::abs(position1_rounded - position2_rounded) < 9.99e-4) {
-    return "";
-  } else if (position1 < position2) {
-    return " (-" + format_position(position2_rounded - position1_rounded, true) + ")";
-  }
-
-  return " (+" + format_position(position1_rounded - position2_rounded, true) + ")";
-}
-
-static std::string to_hex(const uint32_t value, const int width) {
-  std::stringstream sstream;
-  sstream << std::setfill('0') << std::setw(width) << std::hex << value;
-
-  return sstream.str();
-}
-
-static std::string format_libav_version(unsigned version) {
-  int major = (version >> 16) & 0xff;
-  int minor = (version >> 8) & 0xff;
-  int micro = version & 0xff;
-  return string_sprintf("%2u.%2u.%3u", major, minor, micro);
-}
-
-auto get_metadata_int_value = [](const AVFrame* frame, const std::string& key, const int default_value) -> int {
-  const AVDictionaryEntry* entry = av_dict_get(frame->metadata, key.c_str(), nullptr, 0);
-
-  return entry ? std::atoi(entry->value) : default_value;
-};
 
 SDL::SDL() {
   check_sdl(SDL_Init(SDL_INIT_VIDEO), "SDL init");
@@ -1499,7 +1338,7 @@ void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_
   osd->height = drawable_height_;
   osd->data[0] = pixels;
   osd->linesize[0] = pitch;
-  AVFramePtr osd_frame(osd, frame_deleter);
+  AVFramePtr osd_frame(osd);
 
   save_image_frames_core(left_frame, right_frame, osd_frame.get());
 }
@@ -1650,98 +1489,6 @@ int Display::round_and_clamp(const float value) {
   return requires_10_bpc() ? clamp_int_to_10_bpc_range(result) : clamp_int_to_byte_range(result);
 }
 
-const std::array<int, 3> Display::get_rgb_pixel(uint8_t* rgb_plane, const size_t pitch, const int x, const int y) {
-  int r, g, b;
-
-  if (requires_10_bpc()) {
-    uint16_t* rgb_pixel = reinterpret_cast<uint16_t*>(rgb_plane + x * 6 + y * pitch);
-
-    r = *(rgb_pixel) >> 6;
-    g = *(rgb_pixel + 1) >> 6;
-    b = *(rgb_pixel + 2) >> 6;
-
-  } else {
-    uint8_t* rgb_pixel = rgb_plane + x * 3 + y * pitch;
-
-    r = *(rgb_pixel);
-    g = *(rgb_pixel + 1);
-    b = *(rgb_pixel + 2);
-  }
-
-  return {r, g, b};
-}
-
-const std::array<int, 3> Display::convert_rgb_to_yuv(const std::array<int, 3> rgb, const AVPixelFormat rgb_format, const AVColorSpace color_space, const AVColorRange color_range) {
-  auto allocate_frame = [&](const AVPixelFormat format) -> AVFramePtr {
-    AVFrame* raw_frame = av_frame_alloc();
-
-    if (raw_frame == nullptr) {
-      throw ffmpeg::Error("Couldn't allocate frame");
-    }
-
-    raw_frame->format = format;
-    raw_frame->width = 1;
-    raw_frame->height = 1;
-    raw_frame->colorspace = color_space;
-    raw_frame->color_range = color_range;
-
-    ffmpeg::check(av_image_alloc(raw_frame->data, raw_frame->linesize, raw_frame->width, raw_frame->height, format, 64));
-
-    return AVFramePtr(raw_frame, frame_deleter);
-  };
-
-  const AVPixelFormat yuv_format = requires_10_bpc() ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV444P;
-
-  auto rgb_pixel_frame = allocate_frame(rgb_format);
-  auto yuv_pixel_frame = allocate_frame(yuv_format);
-
-  if (requires_10_bpc()) {
-    uint16_t* rgb_data = reinterpret_cast<uint16_t*>(rgb_pixel_frame->data[0]);
-
-    auto extend_10_to_16_bit = [](const int value) {
-      return (value * 1025) >> 4;  // 1023->65535
-    };
-
-    rgb_data[0] = extend_10_to_16_bit(rgb[0]);
-    rgb_data[1] = extend_10_to_16_bit(rgb[1]);
-    rgb_data[2] = extend_10_to_16_bit(rgb[2]);
-  } else {
-    uint8_t* rgb_data = reinterpret_cast<uint8_t*>(rgb_pixel_frame->data[0]);
-
-    rgb_data[0] = rgb[0];
-    rgb_data[1] = rgb[1];
-    rgb_data[2] = rgb[2];
-  }
-
-  FormatConverter rgb_to_yuv_converter(1, 1, 1, 1, rgb_format, yuv_format, color_space, color_range);
-  rgb_to_yuv_converter(rgb_pixel_frame.get(), yuv_pixel_frame.get());
-
-  if (requires_10_bpc()) {
-    auto y_data = reinterpret_cast<const uint16_t*>(yuv_pixel_frame->data[0]);
-    auto u_data = reinterpret_cast<const uint16_t*>(yuv_pixel_frame->data[1]);
-    auto v_data = reinterpret_cast<const uint16_t*>(yuv_pixel_frame->data[2]);
-
-    return {y_data[0], u_data[0], v_data[0]};
-  } else {
-    return {yuv_pixel_frame->data[0][0], yuv_pixel_frame->data[1][0], yuv_pixel_frame->data[2][0]};
-  }
-}
-
-std::string Display::format_pixel(const std::array<int, 3>& pixel) {
-  std::string hex_pixel = requires_10_bpc() ? to_hex((pixel[0] << 20) | (pixel[1] << 10) | pixel[2], 8) : to_hex((pixel[0] << 16) | (pixel[1] << 8) | pixel[2], 6);
-
-  return requires_10_bpc() ? string_sprintf("(%4d,%4d,%4d#%s)", pixel[0], pixel[1], pixel[2], hex_pixel.c_str()) : string_sprintf("(%3d,%3d,%3d#%s)", pixel[0], pixel[1], pixel[2], hex_pixel.c_str());
-}
-
-std::string Display::get_and_format_rgb_yuv_pixel(uint8_t* rgb_plane, const size_t pitch, const AVFrame* frame, const int x, const int y) {
-  auto rgb_format = static_cast<AVPixelFormat>(frame->format);
-
-  const std::array<int, 3> rgb = get_rgb_pixel(rgb_plane, pitch, x, y);
-  const std::array<int, 3> yuv = convert_rgb_to_yuv(rgb, rgb_format, frame->colorspace, frame->color_range);
-
-  return "RGB" + format_pixel(rgb) + ", YUV" + format_pixel(yuv);
-}
-
 AVFrame* crop_rgb_frame(const AVFrame* src, const SDL_Rect& roi, SDL_Rect* out_effective_roi = nullptr) {
   AVFrame* cropped_frame = av_frame_clone(src);
 
@@ -1771,134 +1518,6 @@ AVFrame* crop_rgb_frame(const AVFrame* src, const SDL_Rect& roi, SDL_Rect* out_e
   cropped_frame->width = w;
   cropped_frame->height = h;
   return cropped_frame;
-}
-
-float* Display::rgb_to_grayscale(const uint8_t* plane, const size_t pitch, const int width, const int height) {
-  float* grayscale_image = new float[width * height];
-  float* p_out = grayscale_image;
-
-  auto to_grayscale = [](const float r, const float g, const float b, const float normalization_factor) -> float { return (r * 0.299f + g * 0.587f + b * 0.114f) * normalization_factor; };
-
-  if (requires_10_bpc()) {
-    for (int y = 0; y < height; y++) {
-      const uint16_t* row = reinterpret_cast<const uint16_t*>(plane + y * pitch);
-      for (int x = 0; x < (width * 3); x += 3) {
-        const float r = row[x] >> 6;
-        const float g = row[x + 1] >> 6;
-        const float b = row[x + 2] >> 6;
-        *(p_out++) = to_grayscale(r, g, b, 1.f / 1023.f);
-      }
-    }
-  } else {
-    for (int y = 0; y < height; y++) {
-      const uint8_t* row = plane + y * pitch;
-      for (int x = 0; x < (width * 3); x += 3) {
-        const float r = row[x];
-        const float g = row[x + 1];
-        const float b = row[x + 2];
-        *(p_out++) = to_grayscale(r, g, b, 1.f / 255.f);
-      }
-    }
-  }
-
-  return grayscale_image;
-}
-
-float Display::compute_ssim_block(const float* left_plane, const float* right_plane, const int width, const int x_offset, const int y_offset, const int block_size) {
-  const int block_elements = block_size * block_size;
-
-  auto compute_mean = [&](const float* plane) {
-    float sum = 0;
-
-    for (int y = y_offset; y < (y_offset + block_size); y++) {
-      const float* row = plane + y * width + x_offset;
-
-      for (int x = 0; x < block_size; x++) {
-        sum += *(row++);
-      }
-    }
-
-    return sum / block_elements;
-  };
-
-  float mean1 = compute_mean(left_plane);
-  float mean2 = compute_mean(right_plane);
-
-  // compute variance and convariance
-  float sum_var1 = 0, sum_var2 = 0, sum_covar = 0;
-
-  for (int y = y_offset; y < (y_offset + block_size); y++) {
-    const float* row1 = left_plane + y * width + x_offset;
-    const float* row2 = right_plane + y * width + x_offset;
-
-    for (int x = 0; x < block_size; x++) {
-      float diff1 = *(row1++) - mean1;
-      float diff2 = *(row2++) - mean2;
-
-      sum_var1 += diff1 * diff1;
-      sum_var2 += diff2 * diff2;
-      sum_covar += diff1 * diff2;
-    }
-  }
-
-  float variance1 = sum_var1 / block_elements;
-  float variance2 = sum_var2 / block_elements;
-  float covariance = sum_covar / block_elements;
-
-  float geomtric_mean_variance12 = sqrtf(variance1 * variance2);
-
-  // compute SSIM metrics
-  static constexpr float k1 = 0.01f;
-  static constexpr float k2 = 0.03f;
-  static constexpr float c1 = k1 * k1;
-  static constexpr float c2 = k2 * k2;
-  static constexpr float c3 = c2 / 2.f;
-
-  float luminance = (2.f * mean1 * mean2 + c1) / (mean1 * mean1 + mean2 * mean2 + c1);
-  float contrast = (2.f * geomtric_mean_variance12 + c2) / (variance1 + variance2 + c2);
-  float structure = (covariance + c3) / (geomtric_mean_variance12 + c3);
-
-  return luminance * contrast * structure;
-}
-
-std::string Display::compute_ssim(const float* left_plane, const float* right_plane, const int width, const int height) {
-  static constexpr int overlap = 4;
-  static constexpr int block_size = 8;
-
-  float ssim_sum = 0.0;
-  int count = 0;
-
-  for (int y = 0; y < height - (block_size - 1); y += block_size - overlap) {
-    for (int x = 0; x < width - (block_size - 1); count++, x += block_size - overlap) {
-      ssim_sum += compute_ssim_block(left_plane, right_plane, width, x, y, block_size);
-    }
-  }
-
-  if (count == 0) {
-    return "n/a";
-  }
-
-  const float ssim = ssim_sum / static_cast<float>(count);
-  return string_sprintf("%.5f", ssim);
-}
-
-std::string Display::compute_psnr(const float* left_plane, const float* right_plane, const int width, const int height) {
-  // compute MSE
-  double mse = 0.0;
-
-  for (int i = 0; i < (width * height); i++) {
-    const float diff = *(left_plane++) - *(right_plane++);
-    mse += static_cast<double>(diff) * static_cast<double>(diff);
-  }
-
-  mse /= static_cast<double>(width) * static_cast<double>(height);
-
-  if (mse == 0) {
-    return "inf";
-  }
-
-  // compute PSNR
-  return string_sprintf("%.3f", -10.f * log10f(static_cast<float>(mse)));
 }
 
 void Display::render_help() {
@@ -2642,10 +2261,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
           const auto od_right = original_dims(right_frame);
 
           std::cout << "Left:  " << string_sprintf("[%4d,%4d]", pixel_video_x * od_left.first / video_width_, pixel_video_y * od_left.second / video_height_);
-          std::cout << ", " << get_and_format_rgb_yuv_pixel(rgb_frames_[0]->data[0], rgb_frames_[0]->linesize[0], rgb_frames_[0], pixel_video_x, pixel_video_y);
+          std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(rgb_frames_[0]->data[0], rgb_frames_[0]->linesize[0], rgb_frames_[0], pixel_video_x, pixel_video_y, requires_10_bpc());
           std::cout << " - ";
           std::cout << "Right: " << string_sprintf("[%4d,%4d]", pixel_video_x * od_right.first / video_width_, pixel_video_y * od_right.second / video_height_);
-          std::cout << ", " << get_and_format_rgb_yuv_pixel(rgb_frames_[1]->data[0], rgb_frames_[1]->linesize[0], rgb_frames_[1], pixel_video_x, pixel_video_y);
+          std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(rgb_frames_[1]->data[0], rgb_frames_[1]->linesize[0], rgb_frames_[1], pixel_video_x, pixel_video_y, requires_10_bpc());
           std::cout << std::endl;
         }
         print_mouse_position_and_color_ = false;
@@ -2665,11 +2284,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
             const int crop_width = effective_roi_left.w;
             const int crop_height = effective_roi_left.h;
 
-            float* left_gray = rgb_to_grayscale(left_crop->data[0], left_crop->linesize[0], crop_width, crop_height);
-            float* right_gray = rgb_to_grayscale(right_crop->data[0], right_crop->linesize[0], crop_width, crop_height);
+            float* left_gray = MetricsCalculator::rgb_to_grayscale(left_crop->data[0], left_crop->linesize[0], crop_width, crop_height, requires_10_bpc());
+            float* right_gray = MetricsCalculator::rgb_to_grayscale(right_crop->data[0], right_crop->linesize[0], crop_width, crop_height, requires_10_bpc());
 
-            const std::string psnr = compute_psnr(left_gray, right_gray, crop_width, crop_height);
-            const std::string ssim = compute_ssim(left_gray, right_gray, crop_width, crop_height);
+            const std::string psnr = MetricsCalculator::compute_psnr(left_gray, right_gray, crop_width, crop_height);
+            const std::string ssim = MetricsCalculator::compute_ssim(left_gray, right_gray, crop_width, crop_height);
             const std::string vmaf = (left_crop && right_crop) ? VMAFCalculator::instance().compute(left_crop, right_crop) : "n/a";
 
             const std::string roi_str =
@@ -2694,10 +2313,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
       // Live on-screen quality metrics (rendered further down).
       if (show_quality_metrics_ && video_width_ > 0 && video_height_ > 0) {
-        float* left_gray = rgb_to_grayscale(rgb_frames_[0]->data[0], rgb_frames_[0]->linesize[0], video_width_, video_height_);
-        float* right_gray = rgb_to_grayscale(rgb_frames_[1]->data[0], rgb_frames_[1]->linesize[0], video_width_, video_height_);
-        last_psnr_ = compute_psnr(left_gray, right_gray, video_width_, video_height_);
-        last_ssim_ = compute_ssim(left_gray, right_gray, video_width_, video_height_);
+        float* left_gray = MetricsCalculator::rgb_to_grayscale(rgb_frames_[0]->data[0], rgb_frames_[0]->linesize[0], video_width_, video_height_, requires_10_bpc());
+        float* right_gray = MetricsCalculator::rgb_to_grayscale(rgb_frames_[1]->data[0], rgb_frames_[1]->linesize[0], video_width_, video_height_, requires_10_bpc());
+        last_psnr_ = MetricsCalculator::compute_psnr(left_gray, right_gray, video_width_, video_height_);
+        last_ssim_ = MetricsCalculator::compute_ssim(left_gray, right_gray, video_width_, video_height_);
         delete[] left_gray;
         delete[] right_gray;
 
@@ -3549,7 +3168,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // alive because TextOverlayOp pixel pointers alias them) into an RGB24
     // AVFrame, then save left/right/osd together. Done here so the surfaces
     // haven't been destroyed yet.
-    AVFramePtr osd_frame(nullptr, frame_deleter);
+    AVFramePtr osd_frame(nullptr);
     if (save_image_frames_ && have_rgb) {
       const size_t pitch = static_cast<size_t>(drawable_width_) * 3;
       uint8_t* pixels = reinterpret_cast<uint8_t*>(av_malloc(pitch * static_cast<size_t>(drawable_height_)));
@@ -3667,10 +3286,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       auto original_right_dims = get_original_dimensions(right_frame);
 
       std::cout << "Left:  " << string_sprintf("[%4d,%4d]", pixel_video_x * original_left_dims.first / video_width_, pixel_video_y * original_left_dims.second / video_height_);
-      std::cout << ", " << get_and_format_rgb_yuv_pixel(planes_left[0], pitches_left[0], left_frame, pixel_video_x, pixel_video_y);
+      std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(planes_left[0], pitches_left[0], left_frame, pixel_video_x, pixel_video_y, requires_10_bpc());
       std::cout << " - ";
       std::cout << "Right: " << string_sprintf("[%4d,%4d]", pixel_video_x * original_right_dims.first / video_width_, pixel_video_y * original_right_dims.second / video_height_);
-      std::cout << ", " << get_and_format_rgb_yuv_pixel(planes_right[0], pitches_right[0], right_frame, pixel_video_x, pixel_video_y);
+      std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(planes_right[0], pitches_right[0], right_frame, pixel_video_x, pixel_video_y, requires_10_bpc());
       std::cout << std::endl;
     }
 
@@ -3697,11 +3316,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         const int crop_width = effective_roi_left.w;
         const int crop_height = effective_roi_left.h;
 
-        float* left_gray = rgb_to_grayscale(left_crop->data[0], left_crop->linesize[0], crop_width, crop_height);
-        float* right_gray = rgb_to_grayscale(right_crop->data[0], right_crop->linesize[0], crop_width, crop_height);
+        float* left_gray = MetricsCalculator::rgb_to_grayscale(left_crop->data[0], left_crop->linesize[0], crop_width, crop_height, requires_10_bpc());
+        float* right_gray = MetricsCalculator::rgb_to_grayscale(right_crop->data[0], right_crop->linesize[0], crop_width, crop_height, requires_10_bpc());
 
-        const std::string psnr = compute_psnr(left_gray, right_gray, crop_width, crop_height);
-        const std::string ssim = compute_ssim(left_gray, right_gray, crop_width, crop_height);
+        const std::string psnr = MetricsCalculator::compute_psnr(left_gray, right_gray, crop_width, crop_height);
+        const std::string ssim = MetricsCalculator::compute_ssim(left_gray, right_gray, crop_width, crop_height);
         const std::string vmaf = (left_crop && right_crop) ? VMAFCalculator::instance().compute(left_crop, right_crop) : "n/a";
 
         const std::string roi_str =
@@ -3728,11 +3347,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
   // live on-screen quality metrics overlay (toggled by Q key)
   if (show_quality_metrics_ && left_frame != nullptr && right_frame != nullptr && video_width_ > 0 && video_height_ > 0) {
-    float* left_gray = rgb_to_grayscale(left_frame->data[0], left_frame->linesize[0], video_width_, video_height_);
-    float* right_gray = rgb_to_grayscale(right_frame->data[0], right_frame->linesize[0], video_width_, video_height_);
+    float* left_gray = MetricsCalculator::rgb_to_grayscale(left_frame->data[0], left_frame->linesize[0], video_width_, video_height_, requires_10_bpc());
+    float* right_gray = MetricsCalculator::rgb_to_grayscale(right_frame->data[0], right_frame->linesize[0], video_width_, video_height_, requires_10_bpc());
 
-    last_psnr_ = compute_psnr(left_gray, right_gray, video_width_, video_height_);
-    last_ssim_ = compute_ssim(left_gray, right_gray, video_width_, video_height_);
+    last_psnr_ = MetricsCalculator::compute_psnr(left_gray, right_gray, video_width_, video_height_);
+    last_ssim_ = MetricsCalculator::compute_ssim(left_gray, right_gray, video_width_, video_height_);
 
     delete[] left_gray;
     delete[] right_gray;
@@ -5059,35 +4678,7 @@ bool Display::get_auto_align_requested() const {
 }
 
 float Display::compute_frame_psnr(const AVFrame* left_frame, const AVFrame* right_frame) {
-  if (left_frame == nullptr || right_frame == nullptr) {
-    return -std::numeric_limits<float>::max();
-  }
-  if (left_frame->width != right_frame->width || left_frame->height != right_frame->height || left_frame->width <= 0 || left_frame->height <= 0) {
-    return -std::numeric_limits<float>::max();
-  }
-
-  const int width = left_frame->width;
-  const int height = left_frame->height;
-
-  float* left_gray = rgb_to_grayscale(left_frame->data[0], left_frame->linesize[0], width, height);
-  float* right_gray = rgb_to_grayscale(right_frame->data[0], right_frame->linesize[0], width, height);
-
-  double mse = 0.0;
-  const float* lp = left_gray;
-  const float* rp = right_gray;
-  for (int i = 0; i < width * height; i++) {
-    const float diff = *(lp++) - *(rp++);
-    mse += static_cast<double>(diff) * static_cast<double>(diff);
-  }
-  mse /= static_cast<double>(width) * static_cast<double>(height);
-
-  delete[] left_gray;
-  delete[] right_gray;
-
-  if (mse == 0.0) {
-    return std::numeric_limits<float>::max();
-  }
-  return -10.f * log10f(static_cast<float>(mse));
+  return MetricsCalculator::compute_frame_psnr(left_frame, right_frame, requires_10_bpc());
 }
 
 float Display::get_playback_speed_factor() const {
