@@ -2847,6 +2847,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     const int dst_zoomed_size = static_cast<int>(std::round(std::min(drawable_width_, drawable_height_) * 0.5F)) & -2;
     const int dst_half_zoomed_size = dst_zoomed_size / 2;
 
+    // Drawable-x of the split boundary inside each zoom box (-1 = don't
+    // draw, either because zoom is off or split falls outside the zoom src).
+    float zoom_left_slider_dx = -1.f;
+    float zoom_right_slider_dx = -1.f;
+
     if (zoom_left_ || zoom_right_) {
       const int src_zoomed_size = 64;
       const int src_half = src_zoomed_size / 2;
@@ -2964,6 +2969,26 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         const float rx0 = static_cast<float>(drawable_width_ - dst_zoomed_size);
         push_zoom_box(rx0, zoom_dst_y, rx0 + dst_zoomed_size, zoom_dst_y + dst_zoomed_size);
       }
+
+      // Record the exact mapped split-x inside each zoom box so the slider
+      // line (drawn in the HUD pass below) sits on the real left/right
+      // boundary instead of the dst center — split_x is snapped to an
+      // integer video texel, while the src center tracks the raw mouse,
+      // so the two are typically offset by up to half a video pixel.
+      if (mode_ == Mode::Split && compare_mode) {
+        const float sxl = static_cast<float>(split_x);
+        const float src_w = std::max(1e-3f, sx1 - sx0);
+        if (sxl >= sx0 && sxl <= sx1) {
+          const float frac = (sxl - sx0) / src_w;
+          if (zoom_left_) {
+            zoom_left_slider_dx = frac * static_cast<float>(dst_zoomed_size);
+          }
+          if (zoom_right_) {
+            const float rx0 = static_cast<float>(drawable_width_ - dst_zoomed_size);
+            zoom_right_slider_dx = rx0 + frac * static_cast<float>(dst_zoomed_size);
+          }
+        }
+      }
     }
 
     // Build overlay list (Phase 2: primitives only, no text yet).
@@ -2988,20 +3013,20 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         push_rect(split_drawable_x, 0, split_drawable_x + 1, static_cast<float>(drawable_height_),
                   255, 255, 255, 255);
 
-        // Center "slider" line within each active zoom window — matches the
-        // SDL path's Split-mode zoom indicator.
+        // Slider line within each active zoom window, placed at the mapped
+        // split boundary (recorded from the zoom pass). This is typically
+        // near the dst center but shifts by up to half a video pixel (×
+        // dst-scale drawable pixels) so the slider sits exactly on the
+        // left/right frame edge in the zoomed view.
         const float zoom_dst_y = static_cast<float>(drawable_height_ - dst_zoomed_size);
         const float zoom_dst_y1 = static_cast<float>(drawable_height_);
-        if (zoom_left_) {
-          push_rect(static_cast<float>(dst_half_zoomed_size), zoom_dst_y,
-                    static_cast<float>(dst_half_zoomed_size + 1), zoom_dst_y1,
-                    255, 255, 255, 255);
+        if (zoom_left_ && zoom_left_slider_dx >= 0.f) {
+          const float sx = std::round(zoom_left_slider_dx);
+          push_rect(sx, zoom_dst_y, sx + 1.f, zoom_dst_y1, 255, 255, 255, 255);
         }
-        if (zoom_right_) {
-          const int cx = drawable_width_ - dst_half_zoomed_size - 1;
-          push_rect(static_cast<float>(cx), zoom_dst_y,
-                    static_cast<float>(cx + 1), zoom_dst_y1,
-                    255, 255, 255, 255);
+        if (zoom_right_ && zoom_right_slider_dx >= 0.f) {
+          const float sx = std::round(zoom_right_slider_dx);
+          push_rect(sx, zoom_dst_y, sx + 1.f, zoom_dst_y1, 255, 255, 255, 255);
         }
       }
 
