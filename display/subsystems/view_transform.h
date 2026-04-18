@@ -1,7 +1,7 @@
 #pragma once
 #include <SDL3/SDL.h>
 #include <functional>
-#include "display_types.h"
+#include "../display_types.h"
 
 // Read-only view of the window layout state that ViewTransform depends on.
 // Implemented by a small adapter over Display for now; will be replaced by a

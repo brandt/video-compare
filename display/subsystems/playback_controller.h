@@ -1,5 +1,5 @@
 #pragma once
-#include "display_types.h"
+#include "../display_types.h"
 
 // Per-session playback state: play/pause, loop mode, seek requests, frame
 // navigation offsets, playback speed. Most fields are transient — set by

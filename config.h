@@ -2,7 +2,7 @@
 #include <string>
 #include <vector>
 #include "core_types.h"
-#include "display.h"
+#include "display/display.h"
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/rational.h>

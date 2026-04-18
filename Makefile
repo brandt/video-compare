@@ -1,4 +1,5 @@
 CXXFLAGS = -g3 -O3 -ffast-math -std=c++20 -D__STDC_CONSTANT_MACROS \
+		   -I. \
 		   -Wall -Wextra -Wno-deprecated -Wno-deprecated-declarations \
 		   -Wdisabled-optimization -Wctor-dtor-privacy \
 		   -Woverloaded-virtual -Wno-unused -Wno-missing-field-initializers
@@ -68,7 +69,7 @@ else
   LDLIBS += -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lSDL3_ttf -lSDL3
 endif
 
-cpp_src = $(wildcard *.cpp)
+cpp_src = $(wildcard *.cpp) $(wildcard display/*.cpp) $(wildcard display/subsystems/*.cpp)
 c_src = $(wildcard *.c)
 obj = $(cpp_src:.cpp=.o) $(c_src:.c=.o)
 dep = $(obj:.o=.d)

@@ -1,6 +1,6 @@
 #pragma once
 #include <SDL3/SDL.h>
-#include "display_types.h"
+#include "../display_types.h"
 
 // Owns rectangle-selection and crop-mode state shared by the save-selected-
 // area feature and the crop-mode UI. State transitions are driven by mouse

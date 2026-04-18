@@ -11,20 +11,20 @@
 #include <tuple>
 #include <vector>
 #include "core_types.h"
-#include "difference_processor.h"
+#include "subsystems/difference_processor.h"
 #include "display_types.h"
 #include "display_utils.h"
 #include "gpu_renderer.h"
-#include "image_saver.h"
-#include "metadata_panel.h"
-#include "overlay_manager.h"
+#include "subsystems/image_saver.h"
+#include "subsystems/metadata_panel.h"
+#include "subsystems/overlay_manager.h"
 #include "pixel_format_utils.h"
-#include "playback_controller.h"
-#include "rgb_frame_cache.h"
+#include "subsystems/playback_controller.h"
+#include "subsystems/rgb_frame_cache.h"
 #include "row_workers.h"
 #include "scope_window.h"
-#include "selection_manager.h"
-#include "view_transform.h"
+#include "subsystems/selection_manager.h"
+#include "subsystems/view_transform.h"
 extern "C" {
 #include <libavutil/frame.h>
 }

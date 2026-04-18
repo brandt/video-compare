@@ -2,7 +2,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3_ttf/SDL_ttf.h>
 #include <vector>
-#include "display_types.h"
+#include "../display_types.h"
 
 // Metadata table shown on Ctrl+I. Holds the two VideoMetadata sources plus
 // the pre-rendered textures (SDL path) or RGBA surfaces (GPU path).

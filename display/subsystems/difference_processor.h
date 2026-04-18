@@ -3,8 +3,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include "display_types.h"
-#include "pixel_format_utils.h"
+#include "../display_types.h"
+#include "../pixel_format_utils.h"
 
 class RowWorkers;
 struct AVFrame;

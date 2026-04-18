@@ -11,7 +11,7 @@
 #include "config.h"
 #include "core_types.h"
 #include "demuxer.h"
-#include "display.h"
+#include "display/display.h"
 #include "format_converter.h"
 #include "frame_ring.h"
 #include "queue.h"

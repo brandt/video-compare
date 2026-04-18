@@ -1,6 +1,6 @@
 #include "view_transform.h"
 #include <cmath>
-#include "display_utils.h"
+#include "../display_utils.h"
 
 float ViewTransform::compute_zoom_factor(const float zoom_level) const {
   return std::pow(ZOOM_STEP_SIZE, zoom_level);

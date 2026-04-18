@@ -1,7 +1,7 @@
 #include "metadata_panel.h"
 #include <algorithm>
 #include <vector>
-#include "display_utils.h"
+#include "../display_utils.h"
 #include "string_utils.h"
 
 MetadataPanel::~MetadataPanel() {

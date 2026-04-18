@@ -1,6 +1,6 @@
 #include "playback_controller.h"
 #include <cmath>
-#include "display_utils.h"
+#include "../display_utils.h"
 
 void PlaybackController::toggle_play() {
   play_ = !play_;
