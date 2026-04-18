@@ -40,6 +40,7 @@ SDL::~SDL() {
   SDL_Quit();
 }
 
+// Construct the main window, font resources, GPU renderer, and all collaborator units.
 Display::Display(const int display_number,
                  const Mode mode,
                  const bool verbose,
@@ -281,6 +282,7 @@ Display::Display(const int display_number,
   }
 }
 
+// Destroy textures, cursors, and window in reverse construction order.
 Display::~Display() {
   if (gpu_renderer_active_) {
     gpu_renderer_.destroy();
@@ -313,6 +315,7 @@ Display::~Display() {
   SDL_DestroyWindow(window_);
 }
 
+// Tear down and rebuild per-side video textures after a pixel format or filtering change.
 void Display::recreate_video_textures_for_current_mode() {
   // GPU renderer: no SDL textures needed for video frames.
   if (gpu_renderer_active_) return;
@@ -359,11 +362,13 @@ void Display::recreate_video_textures_for_current_mode() {
   }
 }
 
+// Force a specific window size and re-derive the content layout; used by hot-keys like Shift+W and mode-switch resize.
 void Display::apply_window_size_and_relayout(const int target_w, const int target_h, const bool force_layout_refresh) {
   SDL_SetWindowSize(window_, target_w, target_h);
   handle_window_resize(true, force_layout_refresh);
 }
 
+// Enter or leave fullscreen, remembering the windowed size for later restore.
 void Display::set_fullscreen(const bool fullscreen) {
   int current_window_w = window_width_;
   int current_window_h = window_height_;
@@ -398,6 +403,7 @@ void Display::set_fullscreen(const bool fullscreen) {
   }
 }
 
+// True when the window visually behaves like fullscreen (true fullscreen or borderless desktop-sized).
 bool Display::detect_fullscreen_like_state() const {
   const Uint32 flags = SDL_GetWindowFlags(window_);
   if ((flags & SDL_WINDOW_FULLSCREEN) != 0) {
@@ -466,6 +472,7 @@ std::array<int, 2> Display::compute_mode_switch_target_window_size() const {
   return {target_w, target_h};
 }
 
+// Resize the window to match the aspect of the newly-selected display mode.
 void Display::resize_window_for_mode_switch() {
   const auto target_size = compute_mode_switch_target_window_size();
   const int target_w = target_size[0];
@@ -487,6 +494,7 @@ void Display::resize_window_for_mode_switch() {
   apply_window_size_and_relayout(target_w, target_h, true);
 }
 
+// Rebuild size-dependent resources (textures, buffers, zoom state) after a crop or source dim change.
 void Display::reinitialize_video_dimensions(const unsigned width, const unsigned height) {
   const int new_video_width = static_cast<int>(width);
   const int new_video_height = static_cast<int>(height);
@@ -515,6 +523,7 @@ void Display::reinitialize_video_dimensions(const unsigned width, const unsigned
   update_window_title_with_current_roi();
 }
 
+// Dump current window, layout, HDR, and playback state to stdout.
 void Display::print_verbose_info() {
   std::cout << "Main program version:  " << VersionInfo::version << std::endl;
   std::cout << "Video size:            " << video_width_ << "x" << video_height_ << std::endl;
@@ -569,6 +578,7 @@ void Display::print_verbose_info() {
   std::cout << "libavcodec configuration: " << avcodec_configuration() << std::endl << std::endl;
 }
 
+// Recreate small/big TTF fonts at the current font scale.
 void Display::rebuild_fonts() {
   if (small_font_ != nullptr) {
     TTF_CloseFont(small_font_);
@@ -586,6 +596,7 @@ void Display::rebuild_fonts() {
   big_font_ = check_sdl(TTF_OpenFontIO(embedded_font_big, true, 24 * font_scale_), "font open");
 }
 
+// Rebuild the per-side filename text textures used by the SDL path.
 void Display::rebuild_side_ui_textures() {
   // file_stem is used by save_selected_area / save_image_frames in both
   // renderer paths — always refresh it, even in GPU mode where the SDL
@@ -612,11 +623,13 @@ void Display::rebuild_side_ui_textures() {
   rebuild_side(RIGHT, format_right_file_label(left_file_name_, right_file_name_, active_right_index_ + 1));
 }
 
+// Clamp the help and metadata panel scroll offsets to their valid ranges.
 void Display::clamp_overlay_offsets() {
   overlay_.clamp_help_scroll(drawable_height_, gpu_renderer_active_, HELP_TEXT_LINE_SPACING);
   metadata_panel_.clamp_scroll(drawable_height_, gpu_renderer_active_, HELP_TEXT_LINE_SPACING);
 }
 
+// Aspect ratio of the video content layout with current mode + aspect-view adjustments.
 float Display::compute_content_aspect_ratio() const {
   const float content_w = static_cast<float>(video_width_) * ((mode_ == Mode::HStack) ? 2.0F : 1.0F);
   const float content_h = static_cast<float>(video_height_) * ((mode_ == Mode::VStack) ? 2.0F : 1.0F);
@@ -624,6 +637,7 @@ float Display::compute_content_aspect_ratio() const {
   return content_w / std::max(content_h, 1.0F);
 }
 
+// Aspect ratio of the content area actually painted (may be locked to window aspect).
 float Display::compute_active_content_aspect_ratio() const {
   auto apply_mode_layout_multiplier = [&](const float single_frame_ratio) {
     if (mode_ == Mode::HStack) {
@@ -652,6 +666,7 @@ float Display::compute_active_content_aspect_ratio() const {
   return compute_content_aspect_ratio();
 }
 
+// Recompute content_window_ and the window/drawable/video scale factors from the current window state.
 void Display::update_content_window_layout() {
   const int safe_window_w = std::max(1, window_width_);
   const int safe_window_h = std::max(1, window_height_);
@@ -679,6 +694,7 @@ void Display::update_content_window_layout() {
   video_to_window_height_factor_ = content_h / static_cast<float>(std::max(1, content_window_.h));
 }
 
+// Query the current display for HDR availability/headroom; flag changed state for next refresh.
 void Display::update_hdr_display_state() {
   bool hdr_available = false;
   float hdr_headroom = 1.0f;
@@ -698,6 +714,7 @@ void Display::update_hdr_display_state() {
   }
 }
 
+// One-shot: returns true when HDR state has changed since the last call and clears the flag.
 bool Display::consume_hdr_state_change() {
   if (hdr_state_changed_) {
     hdr_state_changed_ = false;
@@ -706,6 +723,7 @@ bool Display::consume_hdr_state_change() {
   return false;
 }
 
+// React to an OS-driven window resize: re-derive layout, refresh HDR, optionally reset the forced-size guard.
 void Display::handle_window_resize(const bool reset_forced_size_guard, const bool force_layout_refresh) {
   if (reset_forced_size_guard) {
     last_forced_window_size_ = {-1, -1};
@@ -829,6 +847,7 @@ void Display::handle_window_resize(const bool reset_forced_size_guard, const boo
   }
 }
 
+// SDL path: read back the rendered scene via SDL_RenderReadPixels and hand off to ImageSaver.
 void Display::save_image_frames_sdl(const AVFrame* left_frame, const AVFrame* right_frame) {
   // SDL renderer path — build the OSD via SDL_RenderReadPixels, then defer
   // to the shared ImageSaver pipeline. The GPU renderer path builds its OSD
@@ -883,6 +902,7 @@ void Display::save_image_frames_sdl(const AVFrame* left_frame, const AVFrame* ri
   image_saver_.save_frames_with_osd(left_frame, right_frame, osd_frame.get(), left_stem, right_stem);
 }
 
+// Draw a text texture with a background rect and an optional clip+fade when it overflows max_text_width_.
 void Display::render_text(const int x, const int y, SDL_Texture* texture, const int texture_width, const int texture_height, const int border_extension, const bool left_adjust) {
   // compute clip amount which ensures the filename does not extend more than half the display width
   const int clip_amount = std::max((texture_width + double_border_extension_) - max_text_width_, 0);
@@ -934,6 +954,7 @@ void Display::render_text(const int x, const int y, SDL_Texture* texture, const 
   }
 }
 
+// Draw the alternating yellow/black progress dot strip along the top or bottom edge.
 void Display::render_progress_dots(const float position, const float progress, const bool is_top) {
   if (duration_ > 0) {
     const float dot_size = 2.f;
@@ -964,10 +985,12 @@ void Display::render_progress_dots(const float position, const float progress, c
   }
 }
 
+// Return the per-side video texture, honoring the current bilinear/nearest filtering choice.
 SDL_Texture* Display::get_side_texture(int side) const {
   return bilinear_texture_filtering_ ? side_textures_linear_[side] : side_textures_nn_[side];
 }
 
+// Upload pixels to both the linear and nearest variants of the per-side video texture.
 void Display::update_side_texture(int side, const void* pixels, int pitch) {
   SDL_Texture* tex = get_side_texture(side);
   void* locked_pixels = nullptr;
@@ -996,6 +1019,7 @@ void Display::update_side_texture(int side, const void* pixels, int pitch) {
   SDL_UnlockTexture(tex);
 }
 
+// Round a float to int and clamp to [0, drawable_height_).
 int Display::round_and_clamp(const float value) {
   const int result = static_cast<int>(std::roundf(value));
 
@@ -1034,6 +1058,7 @@ AVFrame* crop_rgb_frame(const AVFrame* src, const SDL_Rect& roi, SDL_Rect* out_e
 }
 
 
+// SDL path: render the PSNR/SSIM/VMAF overlay in the top-right corner.
 void Display::render_quality_metrics_overlay() {
   const std::string vmaf_display = (last_vmaf_ == "n/a") ? std::string("n/a (pause to compute)") : last_vmaf_;
   const std::array<std::string, 3> lines = {
@@ -1084,16 +1109,19 @@ void Display::render_quality_metrics_overlay() {
   }
 }
 
+// Update displayed_left_side_ / displayed_right_side_ after a swap toggle.
 void Display::refresh_display_side_mapping() {
   displayed_left_side_ = swap_left_right_ ? RIGHT : LEFT;
   displayed_right_side_ = swap_left_right_ ? LEFT : RIGHT;
 }
 
 
+// Store per-side metadata strings and mark the metadata panel dirty so it rebuilds on next render.
 void Display::update_metadata(const VideoMetadata left_metadata, const VideoMetadata right_metadata) {
   metadata_panel_.update(left_metadata, right_metadata);
 }
 
+// Switch the active right-side video, updating filename, metadata, title, and side-UI textures.
 void Display::update_right_video(const std::string& right_file_name, const VideoMetadata right_metadata) {
   metadata_panel_.update(metadata_panel_.left(), right_metadata);
   right_file_name_ = right_file_name;
@@ -1119,6 +1147,7 @@ void Display::update_right_video(const std::string& right_file_name, const Video
   update_window_title_with_current_roi();
 }
 
+// Set the window title to reflect the current files and (when zoomed) the visible ROI.
 void Display::update_window_title_with_current_roi() {
   const std::string base_title = format_window_title(left_file_name_, right_file_name_);
 
@@ -1163,6 +1192,7 @@ void Display::update_window_title_with_current_roi() {
   }
 }
 
+// Render text using big_font_, falling back to small_font_ if the big one is unavailable.
 SDL_Surface* Display::render_text_with_fallback(const std::string& text) {
   SDL_Surface* surface = TTF_RenderText_Blended(small_font_, text.c_str(), 0, TEXT_COLOR);
 
@@ -1176,6 +1206,7 @@ SDL_Surface* Display::render_text_with_fallback(const std::string& text) {
 }
 
 
+// Update the selection end point from the current mouse position (called when zoom/pan changes while selecting).
 void Display::refresh_selection_end_from_mouse() {
   if (selection_.state() != SelectionState::Started) {
     return;
@@ -1191,6 +1222,7 @@ void Display::refresh_selection_end_from_mouse() {
   selection_.set_end(end_video_pos);
 }
 
+// SDL path: draw the selection/crop rectangle(s) with per-side colouring.
 void Display::draw_selection_rect() {
   if (selection_.state() != SelectionState::Started) {
     return;
@@ -1248,6 +1280,7 @@ void Display::draw_selection_rect() {
   }
 }
 
+// If save_selected_area was requested, write left/right JXLs for the current selection rect.
 void Display::possibly_save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame) {
   if (selection_.state() != SelectionState::Completed) {
     return;
@@ -1266,6 +1299,7 @@ void Display::possibly_save_selected_area(const AVFrame* left_frame, const AVFra
   selection_.cancel_save_selected_area();
 }
 
+// If a crop was requested, build a PendingCropRequest from the selection and queue it for the main loop.
 void Display::possibly_apply_crop() {
   if (selection_.state() != SelectionState::Completed) {
     return;
@@ -1303,6 +1337,7 @@ void Display::possibly_apply_crop() {
   selection_.reset_crop_mode();
 }
 
+// Main-loop entry: early-out if nothing changed, build a per-frame RenderContext, then dispatch to the GPU or SDL render path.
 bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_frame, const std::string& current_total_browsable) {
   const std::string left_frame_key = get_frame_key(left_frame);
   const std::string right_frame_key = get_frame_key(right_frame);
@@ -1358,6 +1393,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   return true;
 }
 
+// libplacebo GPU render path: build ops/overlays/text ops and hand them to GpuRenderer::render + present.
 void Display::render_frame_gpu(const RenderContext& ctx, const std::string& current_total_browsable) {
   const AVFrame* left_frame = ctx.left_frame;
   const AVFrame* right_frame = ctx.right_frame;
@@ -1969,6 +2005,7 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
     gpu_finalize_deferred(ctx, have_rgb, osd_frame.get());
 }
 
+// SDL_Renderer render path: upload per-side textures, render HUD via SDL primitives, present.
 void Display::render_frame_sdl(const RenderContext& ctx, const std::string& current_total_browsable) {
   const AVFrame* left_frame = ctx.left_frame;
   const AVFrame* right_frame = ctx.right_frame;
@@ -2050,6 +2087,7 @@ void Display::render_frame_sdl(const RenderContext& ctx, const std::string& curr
 
 // ===== GPU render sub-phases =====
 
+// Convert YUV→RGB on demand and run CPU-side features (pixel inspector, similarity metrics, live quality). Returns whether the RGB cache is populated.
 bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
   const AVFrame* left_frame = ctx.left_frame;
   const AVFrame* right_frame = ctx.right_frame;
@@ -2177,6 +2215,7 @@ bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
   return have_rgb;
 }
 
+// Upload left/right frames (or the RGB-diff shell in subtraction mode) to the GpuRenderer when their keys change.
 void Display::gpu_upload_frames(const RenderContext& ctx, const bool have_rgb) {
   const AVFrame* left_frame = ctx.left_frame;
   const AVFrame* right_frame = ctx.right_frame;
@@ -2216,6 +2255,7 @@ void Display::gpu_upload_frames(const RenderContext& ctx, const bool have_rgb) {
   }
 }
 
+// Build the main-view render ops for Split / HStack / VStack modes.
 void Display::gpu_build_main_video_ops(const RenderContext& ctx, std::vector<GpuRenderer::SideRenderOp>& ops) {
   const bool compare_mode = ctx.compare_mode;
   (void)compare_mode;
@@ -2415,6 +2455,7 @@ void Display::gpu_build_zoom_magnifier_ops(const RenderContext& ctx,
   }
 }
 
+// When a save is pending and CPU pixels are available, capture the OSD via GpuRenderer::capture_osd into an RGB24 AVFrame; otherwise skip the GPU readback and return nullptr.
 AVFramePtr Display::gpu_capture_osd(const bool have_rgb,
                                      const std::vector<GpuRenderer::SideRenderOp>& ops,
                                      const std::vector<GpuRenderer::OverlayOp>& overlays,
@@ -2441,6 +2482,7 @@ AVFramePtr Display::gpu_capture_osd(const bool have_rgb,
   return AVFramePtr(osd);
 }
 
+// Consume deferred save-frames / save-selected-area / crop requests now that the frame has rendered.
 void Display::gpu_finalize_deferred(const RenderContext& ctx, const bool have_rgb, AVFrame* osd_frame) {
   (void)ctx;
   if (image_saver_.save_frames_requested()) {
@@ -2468,6 +2510,7 @@ void Display::gpu_finalize_deferred(const RenderContext& ctx, const bool have_rg
 
 // ===== SDL render sub-phases =====
 
+// SDL path: run pixel inspector, similarity metrics, and live quality metrics directly on the native frame planes.
 void Display::sdl_run_cpu_work(const RenderContext& ctx,
                                 const std::array<uint8_t*, 3>& planes_left, const std::array<size_t, 3>& pitches_left,
                                 const std::array<uint8_t*, 3>& planes_right, const std::array<size_t, 3>& pitches_right) {
@@ -2581,6 +2624,7 @@ void Display::sdl_run_cpu_work(const RenderContext& ctx,
   }
 }
 
+// SDL path: upload per-side frames (with optional packed 10-bpc conversion or subtraction diff) and render them into the on-screen regions.
 void Display::sdl_render_video_textures(const RenderContext& ctx,
                                          const std::array<uint8_t*, 3>& planes_left, const std::array<size_t, 3>& pitches_left,
                                          const std::array<uint8_t*, 3>& planes_right, const std::array<size_t, 3>& pitches_right) {
@@ -2649,6 +2693,7 @@ void Display::sdl_render_video_textures(const RenderContext& ctx,
   }
 }
 
+// SDL path: read back a 64-px src block around the mouse and blit it scaled up into each active zoom-magnifier corner.
 void Display::sdl_render_zoom_magnifier(const int mouse_drawable_x, const int mouse_drawable_y, const int dst_zoomed_size) {
   if (!view_transform_.zoom_left() && !view_transform_.zoom_right()) return;
 
@@ -2677,6 +2722,7 @@ void Display::sdl_render_zoom_magnifier(const int mouse_drawable_x, const int mo
   SDL_DestroySurface(render_surface);
 }
 
+// SDL path: draw all HUD text (file labels, positions, seek target, zoom factor, playback speed, frame counter, progress dots).
 void Display::sdl_render_hud(const RenderContext& ctx, const std::string& current_total_browsable) {
   const AVFrame* left_frame = ctx.left_frame;
   const AVFrame* right_frame = ctx.right_frame;
@@ -2871,6 +2917,7 @@ void Display::sdl_render_hud(const RenderContext& ctx, const std::string& curren
   render_progress_dots(right_position, right_progress, false);
 }
 
+// SDL path: render the fading center-screen message overlay when one is active.
 void Display::sdl_render_message_toast() {
   SDL_FRect fill_rect;
   SDL_FRect text_rect;
@@ -2914,6 +2961,7 @@ void Display::sdl_render_message_toast() {
   }
 }
 
+// SDL path: consume deferred save-frames / save-selected-area / crop requests now that the frame has rendered.
 void Display::sdl_finalize_deferred(const AVFrame* left_frame, const AVFrame* right_frame) {
   if (image_saver_.save_frames_requested()) {
     save_image_frames_sdl(left_frame, right_frame);
@@ -2927,16 +2975,19 @@ void Display::sdl_finalize_deferred(const AVFrame* left_frame, const AVFrame* ri
   }
 }
 
+// GPU path entry: upload a decoded native-format AVFrame to the libplacebo side texture.
 void Display::upload_native_frame(int side, const AVFrame* frame) {
   if (gpu_renderer_active_) {
     gpu_renderer_.upload_frame(side, frame);
   }
 }
 
+// Queue a transient center-screen message for display on the next frame.
 void Display::set_pending_message(const std::string& message) {
   overlay_.set_pending_message(message);
 }
 
+// Print to stdout in windowed mode, or queue a toast message in fullscreen.
 void Display::notify_user(const std::string& message) {
   if (!is_fullscreen_) {
     // Avoid cluttering the screen with messages in windowed mode
@@ -2946,12 +2997,14 @@ void Display::notify_user(const std::string& message) {
   }
 }
 
+// Raise the main window (counteracts scope windows stealing keyboard focus).
 void Display::focus_main_window() {
   if (window_ != nullptr) {
     SDL_RaiseWindow(window_);
   }
 }
 
+// Compute the visible ROI on each side in single-frame (per-side) coordinates, accounting for zoom and mode.
 std::pair<SDL_Rect, SDL_Rect> Display::get_visible_rois_in_single_frame_coordinates() const {
   const auto zoom_rect = view_transform_.compute_zoom_rect();
 
@@ -3035,6 +3088,7 @@ std::pair<SDL_Rect, SDL_Rect> Display::get_visible_rois_in_single_frame_coordina
   return {left, right};
 }
 
+// Intersection of the left and right visible ROIs — the region compared by similarity metrics.
 SDL_Rect Display::get_visible_roi_in_single_frame_coordinates() const {
   const auto rois = get_visible_rois_in_single_frame_coordinates();
   const SDL_Rect left_roi = rois.first;
@@ -3069,15 +3123,18 @@ SDL_Rect Display::get_visible_roi_in_single_frame_coordinates() const {
   return left_roi;
 }
 
+// Main loop calls this before pumping events for a new frame.
 void Display::begin_input_frame() {
   playback_.clear_transient_state();
   toggle_scope_window_requested_.fill(false);
 }
 
+// Mark that an event occurred this frame so the next refresh isn't skipped by the early-out guard.
 void Display::mark_input_received() {
   input_received_ = true;
 }
 
+// Dispatch a single SDL event: window events, mouse, keyboard, and global shortcuts.
 void Display::handle_event(const SDL_Event& event) {
   event_ = event;
   input_received_ = true;
@@ -3640,14 +3697,17 @@ void Display::handle_event(const SDL_Event& event) {
   }
 }
 
+// Whether the current display advertises HDR support.
 bool Display::get_hdr_display_available() const {
   return hdr_display_available_;
 }
 
+// Measured HDR peak-to-SDR ratio for the current display.
 float Display::get_hdr_display_headroom() const {
   return hdr_display_headroom_;
 }
 
+// Enable or disable HDR passthrough; recreates the side textures when the state flips.
 void Display::set_hdr_passthrough(bool enabled) {
   if (hdr_passthrough_ != enabled) {
     hdr_passthrough_ = enabled;
@@ -3660,106 +3720,132 @@ void Display::set_hdr_passthrough(bool enabled) {
   }
 }
 
+// Set the content's expected HDR headroom for libplacebo tone-mapping.
 void Display::set_hdr_content_headroom(float headroom) {
   hdr_content_headroom_ = headroom;
 }
 
+// Whether the user has requested to quit.
 bool Display::get_quit() const {
   return quit_;
 }
 
+// Whether playback is currently active.
 bool Display::get_play() const {
   return playback_.play();
 }
 
+// Current loop mode for buffer playback (Off / ForwardOnly / PingPong).
 Display::Loop Display::get_buffer_play_loop_mode() const {
   return playback_.loop_mode();
 }
 
+// Set the loop mode for buffer playback.
 void Display::set_buffer_play_loop_mode(const Display::Loop& mode) {
   playback_.set_loop_mode(mode);
 }
 
+// Whether buffer playback is advancing forward (false = reverse).
 bool Display::get_buffer_play_forward() const {
   return playback_.forward();
 }
 
+// Toggle forward/reverse buffer playback direction.
 void Display::toggle_buffer_play_direction() {
   playback_.toggle_direction();
 }
 
+// Whether fast input alignment is enabled.
 bool Display::get_fast_input_alignment() const {
   return fast_input_alignment_;
 }
 
+// Whether the left and right videos are logically swapped.
 bool Display::get_swap_left_right() const {
   return swap_left_right_;
 }
 
+// Pending relative-seek offset (seconds), consumed by the main loop.
 float Display::get_seek_relative() const {
   return playback_.seek_relative();
 }
 
+// Whether the pending seek is absolute (from start) rather than relative.
 bool Display::get_seek_from_start() const {
   return playback_.seek_from_start();
 }
 
+// Pending frame-buffer offset delta consumed by the main loop.
 int Display::get_frame_buffer_offset_delta() const {
   return playback_.frame_buffer_offset_delta();
 }
 
+// Pending frame-by-frame step delta consumed by the main loop.
 int Display::get_frame_navigation_delta() const {
   return playback_.frame_navigation_delta();
 }
 
+// Pending shift count (+/- frames) to offset the right-side video by.
 int Display::get_shift_right_frames() const {
   return playback_.shift_right_frames();
 }
 
+// Whether the user has requested automatic left/right alignment.
 bool Display::get_auto_align_requested() const {
   return playback_.auto_align_requested();
 }
 
+// Public wrapper around MetricsCalculator::compute_frame_psnr for alignment consumers in video_compare.cpp.
 float Display::compute_frame_psnr(const AVFrame* left_frame, const AVFrame* right_frame) {
   return MetricsCalculator::compute_frame_psnr(left_frame, right_frame, requires_10_bpc());
 }
 
+// Current playback speed multiplier (1.0 = real-time).
 float Display::get_playback_speed_factor() const {
   return playback_.playback_speed_factor();
 }
 
+// Whether the next frame should advance playback by one tick.
 bool Display::get_tick_playback() const {
   return playback_.tick_playback();
 }
 
+// Whether playback may advance this frame (covers both play + single-step).
 bool Display::get_possibly_tick_playback() const {
   return playback_.possibly_tick_playback();
 }
 
+// Whether the FPS counter is currently visible.
 bool Display::get_show_fps() const {
   return show_fps_;
 }
 
+// Consume and return a pending scope-window toggle request for the given scope type.
 bool Display::get_toggle_scope_window_requested(const ScopeWindow::Type type) const {
   return toggle_scope_window_requested_[ScopeWindow::index(type)];
 }
 
+// Consume and return any queued crop request (main loop applies it).
 PendingCropRequest Display::get_and_clear_pending_crop_request() {
   return selection_.get_and_clear_pending_crop_request();
 }
 
+// Set the number of available right-side videos.
 void Display::set_num_right_videos(const size_t num_right_videos) {
   num_right_videos_ = num_right_videos;
 }
 
+// Number of available right-side videos.
 size_t Display::get_num_right_videos() const {
   return num_right_videos_;
 }
 
+// Index of the currently active right-side video.
 size_t Display::get_active_right_index() const {
   return active_right_index_;
 }
 
+// Switch to a different right-side video by index.
 void Display::set_active_right_index(const size_t index) {
   active_right_index_ = std::min(index, num_right_videos_ > 0 ? num_right_videos_ - 1 : 0UL);
 }
