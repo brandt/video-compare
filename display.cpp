@@ -1314,16 +1314,63 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     return false;
   }
 
-  // --- GPU renderer path ---
+  // Reset each frame; set below by animations that need a periodic refresh
+  // (loop-mode blink, fading message) even when no new input arrives.
+  timer_based_update_performed_ = false;
+
+  const bool compare_mode = show_left_ && show_right_;
+  const auto zoom_rect = view_transform_.compute_zoom_rect();
+  const float content_mouse_x = static_cast<float>(mouse_x_ - content_window_.x);
+  const float safe_content_window_w = static_cast<float>(std::max(1, content_window_.w));
+  const float full_ws_mouse_video_x = (content_mouse_x * safe_content_window_w / std::max(1.0F, safe_content_window_w - 1.0F)) * video_to_window_width_factor_;
+  const float video_mouse_x = (full_ws_mouse_video_x - zoom_rect.start.x()) * static_cast<float>(video_width_) / zoom_rect.size.x();
+  const float video_texel_clamped_mouse_x = static_cast<float>(content_window_.x) +
+      (std::round(video_mouse_x) * zoom_rect.size.x() / static_cast<float>(video_width_) + zoom_rect.start.x()) / video_to_window_width_factor_;
+  const int split_x = (compare_mode && mode_ == Mode::Split)
+                          ? clamp_range(std::round(video_mouse_x), 0.0F, float(video_width_))
+                          : show_left_ ? video_width_ : 0;
+  const int dst_zoomed_size = static_cast<int>(std::round(std::min(drawable_width_, drawable_height_) * 0.5F)) & -2;
+  const RenderContext ctx{
+      left_frame,
+      right_frame,
+      has_updated_left_frame,
+      has_updated_right_frame,
+      compare_mode,
+      zoom_rect,
+      video_mouse_x,
+      video_texel_clamped_mouse_x,
+      split_x,
+      dst_zoomed_size,
+      dst_zoomed_size / 2,
+  };
+
   if (gpu_renderer_active_) {
-    const bool compare_mode = show_left_ && show_right_;
-    const auto zoom_rect = view_transform_.compute_zoom_rect();
+    render_frame_gpu(ctx, current_total_browsable);
+  } else {
+    render_frame_sdl(ctx, current_total_browsable);
+  }
 
-    // Reset each frame; set below by animations that need a periodic refresh
-    // (loop-mode blink, fading message) even when no new input arrives.
-    timer_based_update_performed_ = false;
+  input_received_ = false;
+  previous_left_frame_pts_ = left_frame->pts;
+  previous_right_frame_pts_ = right_frame->pts;
+  previous_left_frame_key_ = left_frame_key;
+  previous_right_frame_key_ = right_frame_key;
+  return true;
+}
 
-    // Features that still need CPU pixel access drive an on-demand YUV→RGB
+void Display::render_frame_gpu(const RenderContext& ctx, const std::string& current_total_browsable) {
+  const AVFrame* left_frame = ctx.left_frame;
+  const AVFrame* right_frame = ctx.right_frame;
+  const bool has_updated_left_frame = ctx.has_updated_left_frame;
+  const bool has_updated_right_frame = ctx.has_updated_right_frame;
+  const bool compare_mode = ctx.compare_mode;
+  const auto& zoom_rect = ctx.zoom_rect;
+  const float video_mouse_x = ctx.video_mouse_x;
+  const float video_texel_clamped_mouse_x = ctx.video_texel_clamped_mouse_x;
+  const int split_x = ctx.split_x;
+  const int dst_zoomed_size = ctx.dst_zoomed_size;
+
+  // Features that still need CPU pixel access drive an on-demand YUV→RGB
     // conversion. Skipped entirely when none are active to keep the pipeline
     // GPU-fast.
     const bool need_rgb = diff_processor_.subtraction_mode() || print_mouse_position_and_color_ ||
@@ -1478,16 +1525,6 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       }
     }
 
-    // Compute mouse-x in video coordinates — identical to the SDL path.
-    const float content_mouse_x = static_cast<float>(mouse_x_ - content_window_.x);
-    const float safe_content_window_w = static_cast<float>(std::max(1, content_window_.w));
-    const float full_ws_mouse_video_x = (content_mouse_x * safe_content_window_w / std::max(1.0F, safe_content_window_w - 1.0F)) * video_to_window_width_factor_;
-    const float video_mouse_x = (full_ws_mouse_video_x - zoom_rect.start.x()) * static_cast<float>(video_width_) / zoom_rect.size.x();
-
-    const int split_x = (compare_mode && mode_ == Mode::Split)
-                             ? clamp_range(std::round(video_mouse_x), 0.0F, float(video_width_))
-                             : show_left_ ? video_width_ : 0;
-
     // Build render ops using the exact same coordinate chain as the SDL path:
     // video rect -> video_to_zoom_space -> video_rect_to_drawable_transform.
     // A vector (not a fixed array) — zoom-magnifier mode pushes extra ops on
@@ -1549,8 +1586,6 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // side of the stack boundary that falls within the src rect. This lets
     // the user switch to the opposite corner when the zoom box itself covers
     // the area they want to inspect.
-    const int dst_zoomed_size = static_cast<int>(std::round(std::min(drawable_width_, drawable_height_) * 0.5F)) & -2;
-    const int dst_half_zoomed_size = dst_zoomed_size / 2;
 
     // Drawable-x of the split boundary inside each zoom box (-1 = don't
     // draw, either because zoom is off or split falls outside the zoom src).
@@ -1713,7 +1748,6 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     if (show_hud_) {
       // Split line — vertical white line at mouse-snapped video texel position.
       if (mode_ == Mode::Split && compare_mode) {
-        const float video_texel_clamped_mouse_x = static_cast<float>(content_window_.x) + (std::round(video_mouse_x) * zoom_rect.size.x() / static_cast<float>(video_width_) + zoom_rect.start.x()) / video_to_window_width_factor_;
         const float split_drawable_x = std::round(video_texel_clamped_mouse_x * drawable_to_window_width_factor_);
         push_rect(split_drawable_x, 0, split_drawable_x + 1, static_cast<float>(drawable_height_),
                   255, 255, 255, 255);
@@ -2328,15 +2362,19 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     if (selection_.crop_mode()) {
       possibly_apply_crop();
     }
+}
 
-    input_received_ = false;
-    previous_left_frame_pts_ = left_frame->pts;
-    previous_right_frame_pts_ = right_frame->pts;
-    previous_left_frame_key_ = left_frame_key;
-    previous_right_frame_key_ = right_frame_key;
-    return true;
-  }
-  // --- End GPU renderer path ---
+void Display::render_frame_sdl(const RenderContext& ctx, const std::string& current_total_browsable) {
+  const AVFrame* left_frame = ctx.left_frame;
+  const AVFrame* right_frame = ctx.right_frame;
+  const bool has_updated_left_frame = ctx.has_updated_left_frame;
+  const bool has_updated_right_frame = ctx.has_updated_right_frame;
+  const bool compare_mode = ctx.compare_mode;
+  const auto& zoom_rect = ctx.zoom_rect;
+  const float video_texel_clamped_mouse_x = ctx.video_texel_clamped_mouse_x;
+  const int split_x = ctx.split_x;
+  const int dst_zoomed_size = ctx.dst_zoomed_size;
+  const int dst_half_zoomed_size = ctx.dst_half_zoomed_size;
 
   std::array<uint8_t*, 3> planes_left{left_frame->data[0], left_frame->data[1], left_frame->data[2]};
   std::array<uint8_t*, 3> planes_right{right_frame->data[0], right_frame->data[1], right_frame->data[2]};
@@ -2348,10 +2386,6 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     diff_processor_.ensure_left_planes(pitches_left[0]);
     diff_processor_.ensure_right_planes(pitches_right[0]);
   }
-
-  const bool compare_mode = show_left_ && show_right_;
-
-  const auto zoom_rect = view_transform_.compute_zoom_rect();
 
   update_window_title_with_current_roi();
 
@@ -2474,20 +2508,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   SDL_SetRenderDrawColor(renderer_, BACKGROUND_COLOR.r, BACKGROUND_COLOR.g, BACKGROUND_COLOR.b, BACKGROUND_COLOR.a);
   SDL_RenderClear(renderer_);
 
-  // mouse video x-position stretched to the active content area (letterboxed in fullscreen)
-  const float content_mouse_x = static_cast<float>(mouse_x_ - content_window_.x);
-  const float safe_content_window_w = static_cast<float>(std::max(1, content_window_.w));
-  const float full_ws_mouse_video_x = (content_mouse_x * safe_content_window_w / std::max(1.0F, safe_content_window_w - 1.0F)) * video_to_window_width_factor_;
-
-  // mouse x-position in video coordinates
-  const float video_mouse_x = (full_ws_mouse_video_x - zoom_rect.start.x()) * static_cast<float>(video_width_) / zoom_rect.size.x();
-
-  // the nearest texel border to the mouse x-position in window coordinates
-  const float video_texel_clamped_mouse_x = static_cast<float>(content_window_.x) + (std::round(video_mouse_x) * zoom_rect.size.x() / static_cast<float>(video_width_) + zoom_rect.start.x()) / video_to_window_width_factor_;
-
   if (show_left_ || show_right_) {
-    const int split_x = (compare_mode && mode_ == Mode::Split) ? clamp_range(std::round(video_mouse_x), 0.0F, float(video_width_)) : show_left_ ? video_width_ : 0;
-
     // Upload full frames to per-side textures
     if (input_received_ || has_updated_left_frame) {
       if (requires_10_bpc()) {
@@ -2549,10 +2570,6 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   const int mouse_drawable_x = std::round(video_texel_clamped_mouse_x * drawable_to_window_width_factor_);
   const int mouse_drawable_y = std::round(static_cast<float>(mouse_y_) * drawable_to_window_height_factor_);
 
-  // zoomed area
-  const int dst_zoomed_size = static_cast<int>(std::round(std::min(drawable_width_, drawable_height_) * 0.5F)) & -2;  // size must be an even number of pixels
-  const int dst_half_zoomed_size = dst_zoomed_size / 2;
-
   if (view_transform_.zoom_left() || view_transform_.zoom_right()) {
     const int src_zoomed_size = 64;
     const int src_half_zoomed_size = src_zoomed_size / 2;
@@ -2577,8 +2594,6 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     SDL_DestroyTexture(render_texture);
     SDL_DestroySurface(render_surface);
   }
-
-  timer_based_update_performed_ = false;
 
   SDL_FRect fill_rect;
   SDL_FRect text_rect;
@@ -2868,14 +2883,6 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   }
 
   SDL_RenderPresent(renderer_);
-
-  input_received_ = false;
-  previous_left_frame_pts_ = left_frame->pts;
-  previous_right_frame_pts_ = right_frame->pts;
-  previous_left_frame_key_ = left_frame_key;
-  previous_right_frame_key_ = right_frame_key;
-
-  return true;
 }
 
 void Display::upload_native_frame(int side, const AVFrame* frame) {

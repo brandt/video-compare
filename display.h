@@ -198,6 +198,25 @@ class Display {
   LayoutAdapter layout_adapter_;
   ViewTransform view_transform_;
 
+  // Per-frame snapshot built once at the top of possibly_refresh so both
+  // GPU/SDL paths consume identical derived state without recomputing it.
+  struct RenderContext {
+    const AVFrame* left_frame;
+    const AVFrame* right_frame;
+    bool has_updated_left_frame;
+    bool has_updated_right_frame;
+    bool compare_mode;
+    ViewTransform::ZoomRect zoom_rect;
+    float video_mouse_x;
+    float video_texel_clamped_mouse_x;
+    int split_x;
+    int dst_zoomed_size;
+    int dst_half_zoomed_size;
+  };
+
+  void render_frame_gpu(const RenderContext& ctx, const std::string& current_total_browsable);
+  void render_frame_sdl(const RenderContext& ctx, const std::string& current_total_browsable);
+
   SDL sdl_;
   TTF_Font* small_font_{nullptr};
   TTF_Font* big_font_{nullptr};
