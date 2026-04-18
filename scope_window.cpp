@@ -401,15 +401,15 @@ void ScopeWindow::ensure_texture() {
 
 void ScopeWindow::present_frame(const AVFrame* filtered_frame, const bool allow_cached) {
   SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 100);
-  sdl_check_bool(SDL_RenderClear(renderer_) == 0, "SDL_RenderClear");
+  sdl_check_bool(SDL_RenderClear(renderer_), "SDL_RenderClear");
 
   if (filtered_frame != nullptr) {
-    sdl_check_bool(SDL_UpdateTexture(texture_, nullptr, filtered_frame->data[0], filtered_frame->linesize[0]) == 0, "SDL_UpdateTexture");
+    sdl_check_bool(SDL_UpdateTexture(texture_, nullptr, filtered_frame->data[0], filtered_frame->linesize[0]), "SDL_UpdateTexture");
     has_valid_texture_ = true;
   }
 
   if ((filtered_frame != nullptr) || (allow_cached && has_valid_texture_)) {
-    sdl_check_bool(SDL_RenderTexture(renderer_, texture_, nullptr, nullptr) == 0, "SDL_RenderTexture");
+    sdl_check_bool(SDL_RenderTexture(renderer_, texture_, nullptr, nullptr), "SDL_RenderTexture");
   }
 
   draw_left_right_overlay(renderer_, window_width_, window_height_, window_width_ / 2);
