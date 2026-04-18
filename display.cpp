@@ -73,8 +73,11 @@ Display::Display(const int display_number,
       duration_{duration},
       start_in_fullscreen_{start_in_fullscreen},
       pending_verbose_print_{verbose},
+      layout_adapter_(*this),
+      view_transform_(layout_adapter_),
       diff_processor_(row_workers_, start_in_subtraction_mode),
       wheel_sensitivity_{wheel_sensitivity} {
+  view_transform_.set_on_change([this]() { refresh_selection_end_from_mouse(); });
   const int auto_width = mode == Mode::HStack ? width * 2 : width;
   const int auto_height = mode == Mode::VStack ? height * 2 : height;
 
@@ -515,7 +518,7 @@ void Display::reinitialize_video_dimensions(const unsigned width, const unsigned
   // FormatConverter and RGB destination frames.
   rgb_cache_.invalidate();
 
-  move_offset_ = Vector2D((global_center_.x() - 0.5F) * static_cast<float>(video_width_), (global_center_.y() - 0.5F) * static_cast<float>(video_height_));
+  view_transform_.sync_move_offset_to_center();
 
   // Force relayout because video dimensions changed even if window size did not.
   handle_window_resize(true, true);
@@ -1539,15 +1542,11 @@ void Display::refresh_selection_end_from_mouse() {
   }
 
   SDL_GetMouseState(&mouse_x_, &mouse_y_);
-  selection_end_ = window_to_video_position(mouse_x_, mouse_y_, compute_zoom_rect());
+  selection_end_ = view_transform_.window_to_video_position(mouse_x_, mouse_y_, view_transform_.compute_zoom_rect());
 
   if (selection_wrap_) {
     selection_end_ = wrap_to_left_frame(selection_end_);
   }
-}
-
-void Display::on_view_transform_changed() {
-  refresh_selection_end_from_mouse();
 }
 
 void Display::draw_selection_rect() {
@@ -1555,7 +1554,7 @@ void Display::draw_selection_rect() {
     return;
   }
 
-  const auto zoom_rect = compute_zoom_rect();
+  const auto zoom_rect = view_transform_.compute_zoom_rect();
 
   auto draw_rect = [this](const SDL_FRect& r, Uint8 r_val, Uint8 g_val, Uint8 b_val, int alpha_divider = 1) {
     // Draw semi-transparent overlay
@@ -1570,7 +1569,7 @@ void Display::draw_selection_rect() {
   };
 
   SDL_Rect selection_rect = get_left_selection_rect();
-  SDL_FRect drawable_rect = video_rect_to_drawable_transform(video_to_zoom_space(selection_rect, zoom_rect));
+  SDL_FRect drawable_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(selection_rect, zoom_rect));
 
   if (mode_ == Mode::Split) {
     if (crop_mode_) {
@@ -1609,7 +1608,7 @@ void Display::draw_selection_rect() {
       break;
   }
 
-  drawable_rect = video_rect_to_drawable_transform(video_to_zoom_space(selection_rect, zoom_rect));
+  drawable_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(selection_rect, zoom_rect));
 
   if (!crop_mode_ || crop_target_side_ == CropTargetSide::Right || crop_target_side_ == CropTargetSide::Both) {
     draw_rect(drawable_rect, 128, 128, 255);
@@ -1766,7 +1765,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   // --- GPU renderer path ---
   if (gpu_renderer_active_) {
     const bool compare_mode = show_left_ && show_right_;
-    const auto zoom_rect = compute_zoom_rect();
+    const auto zoom_rect = view_transform_.compute_zoom_rect();
 
     // Reset each frame; set below by animations that need a periodic refresh
     // (loop-mode blink, fading message) even when no new input arrives.
@@ -1786,7 +1785,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // Pixel inspector + similarity metrics consume RGB frames and run before
     // any visual update so a successful key press gets immediate feedback.
     if (have_rgb) {
-      const Vector2D mouse_video_pos = window_to_video_position(mouse_x_, mouse_y_, zoom_rect);
+      const Vector2D mouse_video_pos = view_transform_.window_to_video_position(mouse_x_, mouse_y_, zoom_rect);
       const int mouse_video_x = mouse_video_pos.x();
       const int mouse_video_y = mouse_video_pos.y();
 
@@ -1946,7 +1945,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
     auto push_op = [&](int side, int src_x, int src_y, int src_w, int src_h,
                         const SDL_Rect& video_quad) {
-      const SDL_FRect screen_rect = video_rect_to_drawable_transform(video_to_zoom_space(video_quad, zoom_rect));
+      const SDL_FRect screen_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad, zoom_rect));
       GpuRenderer::SideRenderOp op{};
       op.side = side;
       op.src_x0 = static_cast<float>(src_x);
@@ -2006,7 +2005,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     float zoom_left_slider_dx = -1.f;
     float zoom_right_slider_dx = -1.f;
 
-    if (zoom_left_ || zoom_right_) {
+    if (view_transform_.zoom_left() || view_transform_.zoom_right()) {
       const int src_zoomed_size = 64;
       const int src_half = src_zoomed_size / 2;
 
@@ -2116,10 +2115,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       };
 
       const float zoom_dst_y = static_cast<float>(drawable_height_ - dst_zoomed_size);
-      if (zoom_left_) {
+      if (view_transform_.zoom_left()) {
         push_zoom_box(0.f, zoom_dst_y, static_cast<float>(dst_zoomed_size), zoom_dst_y + dst_zoomed_size);
       }
-      if (zoom_right_) {
+      if (view_transform_.zoom_right()) {
         const float rx0 = static_cast<float>(drawable_width_ - dst_zoomed_size);
         push_zoom_box(rx0, zoom_dst_y, rx0 + dst_zoomed_size, zoom_dst_y + dst_zoomed_size);
       }
@@ -2134,10 +2133,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         const float src_w = std::max(1e-3f, sx1 - sx0);
         if (sxl >= sx0 && sxl <= sx1) {
           const float frac = (sxl - sx0) / src_w;
-          if (zoom_left_) {
+          if (view_transform_.zoom_left()) {
             zoom_left_slider_dx = frac * static_cast<float>(dst_zoomed_size);
           }
-          if (zoom_right_) {
+          if (view_transform_.zoom_right()) {
             const float rx0 = static_cast<float>(drawable_width_ - dst_zoomed_size);
             zoom_right_slider_dx = rx0 + frac * static_cast<float>(dst_zoomed_size);
           }
@@ -2174,11 +2173,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         // left/right frame edge in the zoomed view.
         const float zoom_dst_y = static_cast<float>(drawable_height_ - dst_zoomed_size);
         const float zoom_dst_y1 = static_cast<float>(drawable_height_);
-        if (zoom_left_ && zoom_left_slider_dx >= 0.f) {
+        if (view_transform_.zoom_left() && zoom_left_slider_dx >= 0.f) {
           const float sx = std::round(zoom_left_slider_dx);
           push_rect(sx, zoom_dst_y, sx + 1.f, zoom_dst_y1, 255, 255, 255, 255);
         }
-        if (zoom_right_ && zoom_right_slider_dx >= 0.f) {
+        if (view_transform_.zoom_right() && zoom_right_slider_dx >= 0.f) {
           const float sx = std::round(zoom_right_slider_dx);
           push_rect(sx, zoom_dst_y, sx + 1.f, zoom_dst_y1, 255, 255, 255, 255);
         }
@@ -2385,16 +2384,16 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       // with the value to avoid noisy fractional digits at common zooms.
       std::string zoom_factor_str;
       {
-        const uint64_t zr = lrintf(global_zoom_factor_ * 1000);
+        const uint64_t zr = lrintf(view_transform_.global_zoom_factor() * 1000);
         int tz = ((zr % 10) > 0 ? 0 : 1) + ((zr % 100) > 0 ? 0 : 1) + ((zr % 1000) > 0 ? 0 : 1);
-        if (global_zoom_factor_ < 1e-1 || (tz == 0 && zr < 1000)) {
-          zoom_factor_str = string_sprintf("x%1.3f", global_zoom_factor_);
+        if (view_transform_.global_zoom_factor() < 1e-1 || (tz == 0 && zr < 1000)) {
+          zoom_factor_str = string_sprintf("x%1.3f", view_transform_.global_zoom_factor());
         } else if (tz <= 1 && zr < 10000) {
-          zoom_factor_str = string_sprintf("x%1.2f", global_zoom_factor_);
+          zoom_factor_str = string_sprintf("x%1.2f", view_transform_.global_zoom_factor());
         } else if (tz <= 2 && zr < 100000) {
-          zoom_factor_str = string_sprintf("x%1.1f", global_zoom_factor_);
+          zoom_factor_str = string_sprintf("x%1.1f", view_transform_.global_zoom_factor());
         } else {
-          zoom_factor_str = string_sprintf("x%1.0f", global_zoom_factor_);
+          zoom_factor_str = string_sprintf("x%1.0f", view_transform_.global_zoom_factor());
         }
       }
       {
@@ -2552,7 +2551,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       };
 
       SDL_Rect selection_rect = get_left_selection_rect();
-      SDL_FRect drawable_rect = video_rect_to_drawable_transform(video_to_zoom_space(selection_rect, zoom_rect));
+      SDL_FRect drawable_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(selection_rect, zoom_rect));
 
       if (mode_ == Mode::Split) {
         if (crop_mode_) {
@@ -2575,7 +2574,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         if (mode_ == Mode::HStack) selection_rect.x += video_width_;
         else if (mode_ == Mode::VStack) selection_rect.y += video_height_;
 
-        drawable_rect = video_rect_to_drawable_transform(video_to_zoom_space(selection_rect, zoom_rect));
+        drawable_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(selection_rect, zoom_rect));
         if (!crop_mode_ || crop_target_side_ == CropTargetSide::Right || crop_target_side_ == CropTargetSide::Both) {
           push_selection_rect(drawable_rect, 128, 128, 255);
         } else {
@@ -2795,11 +2794,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
   const bool compare_mode = show_left_ && show_right_;
 
-  const auto zoom_rect = compute_zoom_rect();
+  const auto zoom_rect = view_transform_.compute_zoom_rect();
 
   update_window_title_with_current_roi();
 
-  const Vector2D mouse_video_pos = window_to_video_position(mouse_x_, mouse_y_, zoom_rect);
+  const Vector2D mouse_video_pos = view_transform_.window_to_video_position(mouse_x_, mouse_y_, zoom_rect);
   const int mouse_video_x = mouse_video_pos.x();
   const int mouse_video_y = mouse_video_pos.y();
 
@@ -2975,7 +2974,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     if (show_left_ && (split_x > 0)) {
       const SDL_FRect src_left = {0, 0, static_cast<float>(split_x), static_cast<float>(video_height_)};
       const SDL_Rect video_quad_left = {0, 0, split_x, video_height_};
-      const SDL_FRect screen_quad_left = video_rect_to_drawable_transform(video_to_zoom_space(video_quad_left, zoom_rect));
+      const SDL_FRect screen_quad_left = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad_left, zoom_rect));
       check_sdl(SDL_RenderTexture(renderer_, get_side_texture(0), &src_left, &screen_quad_left), "left video texture render");
     }
     if (show_right_ && ((split_x < video_width_) || mode_ != Mode::Split)) {
@@ -2985,7 +2984,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
       const SDL_FRect src_right = {static_cast<float>(start_right), 0, static_cast<float>(video_width_ - start_right), static_cast<float>(video_height_)};
       const SDL_Rect video_quad_right = {right_x_offset + start_right, right_y_offset, video_width_ - start_right, video_height_};
-      const SDL_FRect screen_quad_right = video_rect_to_drawable_transform(video_to_zoom_space(video_quad_right, zoom_rect));
+      const SDL_FRect screen_quad_right = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad_right, zoom_rect));
       check_sdl(SDL_RenderTexture(renderer_, get_side_texture(1), &src_right, &screen_quad_right), "right video texture render");
     }
   }
@@ -2997,7 +2996,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   const int dst_zoomed_size = static_cast<int>(std::round(std::min(drawable_width_, drawable_height_) * 0.5F)) & -2;  // size must be an even number of pixels
   const int dst_half_zoomed_size = dst_zoomed_size / 2;
 
-  if (zoom_left_ || zoom_right_) {
+  if (view_transform_.zoom_left() || view_transform_.zoom_right()) {
     const int src_zoomed_size = 64;
     const int src_half_zoomed_size = src_zoomed_size / 2;
 
@@ -3008,11 +3007,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     SDL_Texture* render_texture = render_surface ? SDL_CreateTextureFromSurface(renderer_, render_surface) : nullptr;
 
     if (render_texture) {
-      if (zoom_left_) {
+      if (view_transform_.zoom_left()) {
         const SDL_FRect dst_zoomed_area = {0, static_cast<float>(drawable_height_ - dst_zoomed_size), static_cast<float>(dst_zoomed_size), static_cast<float>(dst_zoomed_size)};
         SDL_RenderTexture(renderer_, render_texture, nullptr, &dst_zoomed_area);
       }
-      if (zoom_right_) {
+      if (view_transform_.zoom_right()) {
         const SDL_FRect dst_zoomed_area = {static_cast<float>(drawable_width_ - dst_zoomed_size), static_cast<float>(drawable_height_ - dst_zoomed_size), static_cast<float>(dst_zoomed_size), static_cast<float>(dst_zoomed_size)};
         SDL_RenderTexture(renderer_, render_texture, nullptr, &dst_zoomed_area);
       }
@@ -3113,19 +3112,19 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
     // zoom factor
     std::string zoom_factor_str;
-    const uint64_t global_zoom_factor_rounded = lrintf(global_zoom_factor_ * 1000);
+    const uint64_t global_zoom_factor_rounded = lrintf(view_transform_.global_zoom_factor() * 1000);
     int global_zoom_factor_trailing_zeros = (global_zoom_factor_rounded % 10) > 0 ? 0 : 1;
     global_zoom_factor_trailing_zeros += (global_zoom_factor_rounded % 100) > 0 ? 0 : 1;
     global_zoom_factor_trailing_zeros += (global_zoom_factor_rounded % 1000) > 0 ? 0 : 1;
 
-    if (global_zoom_factor_ < 1e-1 || (global_zoom_factor_trailing_zeros == 0 && global_zoom_factor_rounded < 1000)) {
-      zoom_factor_str = string_sprintf("x%1.3f", global_zoom_factor_);
+    if (view_transform_.global_zoom_factor() < 1e-1 || (global_zoom_factor_trailing_zeros == 0 && global_zoom_factor_rounded < 1000)) {
+      zoom_factor_str = string_sprintf("x%1.3f", view_transform_.global_zoom_factor());
     } else if (global_zoom_factor_trailing_zeros <= 1 && global_zoom_factor_rounded < 10000) {
-      zoom_factor_str = string_sprintf("x%1.2f", global_zoom_factor_);
+      zoom_factor_str = string_sprintf("x%1.2f", view_transform_.global_zoom_factor());
     } else if (global_zoom_factor_trailing_zeros <= 2 && global_zoom_factor_rounded < 100000) {
-      zoom_factor_str = string_sprintf("x%1.1f", global_zoom_factor_);
+      zoom_factor_str = string_sprintf("x%1.1f", view_transform_.global_zoom_factor());
     } else {
-      zoom_factor_str = string_sprintf("x%1.0f", global_zoom_factor_);
+      zoom_factor_str = string_sprintf("x%1.0f", view_transform_.global_zoom_factor());
     }
 
     text_surface = TTF_RenderText_Blended(small_font_, zoom_factor_str.c_str(), 0, ZOOM_COLOR);
@@ -3270,10 +3269,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     SDL_SetRenderDrawColor(renderer_, 255, 255, 255, SDL_ALPHA_OPAQUE);
     SDL_RenderLine(renderer_, mouse_drawable_x, 0, mouse_drawable_x, drawable_height_);
 
-    if (zoom_left_) {
+    if (view_transform_.zoom_left()) {
       SDL_RenderLine(renderer_, dst_half_zoomed_size, drawable_height_ - dst_zoomed_size, dst_half_zoomed_size, drawable_height_);
     }
-    if (zoom_right_) {
+    if (view_transform_.zoom_right()) {
       SDL_RenderLine(renderer_, drawable_width_ - dst_half_zoomed_size - 1, drawable_height_ - dst_zoomed_size, drawable_width_ - dst_half_zoomed_size - 1, drawable_height_);
     }
   }
@@ -3340,72 +3339,12 @@ void Display::focus_main_window() {
   }
 }
 
-float Display::compute_zoom_factor(const float zoom_level) const {
-  return pow(ZOOM_STEP_SIZE, zoom_level);
-}
-
-Vector2D Display::compute_relative_move_offset(const Vector2D& zoom_point, const float zoom_factor) const {
-  const float zoom_factor_change = zoom_factor / global_zoom_factor_;
-
-  const Vector2D view_center((static_cast<float>(content_window_.x) + static_cast<float>(content_window_.w) / 2.0F) * video_to_window_width_factor_,
-                             (static_cast<float>(content_window_.y) + static_cast<float>(content_window_.h) / 2.0F) * video_to_window_height_factor_);
-
-  // the center point has to be moved relative to the zoom point
-  const Vector2D new_move_offset = move_offset_ - (view_center + move_offset_ - zoom_point) * (1.0F - zoom_factor_change);
-
-  return new_move_offset;
-}
-
-void Display::update_zoom_factor_and_move_offset(const float zoom_factor) {
-  const Vector2D zoom_point(static_cast<float>(video_width_) * (mode_ == Mode::HStack ? 1.0F : 0.5F), static_cast<float>(video_height_) * (mode_ == Mode::VStack ? 1.0F : 0.5F));
-  update_move_offset(compute_relative_move_offset(zoom_point, zoom_factor));
-
-  update_zoom_factor(zoom_factor);
-}
-
-void Display::update_zoom_factor(const float zoom_factor) {
-  global_zoom_factor_ = zoom_factor;
-  global_zoom_level_ = log(zoom_factor) / log(ZOOM_STEP_SIZE);
-  on_view_transform_changed();
-}
-
-void Display::update_move_offset(const Vector2D& move_offset) {
-  move_offset_ = move_offset;
-  global_center_ = Vector2D(move_offset_.x() / video_width_ + 0.5F, move_offset_.y() / video_height_ + 0.5F);
-  on_view_transform_changed();
-}
-
-Display::ZoomRect Display::compute_zoom_rect() const {
-  const Vector2D video_extent(video_width_, video_height_);
-  const Vector2D zoom_rect_start((global_center_ - global_zoom_factor_ * 0.5F) * video_extent);
-  const Vector2D zoom_rect_end((global_center_ + global_zoom_factor_ * 0.5F) * video_extent);
-  const Vector2D zoom_rect_size(zoom_rect_end - zoom_rect_start);
-  return {zoom_rect_start, zoom_rect_end, zoom_rect_size, global_zoom_factor_};
-}
-
-Vector2D Display::window_to_video_position(const int window_x_position, const int window_y_position, const Display::ZoomRect& zoom_rect, const bool floor_result) const {
-  auto floor_or_ceil = [&](const float value) -> int { return floor_result ? std::floor(value) : std::ceil(value); };
-
-  const float window_x_in_content = static_cast<float>(window_x_position - content_window_.x);
-  const float window_y_in_content = static_cast<float>(window_y_position - content_window_.y);
-  const int video_x = floor_or_ceil((window_x_in_content * video_to_window_width_factor_ - zoom_rect.start.x()) * static_cast<float>(video_width_) / zoom_rect.size.x());
-  const int video_y = floor_or_ceil((window_y_in_content * video_to_window_height_factor_ - zoom_rect.start.y()) * static_cast<float>(video_height_) / zoom_rect.size.y());
-
-  return Vector2D(video_x, video_y);
-}
-
-SDL_FRect Display::video_to_zoom_space(const SDL_Rect& video_rect, const Display::ZoomRect& zoom_rect) const {
-  // transform video coordinates to the currently zoomed area space
-  return SDL_FRect({zoom_rect.start.x() + float(video_rect.x) * zoom_rect.zoom_factor, zoom_rect.start.y() + float(video_rect.y) * zoom_rect.zoom_factor, std::min(float(video_rect.w) * zoom_rect.zoom_factor, zoom_rect.size.x()),
-                    std::min(float(video_rect.h) * zoom_rect.zoom_factor, zoom_rect.size.y())});
-};
-
 std::pair<SDL_Rect, SDL_Rect> Display::get_visible_rois_in_single_frame_coordinates() const {
-  const auto zoom_rect = compute_zoom_rect();
+  const auto zoom_rect = view_transform_.compute_zoom_rect();
 
   // p0/p1 are in *layout* coordinates in hstack/vstack, single-frame in split.
-  const Vector2D p0 = window_to_video_position(0, 0, zoom_rect, true);
-  const Vector2D p1 = window_to_video_position(window_width_, window_height_, zoom_rect, false);
+  const Vector2D p0 = view_transform_.window_to_video_position(0, 0, zoom_rect, true);
+  const Vector2D p1 = view_transform_.window_to_video_position(window_width_, window_height_, zoom_rect, false);
 
   const int lx0 = static_cast<int>(std::min(p0.x(), p1.x()));
   const int ly0 = static_cast<int>(std::min(p0.y(), p1.y()));
@@ -3494,8 +3433,8 @@ SDL_Rect Display::get_visible_roi_in_single_frame_coordinates() const {
   if (mode_ == Mode::HStack || mode_ == Mode::VStack) {
     // Prefer the side that the view center is currently over, but fall back to the other
     // if that side is not visible.
-    const auto zoom_rect = compute_zoom_rect();
-    const Vector2D center_layout = window_to_video_position(window_width_ / 2, window_height_ / 2, zoom_rect, true);
+    const auto zoom_rect = view_transform_.compute_zoom_rect();
+    const Vector2D center_layout = view_transform_.window_to_video_position(window_width_ / 2, window_height_ / 2, zoom_rect, true);
 
     const bool prefer_right = (mode_ == Mode::HStack) ? (center_layout.x() >= static_cast<float>(video_width_)) : (center_layout.y() >= static_cast<float>(video_height_));
     const SDL_Rect preferred = prefer_right ? right_roi : left_roi;
@@ -3590,13 +3529,13 @@ void Display::handle_event(const SDL_Event& event) {
           delta_zoom /= ZOOM_SLOWDOWN_RATIO;
         }
 
-        const float new_global_zoom_factor = compute_zoom_factor(global_zoom_level_ - delta_zoom);
+        const float new_global_zoom_factor = view_transform_.compute_zoom_factor(view_transform_.global_zoom_level() - delta_zoom);
 
         // logic ported from YUView's MoveAndZoomableView.cpp with thanks :)
         if (new_global_zoom_factor >= 0.001 && new_global_zoom_factor <= 10000) {
           const Vector2D zoom_point = Vector2D(static_cast<float>(mouse_x_ - content_window_.x) * video_to_window_width_factor_, static_cast<float>(mouse_y_ - content_window_.y) * video_to_window_height_factor_);
-          update_move_offset(compute_relative_move_offset(zoom_point, new_global_zoom_factor));
-          update_zoom_factor(new_global_zoom_factor);
+          view_transform_.update_move_offset(view_transform_.compute_relative_move_offset(zoom_point, new_global_zoom_factor));
+          view_transform_.update_zoom_factor(new_global_zoom_factor);
         }
       }
       break;
@@ -3608,7 +3547,7 @@ void Display::handle_event(const SDL_Event& event) {
       if (event_.motion.state & SDL_BUTTON_RMASK) {
         const auto pan_offset = Vector2D(event_.motion.xrel, event_.motion.yrel) * Vector2D(video_to_window_width_factor_, video_to_window_height_factor_) / Vector2D(drawable_to_window_width_factor_, drawable_to_window_height_factor_);
 
-        update_move_offset(move_offset_ + pan_offset);
+        view_transform_.update_move_offset(view_transform_.move_offset() + pan_offset);
       }
 
       if (show_metadata_) {
@@ -3624,7 +3563,7 @@ void Display::handle_event(const SDL_Event& event) {
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
       if (event_.button.button == SDL_BUTTON_LEFT && (save_selected_area_ || crop_mode_) && selection_state_ == SelectionState::None) {
         selection_state_ = SelectionState::Started;
-        selection_start_ = window_to_video_position(mouse_x_, mouse_y_, compute_zoom_rect());
+        selection_start_ = view_transform_.window_to_video_position(mouse_x_, mouse_y_, view_transform_.compute_zoom_rect());
 
         // Check if the selection is outside the left video frame
         selection_wrap_ = (mode_ == Mode::HStack && selection_start_.x() >= video_width_) || (mode_ == Mode::VStack && selection_start_.y() >= video_height_);
@@ -3803,7 +3742,7 @@ void Display::handle_event(const SDL_Event& event) {
           diff_processor_.toggle_subtraction_mode();
           break;
         case SDLK_Z:
-          zoom_left_ = true;
+          view_transform_.set_zoom_left(true);
           break;
         case SDLK_C: {
           if (is_clipboard_mod_pressed()) {
@@ -3814,7 +3753,7 @@ void Display::handle_event(const SDL_Event& event) {
 
             notify_user(string_sprintf("Copied to clipboard: %s", previous_left_frame_secs_str.c_str()));
           } else {
-            zoom_right_ = true;
+            view_transform_.set_zoom_right(true);
           }
           break;
         }
@@ -3937,45 +3876,44 @@ void Display::handle_event(const SDL_Event& event) {
           break;
         case SDLK_4:
         case SDLK_KP_4:
-          update_zoom_factor_and_move_offset(std::min(video_to_window_width_factor_ / drawable_to_window_width_factor_, video_to_window_height_factor_ / drawable_to_window_height_factor_));
+          view_transform_.update_zoom_factor_and_move_offset(std::min(video_to_window_width_factor_ / drawable_to_window_width_factor_, video_to_window_height_factor_ / drawable_to_window_height_factor_));
           break;
         case SDLK_5:
         case SDLK_KP_5:
-          update_zoom_factor_and_move_offset(0.5F);
+          view_transform_.update_zoom_factor_and_move_offset(0.5F);
           break;
         case SDLK_6:
         case SDLK_KP_6:
-          update_zoom_factor_and_move_offset(1.0F);
+          view_transform_.update_zoom_factor_and_move_offset(1.0F);
           break;
         case SDLK_7:
         case SDLK_KP_7:
-          update_zoom_factor_and_move_offset(2.0F);
+          view_transform_.update_zoom_factor_and_move_offset(2.0F);
           break;
         case SDLK_8:
         case SDLK_KP_8:
-          update_zoom_factor_and_move_offset(4.0F);
+          view_transform_.update_zoom_factor_and_move_offset(4.0F);
           break;
         case SDLK_9:
         case SDLK_KP_9:
-          update_zoom_factor_and_move_offset(8.0F);
+          view_transform_.update_zoom_factor_and_move_offset(8.0F);
           break;
         case SDLK_E: {
           SDL_GetMouseState(&mouse_x_, &mouse_y_);
 
-          const auto zoom_rect = compute_zoom_rect();
-          const Vector2D mouse_video = window_to_video_position(mouse_x_, mouse_y_, zoom_rect);
-          const Vector2D center_video = window_to_video_position(content_window_.x + content_window_.w / 2, content_window_.y + content_window_.h / 2, zoom_rect);
+          const auto zoom_rect = view_transform_.compute_zoom_rect();
+          const Vector2D mouse_video = view_transform_.window_to_video_position(mouse_x_, mouse_y_, zoom_rect);
+          const Vector2D center_video = view_transform_.window_to_video_position(content_window_.x + content_window_.w / 2, content_window_.y + content_window_.h / 2, zoom_rect);
 
-          update_move_offset(move_offset_ + (center_video - mouse_video) * global_zoom_factor_);
+          view_transform_.update_move_offset(view_transform_.move_offset() + (center_video - mouse_video) * view_transform_.global_zoom_factor());
           break;
         }
         case SDLK_R:
           if (is_shift_down) {
             toggle_crop_mode_for_side(CropTargetSide::Right);
           } else {
-            move_offset_ = Vector2D(0.0F, 0.0F);
-            global_center_ = Vector2D(0.5F, 0.5F);
-            update_zoom_factor(1.0F);
+            view_transform_.reset_pan();
+            view_transform_.update_zoom_factor(1.0F);
           }
           break;
         case SDLK_LEFT:
@@ -4092,10 +4030,10 @@ void Display::handle_event(const SDL_Event& event) {
     case SDL_EVENT_KEY_UP:
       switch (event_.key.key) {
         case SDLK_Z:
-          zoom_left_ = false;
+          view_transform_.set_zoom_left(false);
           break;
         case SDLK_C:
-          zoom_right_ = false;
+          view_transform_.set_zoom_right(false);
           break;
         case SDLK_X:
           show_fps_ = false;

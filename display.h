@@ -19,6 +19,7 @@
 #include "rgb_frame_cache.h"
 #include "row_workers.h"
 #include "scope_window.h"
+#include "view_transform.h"
 extern "C" {
 #include <libavutil/frame.h>
 }
@@ -141,8 +142,6 @@ class Display {
   bool quit_{false};
   PlaybackController playback_;
   bool swap_left_right_{false};
-  bool zoom_left_{false};
-  bool zoom_right_{false};
   bool show_left_{true};
   bool show_right_{true};
   bool show_hud_{true};
@@ -186,10 +185,24 @@ class Display {
   std::string previous_right_frame_key_;
   bool timer_based_update_performed_;
 
-  float global_zoom_level_{0.0F};
-  float global_zoom_factor_{1.0F};
-  Vector2D move_offset_{0.0F, 0.0F};
-  Vector2D global_center_{0.5F, 0.5F};
+  // Adapter that exposes Display's layout fields as the read-only interface
+  // ViewTransform consumes. Will be replaced with a reference to WindowLayout
+  // in phase 9.
+  class LayoutAdapter : public ViewTransformLayout {
+   public:
+    explicit LayoutAdapter(const Display& d) : d_(d) {}
+    SDL_Rect content_window() const override { return d_.content_window_; }
+    float video_to_window_width_factor() const override { return d_.video_to_window_width_factor_; }
+    float video_to_window_height_factor() const override { return d_.video_to_window_height_factor_; }
+    int video_width() const override { return d_.video_width_; }
+    int video_height() const override { return d_.video_height_; }
+    DisplayMode mode() const override { return d_.mode_; }
+
+   private:
+    const Display& d_;
+  };
+  LayoutAdapter layout_adapter_;
+  ViewTransform view_transform_;
 
   SDL sdl_;
   TTF_Font* small_font_{nullptr};
@@ -336,27 +349,12 @@ class Display {
   SDL_Rect get_left_selection_rect() const;
   Vector2D wrap_to_left_frame(const Vector2D& video_position) const;
   void refresh_selection_end_from_mouse();
-  void on_view_transform_changed();
   void draw_selection_rect();
   void possibly_save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame);
   void possibly_apply_crop();
   void save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame, const SDL_Rect& selection_rect);
 
-  float compute_zoom_factor(const float zoom_level) const;
-  Vector2D compute_relative_move_offset(const Vector2D& zoom_point, const float zoom_factor) const;
-  void update_zoom_factor_and_move_offset(const float zoom_factor);
-  void update_zoom_factor(const float zoom_factor);
-  void update_move_offset(const Vector2D& move_offset);
-
-  struct ZoomRect {
-    Vector2D start;
-    Vector2D end;
-    Vector2D size;
-    float zoom_factor;
-  };
-  ZoomRect compute_zoom_rect() const;
-  Vector2D window_to_video_position(const int window_x_position, const int window_y_position, const ZoomRect& zoom_rect, const bool floor_result = true) const;
-  SDL_FRect video_to_zoom_space(const SDL_Rect& video_rect, const ZoomRect& zoom_rect) const;
+  using ZoomRect = ViewTransform::ZoomRect;
 
  public:
   Display(const int display_number,
