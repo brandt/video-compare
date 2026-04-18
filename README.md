@@ -228,7 +228,7 @@ see all supported options.
 - `M`: Print image similarity metrics to console
 - `Q`: Toggle on-screen quality metrics overlay (PSNR/SSIM live, VMAF on pause)
 - `\``: Auto-align right video: shift to buffered right frame best matching current left frame (by PSNR)
-- `F`: Save both frames and the on-screen content as PNG images
+- `F`: Save both frames and the on-screen content as JPEG-XL images
 - `I`: Toggle fast/high-quality resizing for input alignment
 - `T`: Toggle nearest-neighbor/bilinear video texture filtering
 - `Y`: Cycle through subtraction modes
@@ -246,7 +246,7 @@ see all supported options.
 - `Shift+A`: Seek to the previous frame (best with intra-frame formats)
 - `Shift+M`: Cycle display mode
 - `Shift+S`: Cycle aspect view mode
-- `Shift+F`: Select a region and save cutouts as PNGs
+- `Shift+F`: Select a region and save cutouts as JPEG-XL images
 - `Shift+X`: Print display state to console
 - `Shift+W`: Restore saved window size
 - `Ctrl+W`: Restore startup window size

@@ -17,7 +17,6 @@
 #include "ffmpeg.h"
 #include "format_converter.h"
 #include "jxl_saver.h"
-#include "png_saver.h"
 #include "scope_window.h"
 #include "source_code_pro_regular_ttf.h"
 #include "version.h"
@@ -1481,11 +1480,7 @@ void Display::update_difference(std::array<uint8_t*, 3> planes_left, std::array<
 
 void save_frame_image(const AVFrame* frame, const std::string& filename, std::atomic_bool& error_occurred) {
   try {
-    if (frame->format == AV_PIX_FMT_X2RGB10LE) {
-      JxlSaver::save(frame, filename);
-    } else {
-      PngSaver::save(frame, filename);
-    }
+    JxlSaver::save(frame, filename);
   } catch (const std::ios_base::failure& e) {
     std::cerr << "Error saving image to file: " << filename << std::endl;
     error_occurred = true;
@@ -1554,15 +1549,9 @@ void Display::save_image_frames_core(const AVFrame* left_frame, const AVFrame* r
   const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
   const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
   const bool stems_equal = (left_stem == right_stem);
-  // JXL for HDR content (X2RGB10LE in SDL passthrough, or any frame carrying
-  // PQ / HLG transfer on the GPU-mode RGB cache). PNG otherwise.
-  const bool is_hdr_output = (left_frame->format == AV_PIX_FMT_X2RGB10LE) ||
-                             left_frame->color_trc == AVCOL_TRC_SMPTE2084 ||
-                             left_frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
-  const char* frame_ext = is_hdr_output ? "jxl" : "png";
-  const std::string left_filename = string_sprintf("%s%s_%04d.%s", left_stem.c_str(), stems_equal ? "_left" : "", saved_image_number_, frame_ext);
-  const std::string right_filename = string_sprintf("%s%s_%04d.%s", right_stem.c_str(), stems_equal ? "_right" : "", saved_image_number_, frame_ext);
-  const std::string osd_filename = string_sprintf("%s_%s_osd_%04d.png", left_stem.c_str(), right_stem.c_str(), saved_image_number_);
+  const std::string left_filename = string_sprintf("%s%s_%04d.jxl", left_stem.c_str(), stems_equal ? "_left" : "", saved_image_number_);
+  const std::string right_filename = string_sprintf("%s%s_%04d.jxl", right_stem.c_str(), stems_equal ? "_right" : "", saved_image_number_);
+  const std::string osd_filename = string_sprintf("%s_%s_osd_%04d.jxl", left_stem.c_str(), right_stem.c_str(), saved_image_number_);
 
   auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return save_frame_image(frame, filename, error_occurred); };
 
@@ -2528,15 +2517,9 @@ void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right
   const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
   const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
   const bool stems_equal = (left_stem == right_stem);
-  // JXL for HDR content (X2RGB10LE in SDL passthrough, or any frame carrying
-  // PQ / HLG transfer on the GPU-mode RGB cache). PNG otherwise.
-  const bool is_hdr_output = (left_frame->format == AV_PIX_FMT_X2RGB10LE) ||
-                             left_frame->color_trc == AVCOL_TRC_SMPTE2084 ||
-                             left_frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
-  const char* cutout_ext = is_hdr_output ? "jxl" : "png";
-  const std::string left_filename = string_sprintf("%s%s_cutout_%04d.%s", left_stem.c_str(), stems_equal ? "_left" : "", saved_selected_image_number_, cutout_ext);
-  const std::string right_filename = string_sprintf("%s%s_cutout_%04d.%s", right_stem.c_str(), stems_equal ? "_right" : "", saved_selected_image_number_, cutout_ext);
-  const std::string concatenated_filename = string_sprintf("%s_%s_cutout_concat_%04d.%s", left_stem.c_str(), right_stem.c_str(), saved_selected_image_number_, cutout_ext);
+  const std::string left_filename = string_sprintf("%s%s_cutout_%04d.jxl", left_stem.c_str(), stems_equal ? "_left" : "", saved_selected_image_number_);
+  const std::string right_filename = string_sprintf("%s%s_cutout_%04d.jxl", right_stem.c_str(), stems_equal ? "_right" : "", saved_selected_image_number_);
+  const std::string concatenated_filename = string_sprintf("%s_%s_cutout_concat_%04d.jxl", left_stem.c_str(), right_stem.c_str(), saved_selected_image_number_);
 
   auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return save_frame_image(frame, filename, error_occurred); };
 
