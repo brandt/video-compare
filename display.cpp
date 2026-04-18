@@ -274,7 +274,7 @@ Display::Display(const int display_number,
 
   refresh_display_side_mapping();
 
-  rebuild_help_textures();
+  overlay_.rebuild_help(small_font_, big_font_, renderer_, gpu_renderer_active_, drawable_width_);
 
   if (start_in_fullscreen_) {
     set_fullscreen(true);
@@ -294,20 +294,9 @@ Display::~Display() {
   if (!gpu_renderer_active_) {
     SDL_DestroyTexture(side_ui_[LEFT.as_simple_index()].text_texture);
     SDL_DestroyTexture(side_ui_[RIGHT.as_simple_index()].text_texture);
-
-    if (message_texture_ != nullptr) {
-      SDL_DestroyTexture(message_texture_);
-    }
-
-    for (auto help_texture : help_textures_) {
-      SDL_DestroyTexture(help_texture);
-    }
   }
 
-  for (auto s : help_surfaces_) SDL_DestroySurface(s);
-  help_surfaces_.clear();
-  for (auto s : metadata_surfaces_) SDL_DestroySurface(s);
-  metadata_surfaces_.clear();
+  // OverlayManager and MetadataPanel clean up their own textures/surfaces.
 
   TTF_CloseFont(small_font_);
   TTF_CloseFont(big_font_);
@@ -623,81 +612,9 @@ void Display::rebuild_side_ui_textures() {
   rebuild_side(RIGHT, format_right_file_label(left_file_name_, right_file_name_, active_right_index_ + 1));
 }
 
-void Display::rebuild_help_textures() {
-  // Wrapping and layout depend on drawable width, so everything is rebuilt.
-  for (auto help_texture : help_textures_) SDL_DestroyTexture(help_texture);
-  help_textures_.clear();
-  for (auto s : help_surfaces_) SDL_DestroySurface(s);
-  help_surfaces_.clear();
-  help_total_height_ = 0;
-
-  bool primary_color = true;
-
-  // Helper to render one line and track its height for scrolling math.
-  auto add_help_texture = [&](TTF_Font* font, const std::string& text) {
-    SDL_Surface* surface = TTF_RenderText_Blended_Wrapped(font, text.c_str(), 0, primary_color ? HELP_TEXT_PRIMARY_COLOR : HELP_TEXT_ALTERNATE_COLOR, drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2);
-    if (!surface) return;
-
-    if (gpu_renderer_active_) {
-      SDL_Surface* rgba = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
-      SDL_DestroySurface(surface);
-      if (!rgba) return;
-      help_total_height_ += rgba->h;
-      help_surfaces_.push_back(rgba);
-    } else {
-      SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, surface);
-      SDL_DestroySurface(surface);
-      float tw, th; SDL_GetTextureSize(texture, &tw, &th);
-      help_total_height_ += static_cast<int>(th);
-      help_textures_.push_back(texture);
-    }
-  };
-
-  add_help_texture(small_font_, " ");
-
-  const auto& sections = get_control_sections();
-  for (size_t i = 0; i < sections.size(); ++i) {
-    const auto& section = sections[i];
-
-    // Force section headers to white, underlined, and uppercase.
-    primary_color = true;
-
-    TTF_SetFontStyle(big_font_, TTF_STYLE_BOLD | TTF_STYLE_UNDERLINE);
-    add_help_texture(big_font_, to_upper_case(section.title));
-    TTF_SetFontStyle(big_font_, TTF_STYLE_NORMAL);
-
-    // Reset so the first section item toggles to secondary color (light yellow).
-    primary_color = true;
-
-    for (size_t j = 0; j < section.entries.size(); ++j) {
-      const auto& entry = section.entries[j];
-      primary_color = !primary_color;
-
-      if (entry.key.empty()) {
-        add_help_texture(small_font_, entry.description);
-        add_help_texture(small_font_, " ");
-      } else {
-        add_help_texture(small_font_, string_sprintf(" %-16s %s", entry.key.c_str(), entry.description.c_str()));
-      }
-    }
-
-    if (i + 1 < sections.size()) {
-      add_help_texture(small_font_, " ");
-    }
-  }
-}
-
 void Display::clamp_overlay_offsets() {
-  auto clamp_offset = [&](int& y_offset, const int total_height, const size_t count) {
-    const int min_offset = drawable_height_ - total_height - static_cast<int>(count) * HELP_TEXT_LINE_SPACING;
-    y_offset = std::max(y_offset, min_offset);
-    y_offset = std::min(y_offset, 0);
-  };
-
-  const size_t help_count = gpu_renderer_active_ ? help_surfaces_.size() : help_textures_.size();
-  const size_t meta_count = gpu_renderer_active_ ? metadata_surfaces_.size() : metadata_textures_.size();
-  clamp_offset(help_y_offset_, help_total_height_, help_count);
-  clamp_offset(metadata_y_offset_, metadata_total_height_, meta_count);
+  overlay_.clamp_help_scroll(drawable_height_, gpu_renderer_active_, HELP_TEXT_LINE_SPACING);
+  metadata_panel_.clamp_scroll(drawable_height_, gpu_renderer_active_, HELP_TEXT_LINE_SPACING);
 }
 
 float Display::compute_content_aspect_ratio() const {
@@ -893,8 +810,8 @@ void Display::handle_window_resize(const bool reset_forced_size_guard, const boo
 
   rebuild_fonts();
   rebuild_side_ui_textures();
-  rebuild_help_textures();
-  metadata_dirty_ = true;
+  overlay_.rebuild_help(small_font_, big_font_, renderer_, gpu_renderer_active_, drawable_width_);
+  metadata_panel_.mark_dirty();
 
   // Clamp overlay scroll positions to the new size and refresh ROI-dependent title.
   clamp_overlay_offsets();
@@ -1116,58 +1033,6 @@ AVFrame* crop_rgb_frame(const AVFrame* src, const SDL_Rect& roi, SDL_Rect* out_e
   return cropped_frame;
 }
 
-void Display::render_help() {
-  SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-  SDL_SetRenderDrawColor(renderer_, 0, 0, 0, BACKGROUND_ALPHA * 3 / 2);
-  SDL_RenderFillRect(renderer_, nullptr);
-
-  int y = help_y_offset_;
-
-  for (size_t i = 0; i < help_textures_.size(); i++) {
-    float fw, fh;
-    SDL_GetTextureSize(help_textures_[i], &fw, &fh);
-
-    SDL_FRect screen_area = {static_cast<float>(HELP_TEXT_HORIZONTAL_MARGIN), static_cast<float>(y), fw, fh};
-    SDL_RenderTexture(renderer_, help_textures_[i], nullptr, &screen_area);
-
-    y += static_cast<int>(fh) + HELP_TEXT_LINE_SPACING;
-  }
-}
-
-void Display::render_metadata_overlay() {
-  ensure_metadata_textures_current();
-
-  SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-  SDL_SetRenderDrawColor(renderer_, 0, 0, 0, BACKGROUND_ALPHA * 3 / 2);
-  SDL_RenderFillRect(renderer_, nullptr);
-
-  const int table_width = drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2;
-  const int table_x = HELP_TEXT_HORIZONTAL_MARGIN;
-
-  // Calculate the starting Y position to center the table vertically
-  int y;
-
-  if (mode_ == Mode::VStack && metadata_total_height_ < drawable_height_ / 2) {
-    y = (drawable_height_ / 2 - metadata_total_height_) / 2;
-  } else if (mode_ != Mode::VStack && metadata_total_height_ < drawable_height_) {
-    y = (drawable_height_ - metadata_total_height_) / 2;
-  } else {
-    y = metadata_y_offset_ + 10;
-  }
-
-  for (size_t i = 0; i < metadata_textures_.size(); i++) {
-    float fw, fh;
-    SDL_GetTextureSize(metadata_textures_[i], &fw, &fh);
-    int w = static_cast<int>(fw), h = static_cast<int>(fh);
-
-    int x_offset = (table_width - w) / 2;
-
-    SDL_FRect screen_area = {static_cast<float>(table_x + x_offset), static_cast<float>(y), fw, fh};
-    SDL_RenderTexture(renderer_, metadata_textures_[i], nullptr, &screen_area);
-
-    y += h + HELP_TEXT_LINE_SPACING;
-  }
-}
 
 void Display::render_quality_metrics_overlay() {
   const std::string vmaf_display = (last_vmaf_ == "n/a") ? std::string("n/a (pause to compute)") : last_vmaf_;
@@ -1224,163 +1089,13 @@ void Display::refresh_display_side_mapping() {
   displayed_right_side_ = swap_left_right_ ? LEFT : RIGHT;
 }
 
-void Display::build_metadata_textures(const VideoMetadata& left_metadata, const VideoMetadata& right_metadata) {
-  constexpr char TOKENIZER = ',';
-
-  for (auto texture : metadata_textures_) SDL_DestroyTexture(texture);
-  metadata_textures_.clear();
-  for (auto s : metadata_surfaces_) SDL_DestroySurface(s);
-  metadata_surfaces_.clear();
-  metadata_total_height_ = 0;
-
-  auto add_metadata_texture = [&](TTF_Font* font, const std::string& text, bool primary_color, bool is_header) {
-    // choose text color based on content type and alternating pattern
-    SDL_Color text_color = is_header ? HELP_TEXT_PRIMARY_COLOR : (primary_color ? HELP_TEXT_PRIMARY_COLOR : HELP_TEXT_ALTERNATE_COLOR);
-
-    // render text with word wrapping to fit available width
-    SDL_Surface* surface = TTF_RenderText_Blended_Wrapped(font, text.c_str(), 0, text_color, drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2);
-    if (!surface) return;
-
-    if (gpu_renderer_active_) {
-      SDL_Surface* rgba = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
-      SDL_DestroySurface(surface);
-      if (!rgba) return;
-      metadata_total_height_ += rgba->h + HELP_TEXT_LINE_SPACING;
-      metadata_surfaces_.push_back(rgba);
-    } else {
-      SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, surface);
-      SDL_DestroySurface(surface);
-      float tw, th; SDL_GetTextureSize(texture, &tw, &th);
-      metadata_total_height_ += static_cast<int>(th) + HELP_TEXT_LINE_SPACING;
-      metadata_textures_.push_back(texture);
-    }
-  };
-
-  // Calculate max length for column sizing
-  auto calculate_max_length = [](const VideoMetadata& metadata) -> size_t {
-    size_t max_length = 0;
-    for (const auto& kv : metadata.properties) {
-      // comma tokenize value and find max length among all tokens
-      std::vector<std::string> tokens = string_split(kv.second, TOKENIZER);
-      for (const auto& token : tokens) {
-        max_length = std::max(max_length, token.length());
-      }
-    }
-    return max_length;
-  };
-
-  auto left_max_length = calculate_max_length(left_metadata);
-  auto right_max_length = calculate_max_length(right_metadata);
-
-  const std::vector<std::string> properties(MetadataProperties::ALL, MetadataProperties::ALL + MetadataProperties::COUNT);
-
-  // calculate available display width (accounting for margins)
-  const int available_width = drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2;
-
-  // dynamic column width calculation
-  constexpr int spacing = 2;
-
-  // calculate initial column widths based on content
-  int prop_cols = MetadataProperties::LONGEST + spacing;
-  int left_cols = left_max_length + spacing;
-  int right_cols = right_max_length + spacing;
-  int total_cols = prop_cols + left_cols + right_cols;
-
-  // determine character widths for both font sizes to choose optimal font
-  const std::string test_text = "FOR COMPUTING THE AVERAGE CHARACTER WIDTHS, WE NEED TO TEST THE WIDTH OF A STRING";
-
-  int char_width_small = 10;
-  int char_width_big = 14;
-
-  int text_width, text_height;
-
-  if (TTF_GetStringSize(small_font_, test_text.c_str(), 0, &text_width, &text_height)) {
-    char_width_small = text_width / test_text.length() + 1;
-  }
-  if (TTF_GetStringSize(big_font_, test_text.c_str(), 0, &text_width, &text_height)) {
-    char_width_big = text_width / test_text.length() + 1;
-  }
-
-  // calculate how many characters can fit per line with each font
-  const int max_cols_per_line_big = available_width / char_width_big;
-  const int max_cols_per_line_small = available_width / char_width_small;
-
-  // choose the largest font that can accommodate all columns
-  const int char_width = max_cols_per_line_big >= total_cols ? char_width_big : char_width_small;
-  auto font = max_cols_per_line_big >= total_cols ? big_font_ : small_font_;
-
-  const int max_cols_per_line = available_width / char_width;
-
-  // if content is too wide for the window, proportionally reduce column widths
-  if (total_cols > max_cols_per_line) {
-    const int overshoot = total_cols - max_cols_per_line;
-
-    // distribute the overshoot proportionally across columns
-    // property column gets priority (2x weight) since it's the least important
-    const int prop_cols_overshoot = std::min(prop_cols, overshoot * prop_cols / total_cols * 2);
-    const int left_cols_overshoot = std::max(0, overshoot - prop_cols_overshoot) * left_cols / (left_cols + right_cols);
-    const int right_cols_overshoot = overshoot - prop_cols_overshoot - left_cols_overshoot;
-
-    prop_cols -= prop_cols_overshoot;
-    left_cols -= left_cols_overshoot;
-    right_cols -= right_cols_overshoot;
-  }
-
-  // generate table header
-  TTF_SetFontStyle(font, TTF_STYLE_ITALIC | TTF_STYLE_UNDERLINE);
-  add_metadata_texture(font, string_sprintf("%-*s%-*s%-*s", prop_cols, "", left_cols, "LEFT", right_cols, "RIGHT"), true, false);
-  TTF_SetFontStyle(font, TTF_STYLE_NORMAL);
-
-  bool primary_color = false;
-
-  for (const auto& prop : properties) {
-    std::string prop_value = to_upper_case(prop);
-
-    // extract values for both videos
-    std::string left_value = left_metadata.get(prop);
-    std::string right_value = right_metadata.get(prop);
-
-    // tokenize values by comma
-    std::vector<std::string> left_tokens = string_split(left_value, TOKENIZER);
-    std::vector<std::string> right_tokens = string_split(right_value, TOKENIZER);
-
-    // determine how many lines we need for this property
-    size_t max_tokens = std::max(left_tokens.size(), right_tokens.size());
-
-    for (size_t i = 0; i < max_tokens; i++) {
-      std::string current_prop_value = (i == 0) ? prop_value : "";
-      std::string current_left_value = (i < left_tokens.size()) ? left_tokens[i] : "";
-      std::string current_right_value = (i < right_tokens.size()) ? right_tokens[i] : "";
-
-      // text truncation for narrow columns
-      if (static_cast<int>(current_prop_value.length()) >= prop_cols) {
-        current_prop_value = prop_cols > 1 ? current_prop_value.substr(0, prop_cols - 2) + "… " : "";
-      }
-      if (static_cast<int>(current_left_value.length()) >= left_cols) {
-        current_left_value = "…" + current_left_value.substr(current_left_value.length() - left_cols + 2) + " ";
-      }
-      if (static_cast<int>(current_right_value.length()) >= right_cols) {
-        current_right_value = "…" + current_right_value.substr(current_right_value.length() - right_cols + 2) + " ";
-      }
-
-      add_metadata_texture(font, string_sprintf("%-*s%-*s%-*s", prop_cols, current_prop_value.c_str(), left_cols, current_left_value.c_str(), right_cols, current_right_value.c_str()), primary_color, false);
-
-      primary_color = !primary_color;
-    }
-  }
-}
 
 void Display::update_metadata(const VideoMetadata left_metadata, const VideoMetadata right_metadata) {
-  left_metadata_ = left_metadata;
-  right_metadata_ = right_metadata;
-
-  metadata_dirty_ = true;
+  metadata_panel_.update(left_metadata, right_metadata);
 }
 
 void Display::update_right_video(const std::string& right_file_name, const VideoMetadata right_metadata) {
-  // Update right metadata
-  right_metadata_ = right_metadata;
-  metadata_dirty_ = true;
+  metadata_panel_.update(metadata_panel_.left(), right_metadata);
   right_file_name_ = right_file_name;
 
   // Update right file stem (used by both renderer paths for save filenames)
@@ -1460,17 +1175,6 @@ SDL_Surface* Display::render_text_with_fallback(const std::string& text) {
   return surface;
 }
 
-void Display::ensure_metadata_textures_current() {
-  if (metadata_dirty_ || (swap_left_right_ != last_swap_left_right_state_)) {
-    last_swap_left_right_state_ = swap_left_right_;
-
-    const VideoMetadata& left_meta = (displayed_left_side_.is_left()) ? left_metadata_ : right_metadata_;
-    const VideoMetadata& right_meta = (displayed_right_side_.is_right()) ? right_metadata_ : left_metadata_;
-    build_metadata_textures(left_meta, right_meta);
-
-    metadata_dirty_ = false;
-  }
-}
 
 void Display::refresh_selection_end_from_mouse() {
   if (selection_.state() != SelectionState::Started) {
@@ -1606,7 +1310,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   const bool has_updated_left_frame = previous_left_frame_key_ != left_frame_key;
   const bool has_updated_right_frame = previous_right_frame_key_ != right_frame_key;
 
-  if (!input_received_ && !has_updated_left_frame && !has_updated_right_frame && !timer_based_update_performed_ && pending_message_.empty()) {
+  if (!input_received_ && !has_updated_left_frame && !has_updated_right_frame && !timer_based_update_performed_ && overlay_.pending_message().empty()) {
     return false;
   }
 
@@ -2324,14 +2028,14 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // Message toast — fading center-screen notification. Independent of
     // show_hud_.  On arrival, move pending_message_ to the "active" slot so
     // it persists through the fade even after pending_message_ is cleared.
-    if (!pending_message_.empty()) {
-      gpu_active_message_ = pending_message_;
-      pending_message_.clear();
-      message_shown_at_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
+    if (!overlay_.pending_message().empty()) {
+      overlay_.set_gpu_active_message(overlay_.pending_message());
+      overlay_.clear_pending_message();
+      overlay_.set_message_shown_at(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()));
     }
-    if (!gpu_active_message_.empty()) {
+    if (!overlay_.gpu_active_message().empty()) {
       const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
-      const float elapsed_s = (now - message_shown_at_).count() / 1000.0f;
+      const float elapsed_s = (now - overlay_.message_shown_at()).count() / 1000.0f;
       constexpr float kHoldSeconds = 3.0f;
       constexpr float kFadeSeconds = 0.5f;
       float keep_alpha;
@@ -2341,9 +2045,9 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         keep_alpha = std::max(std::sqrt(1.0f - (elapsed_s - kHoldSeconds) / kFadeSeconds), 0.0f);
       }
       if (keep_alpha <= 0.0f) {
-        gpu_active_message_.clear();
+        overlay_.clear_gpu_active_message();
       } else {
-        SDL_Surface* raw = TTF_RenderText_Blended(big_font_, gpu_active_message_.c_str(), 0, TEXT_COLOR);
+        SDL_Surface* raw = TTF_RenderText_Blended(big_font_, overlay_.gpu_active_message().c_str(), 0, TEXT_COLOR);
         if (raw) {
           SDL_Surface* rgba = SDL_ConvertSurface(raw, SDL_PIXELFORMAT_RGBA32);
           SDL_DestroySurface(raw);
@@ -2434,7 +2138,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // Live quality metrics overlay (PSNR / SSIM / VMAF) — rendered at the
     // top-right corner when show_quality_metrics_ is on. Suppressed while
     // a full-screen panel is visible (they'd otherwise peek through).
-    if (show_quality_metrics_ && !show_help_ && !show_metadata_) {
+    if (show_quality_metrics_ && !overlay_.show_help() && !overlay_.show_metadata()) {
       const std::string vmaf_display = (last_vmaf_ == "n/a") ? std::string("n/a (pause to compute)") : last_vmaf_;
       const std::array<std::string, 3> metric_lines = {
           std::string("PSNR: ") + last_psnr_ + " dB",
@@ -2495,7 +2199,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // while a full-screen panel is visible.  The panel's own background
     // fully dims the area where HUD would have been, so the result is
     // visually equivalent to the SDL path.
-    if (show_help_ || show_metadata_) {
+    if (overlay_.show_help() || overlay_.show_metadata()) {
       // Clear previously-accumulated text overlays (HUD labels, positions,
       // FPS, etc.) so they don't poke through the panel.
       text_ops.clear();
@@ -2507,11 +2211,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       push_rect(0, 0, static_cast<float>(drawable_width_), static_cast<float>(drawable_height_),
                 0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 3 / 2));
 
-      if (show_help_) {
-        int y = help_y_offset_;
-        for (SDL_Surface* s : help_surfaces_) {
+      if (overlay_.show_help()) {
+        int y = overlay_.help_scroll_offset();
+        for (SDL_Surface* s : overlay_.help_surfaces()) {
           if (!s) continue;
-          // Skip lines fully outside the visible area.
           if (y + s->h > 0 && y < drawable_height_) {
             GpuRenderer::TextOverlayOp t{};
             t.rgba_data = s->pixels;
@@ -2525,22 +2228,27 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
           }
           y += s->h + HELP_TEXT_LINE_SPACING;
         }
-      } else if (show_metadata_) {
-        ensure_metadata_textures_current();
+      } else if (overlay_.show_metadata()) {
+        metadata_panel_.ensure_current(swap_left_right_,
+                                       displayed_left_side_.is_left(),
+                                       displayed_right_side_.is_right(),
+                                       small_font_, big_font_, renderer_,
+                                       gpu_renderer_active_, drawable_width_);
 
         const int table_width = drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2;
         const int table_x = HELP_TEXT_HORIZONTAL_MARGIN;
 
         int y;
-        if (mode_ == Mode::VStack && metadata_total_height_ < drawable_height_ / 2) {
-          y = (drawable_height_ / 2 - metadata_total_height_) / 2;
-        } else if (mode_ != Mode::VStack && metadata_total_height_ < drawable_height_) {
-          y = (drawable_height_ - metadata_total_height_) / 2;
+        const int meta_total_h = metadata_panel_.total_height();
+        if (mode_ == Mode::VStack && meta_total_h < drawable_height_ / 2) {
+          y = (drawable_height_ / 2 - meta_total_h) / 2;
+        } else if (mode_ != Mode::VStack && meta_total_h < drawable_height_) {
+          y = (drawable_height_ - meta_total_h) / 2;
         } else {
-          y = metadata_y_offset_ + 10;
+          y = metadata_panel_.scroll_offset() + 10;
         }
 
-        for (SDL_Surface* s : metadata_surfaces_) {
+        for (SDL_Surface* s : metadata_panel_.surfaces()) {
           if (!s) continue;
           const int x_offset = (table_width - s->w) / 2;
           if (y + s->h > 0 && y < drawable_height_) {
@@ -3078,37 +2786,39 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   }
 
   // render (optional) message
-  if (!pending_message_.empty()) {
-    message_shown_at_ = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
-    text_surface = TTF_RenderText_Blended(big_font_, pending_message_.c_str(), 0, TEXT_COLOR);
+  if (!overlay_.pending_message().empty()) {
+    overlay_.set_message_shown_at(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()));
+    text_surface = TTF_RenderText_Blended(big_font_, overlay_.pending_message().c_str(), 0, TEXT_COLOR);
 
-    if (message_texture_ != nullptr) {
-      SDL_DestroyTexture(message_texture_);
+    if (overlay_.message_texture() != nullptr) {
+      SDL_DestroyTexture(overlay_.message_texture());
     }
-    message_texture_ = SDL_CreateTextureFromSurface(renderer_, text_surface);
+    overlay_.message_texture() = SDL_CreateTextureFromSurface(renderer_, text_surface);
 
-    message_width_ = text_surface->w;
-    message_height_ = text_surface->h;
+    overlay_.message_width() = text_surface->w;
+    overlay_.message_height() = text_surface->h;
     SDL_DestroySurface(text_surface);
 
-    pending_message_.clear();
+    overlay_.clear_pending_message();
   }
-  if (message_texture_ != nullptr) {
+  if (overlay_.message_texture() != nullptr) {
     std::chrono::milliseconds now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
-    const float elapsed_s = (now - message_shown_at_).count() / 1000.0F;
+    const float elapsed_s = (now - overlay_.message_shown_at()).count() / 1000.0F;
     constexpr float kHoldSeconds = 2.0F;
     constexpr float kFadeSeconds = 1.0F;
     const float keep_alpha = (elapsed_s < kHoldSeconds)
                                  ? 1.0F
                                  : std::max(sqrtf(1.0F - (elapsed_s - kHoldSeconds) / kFadeSeconds), 0.0F);
 
+    const int mw = overlay_.message_width();
+    const int mh = overlay_.message_height();
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, BACKGROUND_ALPHA * keep_alpha);
-    fill_rect = make_frect(drawable_width_ / 2 - message_width_ / 2 - 2, drawable_height_ / 2 - message_height_ / 2 - 2, message_width_ + 4, message_height_ + 4);
+    fill_rect = make_frect(drawable_width_ / 2 - mw / 2 - 2, drawable_height_ / 2 - mh / 2 - 2, mw + 4, mh + 4);
     SDL_RenderFillRect(renderer_, &fill_rect);
 
-    SDL_SetTextureAlphaMod(message_texture_, 255 * keep_alpha);
-    text_rect = make_frect(drawable_width_ / 2 - message_width_ / 2, drawable_height_ / 2 - message_height_ / 2, message_width_, message_height_);
-    SDL_RenderTexture(renderer_, message_texture_, nullptr, &text_rect);
+    SDL_SetTextureAlphaMod(overlay_.message_texture(), 255 * keep_alpha);
+    text_rect = make_frect(drawable_width_ / 2 - mw / 2, drawable_height_ / 2 - mh / 2, mw, mh);
+    SDL_RenderTexture(renderer_, overlay_.message_texture(), nullptr, &text_rect);
 
     timer_based_update_performed_ = timer_based_update_performed_ || (keep_alpha > 0.0F);
   }
@@ -3132,12 +2842,17 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     render_quality_metrics_overlay();
   }
 
-  if (show_metadata_) {
-    render_metadata_overlay();
+  if (overlay_.show_metadata()) {
+    metadata_panel_.ensure_current(swap_left_right_,
+                                   displayed_left_side_.is_left(),
+                                   displayed_right_side_.is_right(),
+                                   small_font_, big_font_, renderer_,
+                                   gpu_renderer_active_, drawable_width_);
+    metadata_panel_.render_sdl(renderer_, drawable_width_, drawable_height_, mode_);
   }
 
-  if (show_help_) {
-    render_help();
+  if (overlay_.show_help()) {
+    overlay_.render_help_sdl(renderer_);
   }
 
   if (image_saver_.save_frames_requested()) {
@@ -3170,7 +2885,7 @@ void Display::upload_native_frame(int side, const AVFrame* frame) {
 }
 
 void Display::set_pending_message(const std::string& message) {
-  pending_message_ = message;
+  overlay_.set_pending_message(message);
 }
 
 void Display::notify_user(const std::string& message) {
@@ -3399,14 +3114,16 @@ void Display::handle_event(const SDL_Event& event) {
         view_transform_.update_move_offset(view_transform_.move_offset() + pan_offset);
       }
 
-      if (show_metadata_) {
-        handle_scroll(metadata_y_offset_, metadata_total_height_,
-                       gpu_renderer_active_ ? metadata_surfaces_.size() : metadata_textures_.size());
+      if (overlay_.show_metadata()) {
+        int y = metadata_panel_.scroll_offset();
+        handle_scroll(y, metadata_panel_.total_height(), metadata_panel_.item_count(gpu_renderer_active_));
+        metadata_panel_.set_scroll_offset(y);
       }
 
-      if (show_help_) {
-        handle_scroll(help_y_offset_, help_total_height_,
-                       gpu_renderer_active_ ? help_surfaces_.size() : help_textures_.size());
+      if (overlay_.show_help()) {
+        int y = overlay_.help_scroll_offset();
+        handle_scroll(y, overlay_.help_total_height(), overlay_.help_item_count(gpu_renderer_active_));
+        overlay_.set_help_scroll_offset(y);
       }
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -3482,7 +3199,7 @@ void Display::handle_event(const SDL_Event& event) {
 
       switch (keycode) {
         case SDLK_H:
-          show_help_ = !show_help_;
+          overlay_.toggle_help();
           break;
         case SDLK_ESCAPE:
           quit_ = true;
@@ -3609,7 +3326,7 @@ void Display::handle_event(const SDL_Event& event) {
               notify_user("No valid timestamp found in clipboard.");
             }
           } else {
-            show_metadata_ = !show_metadata_;
+            overlay_.toggle_metadata();
           }
           break;
         }

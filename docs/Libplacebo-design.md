@@ -1,5 +1,18 @@
 # libplacebo GPU Rendering Pipeline: Design Plan
 
+> **Post-refactor note (2026-04-18):** this document refers to the code as it was at the end of the libplacebo migration, when everything lived in `display.cpp` / `display.h`. The code has since been split across collaborator classes (see the display-refactor plan). Key moves for reading this doc:
+> - `rgb_frames_[...]`, `rgb_converter_[...]`, `ensure_rgb_frames` → `RgbFrameCache` in [rgb_frame_cache.h](../rgb_frame_cache.h).
+> - `diff_buffer_`, `diff_planes/pitches_`, `diff_upload_frame_`, `update_difference`, `convert_to_packed_10_bpc` → `DifferenceProcessor` in [difference_processor.h](../difference_processor.h).
+> - `save_image_frames_core`, `save_frame_image`, `save_selected_area` → `ImageSaver` in [image_saver.h](../image_saver.h). The SDL OSD capture stays as `Display::save_image_frames_sdl`.
+> - `selection_state_`, `selection_start/end_`, `selection_wrap_`, `save_selected_area_`, `crop_mode_`, `crop_target_side_`, `pending_crop_request_`, `get_left_selection_rect`, `wrap_to_left_frame` → `SelectionManager` in [selection_manager.h](../selection_manager.h).
+> - `global_zoom_level/factor_`, `move_offset_`, `global_center_`, `zoom_left/right_`, `compute_zoom_rect`, `window_to_video_position`, `video_to_zoom_space`, `compute_relative_move_offset`, `update_zoom_factor*`, `update_move_offset` → `ViewTransform` in [view_transform.h](../view_transform.h).
+> - `play_`, `buffer_play_loop_mode_`, `playback_speed_*_`, seek / navigation / shift_right_frames / auto_align fields → `PlaybackController` in [playback_controller.h](../playback_controller.h).
+> - PSNR/SSIM/rgb_to_grayscale/format_pixel/get_and_format_rgb_yuv_pixel/get_rgb_pixel/convert_rgb_to_yuv/compute_frame_psnr → `MetricsCalculator` namespace in [metrics_calculator.h](../metrics_calculator.h).
+> - `BitDepthTraits`, `clamp_u32`, `clamp_int_to_byte*` → [pixel_format_utils.h](../pixel_format_utils.h).
+> - Free utilities + constants (colors, zoom/speed steps, `check_sdl`, `clamp_range`, `to_frect`, `AVFramePtr`, etc.) → [display_utils.h](../display_utils.h) / [display_utils.cpp](../display_utils.cpp).
+>
+> The invariants and behaviors documented below are unchanged; only the addresses have moved.
+
 ## Status (2026-04-17) — all four phases complete
 
 ### Scope of "complete"

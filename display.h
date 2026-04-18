@@ -15,6 +15,8 @@
 #include "display_types.h"
 #include "gpu_renderer.h"
 #include "image_saver.h"
+#include "metadata_panel.h"
+#include "overlay_manager.h"
 #include "pixel_format_utils.h"
 #include "playback_controller.h"
 #include "rgb_frame_cache.h"
@@ -139,8 +141,6 @@ class Display {
   // Windowed size to restore when exiting fullscreen.
   std::array<int, 2> windowed_size_before_fullscreen_{{-1, -1}};
 
-  bool show_help_{false};
-  bool show_metadata_{false};
   bool quit_{false};
   PlaybackController playback_;
   bool swap_left_right_{false};
@@ -169,6 +169,8 @@ class Display {
 
   SelectionManager selection_;
   ImageSaver image_saver_;
+  MetadataPanel metadata_panel_;
+  OverlayManager overlay_;
 
   bool input_received_{true};
   int64_t previous_left_frame_pts_;
@@ -220,16 +222,6 @@ class Display {
   int middle_y_;
   int max_text_width_;
 
-  std::string pending_message_;
-  std::chrono::milliseconds message_shown_at_;
-  SDL_Texture* message_texture_{nullptr};
-  int message_width_;
-  int message_height_;
-
-  // Currently-visible message for the GPU renderer path — held until the
-  // fade-out alpha reaches zero, at which point it is cleared.
-  std::string gpu_active_message_;
-
   SDL_Window* window_;
   SDL_Renderer* renderer_;  // nullptr when gpu_renderer_active_
 
@@ -254,14 +246,6 @@ class Display {
   float mouse_y_;
   float wheel_sensitivity_;
 
-  std::vector<SDL_Texture*> metadata_textures_;
-  std::vector<SDL_Surface*> metadata_surfaces_;  // RGBA surfaces (GPU renderer path)
-  int metadata_total_height_{0};
-  int metadata_y_offset_{0};
-  VideoMetadata left_metadata_;
-  VideoMetadata right_metadata_;
-  bool last_swap_left_right_state_{false};
-  bool metadata_dirty_{true};
   Side displayed_left_side_{LEFT};
   Side displayed_right_side_{RIGHT};
   size_t num_right_videos_{1};
@@ -270,11 +254,6 @@ class Display {
   std::string right_file_name_;
   std::string last_window_title_;
 
-  std::vector<SDL_Texture*> help_textures_;
-  std::vector<SDL_Surface*> help_surfaces_;  // RGBA surfaces (GPU renderer path)
-  int help_total_height_{0};
-  int help_y_offset_{0};
-
   // Thread pool for parallel processing
   RowWorkers row_workers_;
 
@@ -282,7 +261,6 @@ class Display {
 
   void rebuild_fonts();
   void rebuild_side_ui_textures();
-  void rebuild_help_textures();
   void clamp_overlay_offsets();
   bool detect_fullscreen_like_state() const;
   float compute_content_aspect_ratio() const;
@@ -325,13 +303,9 @@ class Display {
 
   int round_and_clamp(const float value);
 
-  void render_help();
-  void render_metadata_overlay();
   void render_quality_metrics_overlay();
   void refresh_display_side_mapping();
-  void build_metadata_textures(const VideoMetadata& left, const VideoMetadata& right);
   void update_window_title_with_current_roi();
-  void ensure_metadata_textures_current();
 
   void refresh_selection_end_from_mouse();
   void draw_selection_rect();
