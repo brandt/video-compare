@@ -1,6 +1,6 @@
 # libplacebo GPU Rendering Pipeline: Design Plan
 
-> **Post-refactor note (2026-04-18):** this document refers to the code as it was at the end of the libplacebo migration, when everything lived in `display.cpp` / `display.h`. The code has since been split across 11 collaborator classes (phases 0–8a of the display-refactor plan). Key moves for reading this doc:
+> **Post-refactor note (2026-04-18):** this document refers to the code as it was at the end of the libplacebo migration, when everything lived in `display.cpp` / `display.h`. The code has since been split across 11 collaborator classes and decomposed into focused sub-phases (phases 0–8,10-11 complete of the display-refactor plan). Key moves for reading this doc:
 > - `rgb_frames_[...]`, `rgb_converter_[...]`, `ensure_rgb_frames` → `RgbFrameCache` in [rgb_frame_cache.h](../rgb_frame_cache.h).
 > - `diff_buffer_`, `diff_planes/pitches_`, `diff_upload_frame_`, `update_difference`, `convert_to_packed_10_bpc` → `DifferenceProcessor` in [difference_processor.h](../difference_processor.h).
 > - `save_image_frames_core`, `save_frame_image`, `save_selected_area` → `ImageSaver` in [image_saver.h](../image_saver.h). The SDL OSD capture stays as `Display::save_image_frames_sdl`.
@@ -13,7 +13,11 @@
 > - `BitDepthTraits`, `clamp_u32`, `clamp_int_to_byte*` → [pixel_format_utils.h](../pixel_format_utils.h).
 > - Free utilities + constants (colors, zoom/speed steps, `check_sdl`, `clamp_range`, `to_frect`, `AVFramePtr`, etc.) → [display_utils.h](../display_utils.h) / [display_utils.cpp](../display_utils.cpp).
 >
-> The invariants and behaviors documented below are unchanged; only the addresses have moved.
+> **Phase 10 (possibly_refresh decomposition):** Introduced `RenderContext` struct to capture per-frame invariants (frame keys, change flags, zoom rectangles, mouse position, drawable dimensions, HDR flags), eliminating redundant computation between the GPU and SDL rendering paths. Decomposed `possibly_refresh` from 1570 lines to a 55-line dispatcher + two sibling paths (`render_frame_gpu` / `render_frame_sdl`) + 6 GPU sub-phases + 6 SDL sub-phases organized by rendering responsibility. Result: ~25% reduction in display.cpp (5172 → 3858 lines).
+>
+> **Phase 11 (handle_event decomposition):** Decomposed `handle_event` from 560 lines to a 40-line dispatcher, 6 event-type handlers, and 9 first-match-wins key-group cascade helpers organized by semantic domain (playback, view modes, zoom/pan, diff, crop/save, scope, window, misc). All keyboard cases (~200) now clustered by feature area. Promoted lambdas `update_cursor_mode()` and `is_clipboard_mod_pressed()` to methods.
+>
+> The invariants and behaviors documented below are unchanged; only the addresses have moved, and the mega-functions have been decomposed into focused sub-phases.
 
 ## Status (2026-04-17) — all four phases complete
 

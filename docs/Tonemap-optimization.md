@@ -1,8 +1,8 @@
 # Tonemap Optimization Opportunities
 
-## Status (2026-04-17)
+## Status (2026-04-18)
 
-**Superseded by libplacebo migration (`Docs/Libplacebo-design.md`).** In GPU mode (default on Apple Silicon + Vulkan/MoltenVK), the entire CPU tonemap chain is bypassed:
+**Superseded by libplacebo migration (`Docs/Libplacebo-design.md`) and display.cpp refactor (`phases 0–8,10-11 complete`).** In GPU mode (default on Apple Silicon + Vulkan/MoltenVK), the entire CPU tonemap chain is bypassed:
 - `VideoFilterer` is constructed with `gpu_color_processing = true` — tonemap filters and HLG→PQ passthrough are both skipped.
 - `FormatConverter` / `sws_scale` is bypassed in `format_convert_video` — filtered frames pass through unchanged.
 - Native YUV frames go directly to `pl_map_avframe_ex` → `pl_render_image`, which handles YUV→RGB, color primaries / transfer conversion, and tone mapping on the GPU in <1ms per frame.
@@ -305,3 +305,9 @@ The remaining ~2.1-core steady-state gap vs SDR is the HLG→PQ `zscale=t=smpte2
 | 5 | Cache tonemapped frames   | variable               | none                 | moderate |
 | 6 | SDL3 HDR passthrough      | ~0.3 core HLG (measured), ~2.4 PQ (est.) | more faithful HDR | moderate | **done** (phases 1-4)
 | 7 | Display refresh (per-side `SDL_LockTexture`) | 53→17ms upload (3×) | none | moderate | **done**
+
+## Display refactor impact (phases 10–11, 2026-04-18)
+
+The 1570-line `possibly_refresh` mega-function was decomposed into a RenderContext-based dispatcher pattern (phase 10) that eliminated duplicate GPU/SDL render path computations (frame keys, zoom rectangles, mouse transforms, drawable dimensions). This consolidation reduced line count by ~25% (5172 → 3858 in display.cpp) while improving clarity through six focused GPU sub-phases and six SDL sub-phases. Tonemap optimization #1 (drop `format=rgb48`) and #6 (SDL3 HDR passthrough) are now cleanly separated and co-located in the GPU path.
+
+The 560-line `handle_event` mega-function was similarly decomposed into a 40-line dispatcher + 9 first-match-wins key-group cascade handlers (phase 11), making the input grammar navigable and organized by semantic domain (playback, view modes, zoom, diff, crop/save, scope, window, misc).
