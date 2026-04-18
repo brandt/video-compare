@@ -11,6 +11,7 @@
 #include <tuple>
 #include <vector>
 #include "core_types.h"
+#include "difference_processor.h"
 #include "display_types.h"
 #include "gpu_renderer.h"
 #include "pixel_format_utils.h"
@@ -148,7 +149,6 @@ class Display {
   bool show_hud_{true};
   bool start_in_fullscreen_{false};
   bool is_fullscreen_{false};
-  bool subtraction_mode_{false};
   bool pending_verbose_print_{false};
   float seek_relative_{0.0F};
   int frame_buffer_offset_delta_{0};
@@ -174,10 +174,6 @@ class Display {
   std::string last_vmaf_{"n/a"};
   int64_t last_vmaf_left_pts_{INT64_MIN};
   int64_t last_vmaf_right_pts_{INT64_MIN};
-
-  // Subtraction mode settings
-  DiffMode diff_mode_{DiffMode::AbsLinear};
-  bool diff_luma_only_{false};
 
   // Scope windows toggle requests
   std::array<bool, ScopeWindow::kNumScopes> toggle_scope_window_requested_{{false, false, false}};
@@ -212,13 +208,8 @@ class Display {
   SDL_Cursor* normal_mode_cursor_;
   SDL_Cursor* pan_mode_cursor_;
   SDL_Cursor* selection_mode_cursor_;
-  uint8_t* diff_buffer_{nullptr};
-  uint32_t* left_buffer_{nullptr};
-  uint32_t* right_buffer_{nullptr};
-  std::array<uint8_t*, 3> diff_planes_;
-  std::array<uint32_t*, 3> left_planes_;
-  std::array<uint32_t*, 3> right_planes_;
-  std::array<size_t, 3> diff_pitches_;
+
+  DifferenceProcessor diff_processor_;
 
   struct SideUIState {
     SDL_Texture* text_texture{nullptr};
@@ -263,8 +254,6 @@ class Display {
   // populated via on-demand sws_scale from the native YUV frames; main
   // GPU pipeline stays YUV-only when these features are off.
   RgbFrameCache rgb_cache_;
-  // Upload-only AVFrame shell used to hand diff_buffer_ to libplacebo.
-  AVFrame* diff_upload_frame_{nullptr};
 
   SDL_Event event_;
   float mouse_x_;
@@ -315,23 +304,6 @@ class Display {
   void update_hdr_display_state();
   void handle_window_resize(bool reset_forced_size_guard = false, bool force_layout_refresh = false);
   void recreate_video_textures_for_current_mode();
-
-  void convert_to_packed_10_bpc(std::array<uint8_t*, 3> in_planes, std::array<size_t, 3> in_pitches, std::array<uint32_t*, 3> out_planes, std::array<size_t, 3> out_pitches, const SDL_Rect& roi);
-
-  void update_difference(std::array<uint8_t*, 3> planes_left, std::array<size_t, 3> pitches_left, std::array<uint8_t*, 3> planes_right, std::array<size_t, 3> pitches_right, int split_x);
-
-  template <int Bpc>
-  float calculate_frame_p99(const typename BitDepthTraits<Bpc>::P* plane_left, const typename BitDepthTraits<Bpc>::P* plane_right, const size_t pitch_left, const size_t pitch_right, const int width_right) const;
-
-  template <int Bpc>
-  void process_difference_planes(const typename BitDepthTraits<Bpc>::P* plane_left0,
-                                 const typename BitDepthTraits<Bpc>::P* plane_right0,
-                                 typename BitDepthTraits<Bpc>::P* plane_difference0,
-                                 const size_t pitch_left,
-                                 const size_t pitch_right,
-                                 const size_t pitch_difference,
-                                 const int width_right,
-                                 const float diff_max) const;
 
   void save_image_frames(const AVFrame* left_frame, const AVFrame* right_frame);
 
