@@ -10,37 +10,37 @@ extern "C" {
 #include <libavutil/frame.h>
 }
 
-static const SDL_Color BACKGROUND_COLOR = {54, 69, 79, 0};
-static const SDL_Color LOOP_OFF_LABEL_COLOR = {0, 0, 0, 0};
-static const SDL_Color LOOP_FW_LABEL_COLOR = {80, 127, 255, 0};
-static const SDL_Color LOOP_PP_LABEL_COLOR = {191, 95, 60, 0};
-static const SDL_Color TEXT_COLOR = {255, 255, 255, 0};
-static const SDL_Color HELP_TEXT_PRIMARY_COLOR = {255, 255, 255, 0};
-static const SDL_Color HELP_TEXT_ALTERNATE_COLOR = {255, 255, 192, 0};
-static const SDL_Color POSITION_COLOR = {255, 255, 192, 0};
-static const SDL_Color TARGET_COLOR = {200, 200, 140, 0};
-static const SDL_Color ZOOM_COLOR = {255, 165, 0, 0};
-static const SDL_Color PLAYBACK_SPEED_COLOR = {0, 192, 160, 0};
-static const SDL_Color BUFFER_COLOR = {160, 225, 192, 0};
-static const SDL_Color FPS_VIDEO_COLOR = {255, 255, 192, 0};
-static const SDL_Color FPS_UI_COLOR = {255, 120, 200, 0};
-static constexpr int BACKGROUND_ALPHA = 100;
+inline const SDL_Color BACKGROUND_COLOR = {54, 69, 79, 0};
+inline const SDL_Color LOOP_OFF_LABEL_COLOR = {0, 0, 0, 0};
+inline const SDL_Color LOOP_FW_LABEL_COLOR = {80, 127, 255, 0};
+inline const SDL_Color LOOP_PP_LABEL_COLOR = {191, 95, 60, 0};
+inline const SDL_Color TEXT_COLOR = {255, 255, 255, 0};
+inline const SDL_Color HELP_TEXT_PRIMARY_COLOR = {255, 255, 255, 0};
+inline const SDL_Color HELP_TEXT_ALTERNATE_COLOR = {255, 255, 192, 0};
+inline const SDL_Color POSITION_COLOR = {255, 255, 192, 0};
+inline const SDL_Color TARGET_COLOR = {200, 200, 140, 0};
+inline const SDL_Color ZOOM_COLOR = {255, 165, 0, 0};
+inline const SDL_Color PLAYBACK_SPEED_COLOR = {0, 192, 160, 0};
+inline const SDL_Color BUFFER_COLOR = {160, 225, 192, 0};
+inline const SDL_Color FPS_VIDEO_COLOR = {255, 255, 192, 0};
+inline const SDL_Color FPS_UI_COLOR = {255, 120, 200, 0};
+inline constexpr int BACKGROUND_ALPHA = 100;
 
-static constexpr int MOUSE_WHEEL_SCROLL_STEPS_TO_DOUBLE = 12;
-static const float ZOOM_STEP_SIZE = std::pow(2.0F, 1.0F / float(MOUSE_WHEEL_SCROLL_STEPS_TO_DOUBLE));
-static constexpr float ZOOM_SLOWDOWN_RATIO = 3.0F;
+inline constexpr int MOUSE_WHEEL_SCROLL_STEPS_TO_DOUBLE = 12;
+inline const float ZOOM_STEP_SIZE = std::pow(2.0F, 1.0F / float(MOUSE_WHEEL_SCROLL_STEPS_TO_DOUBLE));
+inline constexpr float ZOOM_SLOWDOWN_RATIO = 3.0F;
 
-static constexpr int PLAYBACK_SPEED_KEY_PRESSES_TO_DOUBLE = 6;
-static const float PLAYBACK_SPEED_STEP_SIZE = std::pow(2.0F, 1.0F / float(PLAYBACK_SPEED_KEY_PRESSES_TO_DOUBLE));
-static constexpr float PLAYBACK_SPEED_SLOWDOWN_RATIO = 5.0F;
+inline constexpr int PLAYBACK_SPEED_KEY_PRESSES_TO_DOUBLE = 6;
+inline const float PLAYBACK_SPEED_STEP_SIZE = std::pow(2.0F, 1.0F / float(PLAYBACK_SPEED_KEY_PRESSES_TO_DOUBLE));
+inline constexpr float PLAYBACK_SPEED_SLOWDOWN_RATIO = 5.0F;
 
-static constexpr float RELATIVE_SEEK_SLOWDOWN_RATIO = 4.0F;
+inline constexpr float RELATIVE_SEEK_SLOWDOWN_RATIO = 4.0F;
 
-static constexpr int HELP_TEXT_LINE_SPACING = 1;
-static constexpr int HELP_TEXT_HORIZONTAL_MARGIN = 26;
+inline constexpr int HELP_TEXT_LINE_SPACING = 1;
+inline constexpr int HELP_TEXT_HORIZONTAL_MARGIN = 26;
 
-static constexpr int MIN_WINDOW_WIDTH = 4;
-static constexpr int MIN_WINDOW_HEIGHT = 1;
+inline constexpr int MIN_WINDOW_WIDTH = 4;
+inline constexpr int MIN_WINDOW_HEIGHT = 1;
 
 struct FrameDeleter {
   void operator()(AVFrame* frame) const {

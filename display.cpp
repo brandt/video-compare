@@ -16,7 +16,6 @@
 #include "controls.h"
 #include "display_utils.h"
 #include "ffmpeg.h"
-#include "format_converter.h"
 #include "jxl_saver.h"
 #include "metrics_calculator.h"
 #include "pixel_format_utils.h"
@@ -322,17 +321,9 @@ Display::~Display() {
     delete[] right_buffer_;
   }
 
-  // GPU-mode RGB cache: release per-side FormatConverters and their packed
-  // RGB destination frames. diff_upload_frame_ is an AVFrame shell that
-  // aliases diff_buffer_ (freed above) — clear data[0] first so av_frame_free
-  // doesn't try to walk into memory it doesn't own.
-  for (int s = 0; s < kSideCount; ++s) {
-    if (rgb_frames_[s] != nullptr) {
-      av_freep(&rgb_frames_[s]->data[0]);
-      av_frame_free(&rgb_frames_[s]);
-    }
-    rgb_converter_[s].reset();
-  }
+  // diff_upload_frame_ is an AVFrame shell that aliases diff_buffer_ (freed
+  // above) — clear data[0] first so av_frame_free doesn't try to walk into
+  // memory it doesn't own. The RGB cache cleans itself up via its destructor.
   if (diff_upload_frame_ != nullptr) {
     diff_upload_frame_->data[0] = nullptr;  // diff_buffer_ is owned separately
     av_frame_free(&diff_upload_frame_);
@@ -554,14 +545,7 @@ void Display::reinitialize_video_dimensions(const unsigned width, const unsigned
 
   // Drop any cached RGB conversion state — new video dims require fresh
   // FormatConverter and RGB destination frames.
-  for (int s = 0; s < kSideCount; ++s) {
-    if (rgb_frames_[s] != nullptr) {
-      av_freep(&rgb_frames_[s]->data[0]);
-      av_frame_free(&rgb_frames_[s]);
-    }
-    rgb_converter_[s].reset();
-    rgb_frame_keys_[s].clear();
-  }
+  rgb_cache_.invalidate();
 
   move_offset_ = Vector2D((global_center_.x() - 0.5F) * static_cast<float>(video_width_), (global_center_.y() - 0.5F) * static_cast<float>(video_height_));
 
@@ -2122,79 +2106,6 @@ void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right
   }
 }
 
-// Lazily materialize packed RGB copies of the current native YUV  frames for
-// features that still need CPU pixel access (subtraction mode, per-pixel
-// inspector, live PSNR/SSIM/VMAF). Cached per frame_key so multiple consumers
-// in the same refresh share one conversion, and skipped entirely when none of
-// those features are active -- the normal GPU path stays YUV-only. Target
-// format mirrors what requires_10_bpc() selects so the existing RGB helpers
-// (update_difference, get_rgb_pixel, rgb_to_grayscale) interpret the pixels
-// correctly. Returns true when both sides are ready; callers must gate RGB-
-// dependent work on this.
-bool Display::ensure_rgb_frames(const AVFrame* left_frame, const AVFrame* right_frame) {
-  if (!gpu_renderer_active_) return true;  // SDL path frames are already RGB
-
-  // Target format matches what the existing CPU pixel helpers expect based on
-  // requires_10_bpc(): RGB48LE (10-bit) or RGB24 (8-bit).
-  const AVPixelFormat dst_fmt = requires_10_bpc() ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
-
-  auto ensure_side = [&](int side, const AVFrame* src, std::string& cache_key) -> bool {
-    if (!src || src->data[0] == nullptr || src->width <= 0 || src->height <= 0) return false;
-
-    const std::string new_key = get_frame_key(src);
-    if (!new_key.empty() && new_key == cache_key && rgb_frames_[side] != nullptr) {
-      return true;
-    }
-
-    // Allocate or (re)allocate the destination RGB frame if size/format changed.
-    if (rgb_frames_[side] == nullptr || rgb_frames_[side]->width != video_width_ ||
-        rgb_frames_[side]->height != video_height_ || rgb_frames_[side]->format != dst_fmt) {
-      if (rgb_frames_[side] != nullptr) {
-        av_freep(&rgb_frames_[side]->data[0]);
-        av_frame_free(&rgb_frames_[side]);
-      }
-      AVFrame* fr = av_frame_alloc();
-      if (!fr) return false;
-      fr->format = dst_fmt;
-      fr->width = video_width_;
-      fr->height = video_height_;
-      if (av_image_alloc(fr->data, fr->linesize, video_width_, video_height_, dst_fmt, 64) < 0) {
-        av_frame_free(&fr);
-        return false;
-      }
-      rgb_frames_[side] = fr;
-      // Force converter rebuild on the next conversion.
-      rgb_converter_[side].reset();
-    }
-
-    // Lazily construct / reuse the per-side FormatConverter (handles format
-    // changes itself via reinit on operator()). Initial params are seeded from
-    // the first frame we see.
-    if (!rgb_converter_[side]) {
-      rgb_converter_[side] = std::make_unique<FormatConverter>(
-          src->width, src->height, video_width_, video_height_,
-          static_cast<AVPixelFormat>(src->format), dst_fmt,
-          src->colorspace, src->color_range);
-    }
-
-    // Copy color props and invoke the converter. The converter sets
-    // frame_key metadata on dst from src automatically. color_primaries and
-    // color_trc are propagated so that downstream savers (JxlSaver) can
-    // preserve HDR metadata on saved output.
-    rgb_frames_[side]->colorspace = src->colorspace;
-    rgb_frames_[side]->color_range = src->color_range;
-    rgb_frames_[side]->color_primaries = src->color_primaries;
-    rgb_frames_[side]->color_trc = src->color_trc;
-    (*rgb_converter_[side])(const_cast<AVFrame*>(src), rgb_frames_[side]);
-    cache_key = new_key;
-    return true;
-  };
-
-  const bool ok_left = ensure_side(0, left_frame, rgb_frame_keys_[0]);
-  const bool ok_right = ensure_side(1, right_frame, rgb_frame_keys_[1]);
-  return ok_left && ok_right;
-}
-
 bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_frame, const std::string& current_total_browsable) {
   const std::string left_frame_key = get_frame_key(left_frame);
   const std::string right_frame_key = get_frame_key(right_frame);
@@ -2223,7 +2134,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
                           save_selected_area_ || save_image_frames_;
     bool have_rgb = false;
     if (need_rgb) {
-      have_rgb = ensure_rgb_frames(left_frame, right_frame);
+      have_rgb = rgb_cache_.ensure(left_frame, right_frame, video_width_, video_height_, requires_10_bpc());
     }
 
     // Pixel inspector + similarity metrics consume RGB frames and run before
@@ -2261,10 +2172,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
           const auto od_right = original_dims(right_frame);
 
           std::cout << "Left:  " << string_sprintf("[%4d,%4d]", pixel_video_x * od_left.first / video_width_, pixel_video_y * od_left.second / video_height_);
-          std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(rgb_frames_[0]->data[0], rgb_frames_[0]->linesize[0], rgb_frames_[0], pixel_video_x, pixel_video_y, requires_10_bpc());
+          std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(rgb_cache_.left()->data[0], rgb_cache_.left()->linesize[0], rgb_cache_.left(), pixel_video_x, pixel_video_y, requires_10_bpc());
           std::cout << " - ";
           std::cout << "Right: " << string_sprintf("[%4d,%4d]", pixel_video_x * od_right.first / video_width_, pixel_video_y * od_right.second / video_height_);
-          std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(rgb_frames_[1]->data[0], rgb_frames_[1]->linesize[0], rgb_frames_[1], pixel_video_x, pixel_video_y, requires_10_bpc());
+          std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(rgb_cache_.right()->data[0], rgb_cache_.right()->linesize[0], rgb_cache_.right(), pixel_video_x, pixel_video_y, requires_10_bpc());
           std::cout << std::endl;
         }
         print_mouse_position_and_color_ = false;
@@ -2276,8 +2187,8 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
           std::cerr << "ROI is empty, skipping metrics calculation" << std::endl;
         } else {
           SDL_Rect effective_roi_left{}, effective_roi_right{};
-          AVFrame* left_crop = crop_rgb_frame(rgb_frames_[0], roi, &effective_roi_left);
-          AVFrame* right_crop = crop_rgb_frame(rgb_frames_[1], roi, &effective_roi_right);
+          AVFrame* left_crop = crop_rgb_frame(rgb_cache_.left(), roi, &effective_roi_left);
+          AVFrame* right_crop = crop_rgb_frame(rgb_cache_.right(), roi, &effective_roi_right);
           if (!SDL_RectsEqual(&effective_roi_left, &effective_roi_right)) {
             std::cerr << "Error: Left and right effective ROIs are different" << std::endl;
           } else {
@@ -2313,8 +2224,8 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
       // Live on-screen quality metrics (rendered further down).
       if (show_quality_metrics_ && video_width_ > 0 && video_height_ > 0) {
-        float* left_gray = MetricsCalculator::rgb_to_grayscale(rgb_frames_[0]->data[0], rgb_frames_[0]->linesize[0], video_width_, video_height_, requires_10_bpc());
-        float* right_gray = MetricsCalculator::rgb_to_grayscale(rgb_frames_[1]->data[0], rgb_frames_[1]->linesize[0], video_width_, video_height_, requires_10_bpc());
+        float* left_gray = MetricsCalculator::rgb_to_grayscale(rgb_cache_.left()->data[0], rgb_cache_.left()->linesize[0], video_width_, video_height_, requires_10_bpc());
+        float* right_gray = MetricsCalculator::rgb_to_grayscale(rgb_cache_.right()->data[0], rgb_cache_.right()->linesize[0], video_width_, video_height_, requires_10_bpc());
         last_psnr_ = MetricsCalculator::compute_psnr(left_gray, right_gray, video_width_, video_height_);
         last_ssim_ = MetricsCalculator::compute_ssim(left_gray, right_gray, video_width_, video_height_);
         delete[] left_gray;
@@ -2322,7 +2233,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
         if (!play_) {
           if (left_frame->pts != last_vmaf_left_pts_ || right_frame->pts != last_vmaf_right_pts_) {
-            last_vmaf_ = VMAFCalculator::instance().compute(rgb_frames_[0], rgb_frames_[1]);
+            last_vmaf_ = VMAFCalculator::instance().compute(rgb_cache_.left(), rgb_cache_.right());
             last_vmaf_left_pts_ = left_frame->pts;
             last_vmaf_right_pts_ = right_frame->pts;
           }
@@ -2348,24 +2259,24 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
         // Compute the RGB diff into diff_buffer_ and hand it to libplacebo via
         // a reusable AVFrame shell. When RGB conversion fails we fall back to
         // the normal YUV upload below so the video stays visible.
-        std::array<uint8_t*, 3> rgb_l_planes{rgb_frames_[0]->data[0], nullptr, nullptr};
-        std::array<uint8_t*, 3> rgb_r_planes{rgb_frames_[1]->data[0], nullptr, nullptr};
-        std::array<size_t, 3> rgb_l_pitches{static_cast<size_t>(rgb_frames_[0]->linesize[0]), 0, 0};
-        std::array<size_t, 3> rgb_r_pitches{static_cast<size_t>(rgb_frames_[1]->linesize[0]), 0, 0};
+        std::array<uint8_t*, 3> rgb_l_planes{rgb_cache_.left()->data[0], nullptr, nullptr};
+        std::array<uint8_t*, 3> rgb_r_planes{rgb_cache_.right()->data[0], nullptr, nullptr};
+        std::array<size_t, 3> rgb_l_pitches{static_cast<size_t>(rgb_cache_.left()->linesize[0]), 0, 0};
+        std::array<size_t, 3> rgb_r_pitches{static_cast<size_t>(rgb_cache_.right()->linesize[0]), 0, 0};
         update_difference(rgb_l_planes, rgb_l_pitches, rgb_r_planes, rgb_r_pitches, 0);
 
         if (diff_upload_frame_ == nullptr) {
           diff_upload_frame_ = av_frame_alloc();
         }
-        diff_upload_frame_->format = rgb_frames_[1]->format;
+        diff_upload_frame_->format = rgb_cache_.right()->format;
         diff_upload_frame_->width = video_width_;
         diff_upload_frame_->height = video_height_;
         diff_upload_frame_->data[0] = diff_buffer_;
         for (int i = 1; i < AV_NUM_DATA_POINTERS; ++i) diff_upload_frame_->data[i] = nullptr;
         diff_upload_frame_->linesize[0] = static_cast<int>(diff_pitches_[0]);
         for (int i = 1; i < AV_NUM_DATA_POINTERS; ++i) diff_upload_frame_->linesize[i] = 0;
-        diff_upload_frame_->colorspace = rgb_frames_[1]->colorspace;
-        diff_upload_frame_->color_range = rgb_frames_[1]->color_range;
+        diff_upload_frame_->colorspace = rgb_cache_.right()->colorspace;
+        diff_upload_frame_->color_range = rgb_cache_.right()->color_range;
         gpu_renderer_.upload_frame(1, diff_upload_frame_);
       } else {
         gpu_renderer_.upload_frame(1, right_frame);
@@ -3199,7 +3110,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // consumes.
     if (save_image_frames_) {
       if (have_rgb && osd_frame) {
-        save_image_frames_core(rgb_frames_[0], rgb_frames_[1], osd_frame.get());
+        save_image_frames_core(rgb_cache_.left(), rgb_cache_.right(), osd_frame.get());
       } else {
         std::cerr << "Save image frames: OSD or RGB capture unavailable." << std::endl;
       }
@@ -3207,7 +3118,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     }
     if (save_selected_area_) {
       if (have_rgb) {
-        possibly_save_selected_area(rgb_frames_[0], rgb_frames_[1]);
+        possibly_save_selected_area(rgb_cache_.left(), rgb_cache_.right());
       } else {
         std::cerr << "Save selected area: RGB conversion unavailable." << std::endl;
         save_selected_area_ = false;
