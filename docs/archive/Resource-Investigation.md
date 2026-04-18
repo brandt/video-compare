@@ -4,7 +4,7 @@
 
 **Resolved.** Root cause of the 15s → 25s CPU regression identified: commit `628eab8` linked `ffmpeg-full`, which enabled HDR tonemapping (zscale) that was previously silently skipped. Not a code bug — a feature activating.
 
-The CPU pipeline has since been fully migrated to libplacebo GPU rendering (see `Docs/Libplacebo-design.md`). With `--hwaccel videotoolbox`, 4K HDR 60fps now plays smoothly. The display.cpp mega-function decomposition (phases 10–11) has consolidated the GPU and SDL rendering paths via a RenderContext pattern, further clarifying the architecture. See `Docs/Libplacebo-design.md` post-refactor note for the module map. The CPU-side optimizations below were the stepping stones before the full GPU migration.
+The CPU pipeline has since been fully migrated to libplacebo GPU rendering (see `docs/libplacebo-design.md`). With `--hwaccel videotoolbox`, 4K HDR 60fps now plays smoothly. The display.cpp mega-function decomposition (phases 10–11) has consolidated the GPU and SDL rendering paths via a RenderContext pattern, further clarifying the architecture. See `docs/libplacebo-design.md` post-refactor note for the module map. The CPU-side optimizations below were the stepping stones before the full GPU migration.
 
 ---
 
@@ -66,7 +66,7 @@ The observed CPU% jump (315% → 541%) corresponds to ~2–3 additional cores bu
 
 ### Reproducing the A/B locally
 
-Temporarily guard the `ffmpeg-full` block in [makefile](../makefile) with `NO_FFMPEG_FULL`:
+Temporarily guard the `ffmpeg-full` block in [Makefile](../../Makefile) with `NO_FFMPEG_FULL`:
 
 ```make
 ifeq "$(NO_FFMPEG_FULL)" ""
@@ -273,4 +273,4 @@ The full cost of the `628eab8` "regression" — **all of it** — is HDR tonemap
 - Skip the tonemap chain when the display is HDR-capable and the content's primaries/transfer already match the display.
 - No action needed on the ~600 MB RSS image gap — it's fixed-cost dylib mapping, not working set.
 
-Detailed tonemap optimization analysis and implementation progress: see [Tonemap-optimization.md](Tonemap-optimization.md).
+Detailed tonemap optismization analysis and implementation progress: see [Tonemap-optimization.md](Tonemap-optimization.md).

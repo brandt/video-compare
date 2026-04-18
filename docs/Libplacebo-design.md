@@ -255,7 +255,7 @@ Bottleneck depends on the decode path:
 
 ---
 
-## Implementation notes (learned during Phase 1 + 2)
+## Implementation notes
 
 ### GpuRenderer wrapper API
 

@@ -2,7 +2,7 @@
 
 ## Status (2026-04-18)
 
-**Superseded by libplacebo migration (`Docs/Libplacebo-design.md`) and display.cpp refactor (`phases 0–8,10-11 complete`).** In GPU mode (default on Apple Silicon + Vulkan/MoltenVK), the entire CPU tonemap chain is bypassed:
+**Superseded by [libplacebo migration](../libplacebo-design.md) and display.cpp refactor.** In GPU mode (default on Apple Silicon + Vulkan/MoltenVK), the entire CPU tonemap chain is bypassed:
 - `VideoFilterer` is constructed with `gpu_color_processing = true` — tonemap filters and HLG→PQ passthrough are both skipped.
 - `FormatConverter` / `sws_scale` is bypassed in `format_convert_video` — filtered frames pass through unchanged.
 - Native YUV frames go directly to `pl_map_avframe_ex` → `pl_render_image`, which handles YUV→RGB, color primaries / transfer conversion, and tone mapping on the GPU in <1ms per frame.
