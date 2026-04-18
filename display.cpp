@@ -2851,25 +2851,40 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       const int src_zoomed_size = 64;
       const int src_half = src_zoomed_size / 2;
 
-      const int mouse_drawable_x = std::round(static_cast<float>(mouse_x_) * drawable_to_window_width_factor_);
-      const int mouse_drawable_y = std::round(static_cast<float>(mouse_y_) * drawable_to_window_height_factor_);
+      const float mouse_drawable_x_f = static_cast<float>(mouse_x_) * drawable_to_window_width_factor_;
+      const float mouse_drawable_y_f = static_cast<float>(mouse_y_) * drawable_to_window_height_factor_;
 
-      const int src_x0_draw = clamp_range(mouse_drawable_x - src_half, 0, drawable_width_ - src_zoomed_size);
-      const int src_y0_draw = clamp_range(mouse_drawable_y - src_half, 0, drawable_height_ - src_zoomed_size);
-      const int src_x1_draw = src_x0_draw + src_zoomed_size;
-      const int src_y1_draw = src_y0_draw + src_zoomed_size;
+      // Clamp the 64-drawable-pixel src window to stay inside drawable bounds
+      // (integer clamp preserves the SDL zoom's edge-behavior). The *size*
+      // stays constant in drawable pixels — only the center moves.
+      const float src_cx_draw = clamp_range(mouse_drawable_x_f,
+                                             static_cast<float>(src_half),
+                                             static_cast<float>(drawable_width_ - src_half));
+      const float src_cy_draw = clamp_range(mouse_drawable_y_f,
+                                             static_cast<float>(src_half),
+                                             static_cast<float>(drawable_height_ - src_half));
 
-      // Drawable corners → video-layout coords (layout coords include any
-      // HStack/VStack offsets; split_x and video_{width,height} are the
-      // boundary coordinates we split on below).
-      const Vector2D tl_layout = window_to_video_position(
-          static_cast<int>(std::floor(src_x0_draw / drawable_to_window_width_factor_)),
-          static_cast<int>(std::floor(src_y0_draw / drawable_to_window_height_factor_)), zoom_rect, true);
-      const Vector2D br_layout = window_to_video_position(
-          static_cast<int>(std::ceil(src_x1_draw / drawable_to_window_width_factor_)),
-          static_cast<int>(std::ceil(src_y1_draw / drawable_to_window_height_factor_)), zoom_rect, false);
-      const float sx0 = tl_layout.x(), sy0 = tl_layout.y();
-      const float sx1 = br_layout.x(), sy1 = br_layout.y();
+      // Fixed src size in layout/video coords (independent of mouse position)
+      // — 64 drawable pixels mapped through the current view zoom. Keeping
+      // this constant avoids sub-pixel width jitter that the zoom factor
+      // would otherwise amplify.
+      const float video_per_draw_x = video_to_window_width_factor_ / (zoom_rect.zoom_factor * drawable_to_window_width_factor_);
+      const float video_per_draw_y = video_to_window_height_factor_ / (zoom_rect.zoom_factor * drawable_to_window_height_factor_);
+      const float video_src_half_w = static_cast<float>(src_half) * video_per_draw_x;
+      const float video_src_half_h = static_cast<float>(src_half) * video_per_draw_y;
+
+      // Convert clamped drawable center → layout-video coords (float, no
+      // floor/ceil snapping — window_to_video_position discretises, so the
+      // math is inlined here).
+      const float center_win_x = src_cx_draw / drawable_to_window_width_factor_;
+      const float center_win_y = src_cy_draw / drawable_to_window_height_factor_;
+      const float center_layout_x = ((center_win_x - static_cast<float>(content_window_.x)) * video_to_window_width_factor_ - zoom_rect.start.x()) / zoom_rect.zoom_factor;
+      const float center_layout_y = ((center_win_y - static_cast<float>(content_window_.y)) * video_to_window_height_factor_ - zoom_rect.start.y()) / zoom_rect.zoom_factor;
+
+      const float sx0 = center_layout_x - video_src_half_w;
+      const float sx1 = center_layout_x + video_src_half_w;
+      const float sy0 = center_layout_y - video_src_half_h;
+      const float sy1 = center_layout_y + video_src_half_h;
 
       // Push a side render op whose src rect is in *layout* coords (the
       // per-side frame offset is applied here), dst in FBO coords.
