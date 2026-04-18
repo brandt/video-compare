@@ -418,6 +418,12 @@ class Display {
 
   void save_image_frames(const AVFrame* left_frame, const AVFrame* right_frame);
 
+  // Shared save pipeline: writes left, right, and an on-screen-display frame
+  // to three image files. The public save_image_frames() wraps this with an
+  // SDL_RenderReadPixels-based OSD capture; the GPU path constructs the OSD
+  // frame itself via GpuRenderer::capture_osd.
+  void save_image_frames_core(const AVFrame* left_frame, const AVFrame* right_frame, const AVFrame* osd_frame);
+
   // GPU path: lazily convert native YUV frames to packed RGB24 / RGB48LE so
   // that subtraction mode, per-pixel inspector, and live PSNR/SSIM/VMAF can
   // continue to work. The converted frames are cached per frame_key and

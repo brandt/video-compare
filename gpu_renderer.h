@@ -76,6 +76,17 @@ class GpuRenderer {
               const TextOverlayOp* text_overlays, int num_text_overlays,
               const struct pl_color_space* target_color);
 
+  // Re-render the same scene to an internal host-readable RGBA8 texture and
+  // download its pixels. Used for OSD screenshot capture. `width`/`height`
+  // should match the current swapchain drawable size. Writes RGB24 packed
+  // pixels into `out_rgb24`; `out_pitch` is bytes-per-row of the dst buffer.
+  // Target color is always sRGB (SDR) — HDR content is tonemapped so the
+  // screenshot is viewable as a normal image file.
+  bool capture_osd(uint8_t* out_rgb24, int out_pitch, int width, int height,
+                   const SideRenderOp* ops, int num_ops,
+                   const OverlayOp* overlays, int num_overlays,
+                   const TextOverlayOp* text_overlays, int num_text_overlays);
+
   // Present the rendered frame.
   void present();
 
@@ -117,6 +128,19 @@ class GpuRenderer {
   // Per-slot RGBA textures for text overlays. Grown as needed; slot i is
   // reused across frames so repeated same-sized uploads avoid tex recreate.
   std::vector<pl_tex> text_tex_slots_;
+
+  // Host-readable RGBA8 texture used for OSD screenshot capture. Lazily
+  // (re)created at the current swapchain size when capture_osd is called.
+  pl_tex osd_capture_tex_;
+
+  // Internal: composite side renders + overlays onto the given target frame.
+  // `target` must already be cleared by the caller. Shared between the
+  // normal render path (swapchain target) and capture_osd (host-readable
+  // offscreen target).
+  void compose_frame(struct pl_frame& target, int fbo_w, int fbo_h,
+                     const SideRenderOp* ops, int num_ops,
+                     const OverlayOp* overlays, int num_overlays,
+                     const TextOverlayOp* text_overlays, int num_text_overlays);
 
   SDL_Window* window_;
 };

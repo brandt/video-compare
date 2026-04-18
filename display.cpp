@@ -1496,58 +1496,60 @@ void save_frame_image(const AVFrame* frame, const std::string& filename, std::at
 };
 
 void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_frame) {
-  std::atomic_bool error_occurred(false);
+  // SDL renderer path — build the OSD via SDL_RenderReadPixels, then defer
+  // to the shared save core. The GPU renderer path builds its OSD frame
+  // directly via GpuRenderer::capture_osd and calls save_image_frames_core
+  // itself.
+  const size_t pitch = requires_10_bpc() ? drawable_width_ * 3 * sizeof(uint16_t) : drawable_width_ * 3;
+  uint8_t* pixels = reinterpret_cast<uint8_t*>(av_malloc(pitch * drawable_height_));
 
-  const auto create_onscreen_display_avframe = [&]() -> AVFramePtr {
-    const size_t pitch = requires_10_bpc() ? drawable_width_ * 3 * sizeof(uint16_t) : drawable_width_ * 3;
-    uint8_t* pixels = reinterpret_cast<uint8_t*>(av_malloc(pitch * drawable_height_));
+  SDL_Surface* read_surface = SDL_RenderReadPixels(renderer_, nullptr);
+  if (read_surface) {
+    if (requires_10_bpc()) {
+      const uint32_t* src = reinterpret_cast<const uint32_t*>(read_surface->pixels);
+      uint16_t* dest = reinterpret_cast<uint16_t*>(pixels);
+      const int src_pitch_pixels = read_surface->pitch / sizeof(uint32_t);
 
-    SDL_Surface* read_surface = SDL_RenderReadPixels(renderer_, nullptr);
-    if (read_surface) {
-      if (requires_10_bpc()) {
-        const uint32_t* src = reinterpret_cast<const uint32_t*>(read_surface->pixels);
-        uint16_t* dest = reinterpret_cast<uint16_t*>(pixels);
-        const int src_pitch_pixels = read_surface->pitch / sizeof(uint32_t);
+      for (int row = 0; row < drawable_height_; row++) {
+        const uint32_t* src_row = src + row * src_pitch_pixels;
+        for (int col = 0; col < drawable_width_; col++) {
+          const uint32_t argb = src_row[col];
+          const uint32_t r10 = (argb >> 20) & 0x3FF;
+          const uint32_t g10 = (argb >> 10) & 0x3FF;
+          const uint32_t b10 = argb & 0x3FF;
 
-        for (int row = 0; row < drawable_height_; row++) {
-          const uint32_t* src_row = src + row * src_pitch_pixels;
-          for (int col = 0; col < drawable_width_; col++) {
-            const uint32_t argb = src_row[col];
-            const uint32_t r10 = (argb >> 20) & 0x3FF;
-            const uint32_t g10 = (argb >> 10) & 0x3FF;
-            const uint32_t b10 = argb & 0x3FF;
-
-            *(dest++) = static_cast<uint16_t>(r10 << 6);
-            *(dest++) = static_cast<uint16_t>(g10 << 6);
-            *(dest++) = static_cast<uint16_t>(b10 << 6);
-          }
-        }
-      } else {
-        // Convert surface to RGB24 format
-        SDL_Surface* rgb_surface = SDL_ConvertSurface(read_surface, SDL_PIXELFORMAT_RGB24);
-        if (rgb_surface) {
-          for (int row = 0; row < drawable_height_; row++) {
-            memcpy(pixels + row * pitch,
-                   reinterpret_cast<uint8_t*>(rgb_surface->pixels) + row * rgb_surface->pitch,
-                   drawable_width_ * 3);
-          }
-          SDL_DestroySurface(rgb_surface);
+          *(dest++) = static_cast<uint16_t>(r10 << 6);
+          *(dest++) = static_cast<uint16_t>(g10 << 6);
+          *(dest++) = static_cast<uint16_t>(b10 << 6);
         }
       }
-      SDL_DestroySurface(read_surface);
+    } else {
+      SDL_Surface* rgb_surface = SDL_ConvertSurface(read_surface, SDL_PIXELFORMAT_RGB24);
+      if (rgb_surface) {
+        for (int row = 0; row < drawable_height_; row++) {
+          memcpy(pixels + row * pitch,
+                 reinterpret_cast<uint8_t*>(rgb_surface->pixels) + row * rgb_surface->pitch,
+                 drawable_width_ * 3);
+        }
+        SDL_DestroySurface(rgb_surface);
+      }
     }
+    SDL_DestroySurface(read_surface);
+  }
 
-    AVFrame* renderer_frame = av_frame_alloc();
-    renderer_frame->format = requires_10_bpc() ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
-    renderer_frame->width = drawable_width_;
-    renderer_frame->height = drawable_height_;
-    renderer_frame->data[0] = pixels;
-    renderer_frame->linesize[0] = pitch;
+  AVFrame* osd = av_frame_alloc();
+  osd->format = requires_10_bpc() ? AV_PIX_FMT_RGB48LE : AV_PIX_FMT_RGB24;
+  osd->width = drawable_width_;
+  osd->height = drawable_height_;
+  osd->data[0] = pixels;
+  osd->linesize[0] = pitch;
+  AVFramePtr osd_frame(osd, frame_deleter);
 
-    return AVFramePtr(renderer_frame, frame_deleter);
-  };
+  save_image_frames_core(left_frame, right_frame, osd_frame.get());
+}
 
-  const auto osd_frame = create_onscreen_display_avframe();
+void Display::save_image_frames_core(const AVFrame* left_frame, const AVFrame* right_frame, const AVFrame* osd_frame) {
+  std::atomic_bool error_occurred(false);
 
   const std::string& left_stem = side_ui_[displayed_left_side_.as_simple_index()].file_stem;
   const std::string& right_stem = side_ui_[displayed_right_side_.as_simple_index()].file_stem;
@@ -1566,7 +1568,7 @@ void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_
 
   std::thread save_left_frame_thread(save_frame, left_frame, left_filename);
   std::thread save_right_frame_thread(save_frame, right_frame, right_filename);
-  std::thread save_osd_frame_thread(save_frame, osd_frame.get(), osd_filename);
+  std::thread save_osd_frame_thread(save_frame, osd_frame, osd_filename);
 
   save_left_frame_thread.join();
   save_right_frame_thread.join();
@@ -2655,7 +2657,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     // GPU-fast.
     const bool need_rgb = subtraction_mode_ || print_mouse_position_and_color_ ||
                           print_image_similarity_metrics_ || show_quality_metrics_ ||
-                          save_selected_area_;
+                          save_selected_area_ || save_image_frames_;
     bool have_rgb = false;
     if (need_rgb) {
       have_rgb = ensure_rgb_frames(left_frame, right_frame);
@@ -3599,15 +3601,45 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
       gpu_renderer_.present();
     }
 
+    // OSD screenshot: capture the same scene (text_surfaces must still be
+    // alive because TextOverlayOp pixel pointers alias them) into an RGB24
+    // AVFrame, then save left/right/osd together. Done here so the surfaces
+    // haven't been destroyed yet.
+    AVFramePtr osd_frame(nullptr, frame_deleter);
+    if (save_image_frames_ && have_rgb) {
+      const size_t pitch = static_cast<size_t>(drawable_width_) * 3;
+      uint8_t* pixels = reinterpret_cast<uint8_t*>(av_malloc(pitch * static_cast<size_t>(drawable_height_)));
+      if (pixels &&
+          gpu_renderer_.capture_osd(pixels, static_cast<int>(pitch), drawable_width_, drawable_height_,
+                                     ops.data(), static_cast<int>(ops.size()),
+                                     overlays.data(), static_cast<int>(overlays.size()),
+                                     text_ops.data(), static_cast<int>(text_ops.size()))) {
+        AVFrame* osd = av_frame_alloc();
+        osd->format = AV_PIX_FMT_RGB24;
+        osd->width = drawable_width_;
+        osd->height = drawable_height_;
+        osd->data[0] = pixels;
+        osd->linesize[0] = static_cast<int>(pitch);
+        osd_frame.reset(osd);
+      } else if (pixels) {
+        av_free(pixels);
+      }
+    }
+
     // Surfaces are no longer referenced by libplacebo after render() returns.
     for (SDL_Surface* s : text_surfaces) SDL_DestroySurface(s);
 
-    // Deferred actions. `save_image_frames` still needs `pl_tex_download`
-    // for the OSD capture (Phase 4 remaining). `save_selected_area` works
-    // via the Phase 3 RGB cache — `need_rgb` included it above so
-    // `rgb_frames_` are already populated when we get here.
+    // Deferred actions. `save_image_frames` uses the OSD frame captured
+    // above (via GpuRenderer::capture_osd) plus the Phase 3 rgb_frames_
+    // for left/right. `save_selected_area` also works via rgb_frames_.
+    // `possibly_apply_crop` just sets a pending request the main loop
+    // consumes.
     if (save_image_frames_) {
-      std::cerr << "Save image frames: not supported in GPU renderer mode yet." << std::endl;
+      if (have_rgb && osd_frame) {
+        save_image_frames_core(rgb_frames_[0], rgb_frames_[1], osd_frame.get());
+      } else {
+        std::cerr << "Save image frames: OSD or RGB capture unavailable." << std::endl;
+      }
       save_image_frames_ = false;
     }
     if (save_selected_area_) {

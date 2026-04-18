@@ -21,6 +21,7 @@ GpuRenderer::GpuRenderer()
       frame_mapped_{},
       overlay_tex_(nullptr),
       white_tex_(nullptr),
+      osd_capture_tex_(nullptr),
       window_(nullptr) {}
 
 GpuRenderer::~GpuRenderer() {
@@ -136,6 +137,7 @@ void GpuRenderer::destroy() {
     }
     pl_tex_destroy(vk_->gpu, &overlay_tex_);
     pl_tex_destroy(vk_->gpu, &white_tex_);
+    pl_tex_destroy(vk_->gpu, &osd_capture_tex_);
     for (auto& tex : text_tex_slots_) {
       pl_tex_destroy(vk_->gpu, &tex);
     }
@@ -223,28 +225,10 @@ static bool ensure_white_tex(pl_gpu gpu, pl_tex* tex) {
   return pl_tex_upload(gpu, &xfer);
 }
 
-bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
-                          const OverlayOp* overlays, int num_overlays,
-                          const TextOverlayOp* text_overlays, int num_text_overlays,
-                          const struct pl_color_space* target_color) {
-  if (!swapchain_ || !renderer_) return false;
-
-  struct pl_swapchain_frame sw_frame;
-  if (!pl_swapchain_start_frame(swapchain_, &sw_frame)) {
-    return false;
-  }
-
-  struct pl_frame target;
-  pl_frame_from_swapchain(&target, &sw_frame);
-
-  if (target_color) {
-    target.color = *target_color;
-  }
-
-  // Clear target to background.
-  const float bg[3] = {54.0f / 255.0f, 69.0f / 255.0f, 79.0f / 255.0f};
-  pl_frame_clear(vk_->gpu, &target, bg);
-
+void GpuRenderer::compose_frame(struct pl_frame& target, int fbo_w, int fbo_h,
+                                 const SideRenderOp* ops, int num_ops,
+                                 const OverlayOp* overlays, int num_overlays,
+                                 const TextOverlayOp* text_overlays, int num_text_overlays) {
   struct pl_render_params params = pl_render_fast_params;
   params.color_map_params = &pl_color_map_default_params;
   params.background = PL_CLEAR_SKIP;
@@ -385,14 +369,124 @@ bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
     // clipped by a previously set sub-crop.
     target.crop.x0 = 0;
     target.crop.y0 = 0;
-    target.crop.x1 = static_cast<float>(sw_frame.fbo->params.w);
-    target.crop.y1 = static_cast<float>(sw_frame.fbo->params.h);
+    target.crop.x1 = static_cast<float>(fbo_w);
+    target.crop.y1 = static_cast<float>(fbo_h);
     pl_render_image(renderer_, nullptr, &target, &params);
   }
+}
+
+bool GpuRenderer::render(const SideRenderOp* ops, int num_ops,
+                          const OverlayOp* overlays, int num_overlays,
+                          const TextOverlayOp* text_overlays, int num_text_overlays,
+                          const struct pl_color_space* target_color) {
+  if (!swapchain_ || !renderer_) return false;
+
+  struct pl_swapchain_frame sw_frame;
+  if (!pl_swapchain_start_frame(swapchain_, &sw_frame)) {
+    return false;
+  }
+
+  struct pl_frame target;
+  pl_frame_from_swapchain(&target, &sw_frame);
+
+  if (target_color) {
+    target.color = *target_color;
+  }
+
+  // Clear target to background.
+  const float bg[3] = {54.0f / 255.0f, 69.0f / 255.0f, 79.0f / 255.0f};
+  pl_frame_clear(vk_->gpu, &target, bg);
+
+  compose_frame(target, sw_frame.fbo->params.w, sw_frame.fbo->params.h,
+                ops, num_ops, overlays, num_overlays,
+                text_overlays, num_text_overlays);
 
   if (!pl_swapchain_submit_frame(swapchain_)) {
     std::cerr << "GpuRenderer: pl_swapchain_submit_frame failed" << std::endl;
     return false;
+  }
+
+  return true;
+}
+
+bool GpuRenderer::capture_osd(uint8_t* out_rgb24, int out_pitch, int width, int height,
+                               const SideRenderOp* ops, int num_ops,
+                               const OverlayOp* overlays, int num_overlays,
+                               const TextOverlayOp* text_overlays, int num_text_overlays) {
+  if (!vk_ || !renderer_ || !out_rgb24 || width <= 0 || height <= 0) return false;
+
+  // Find a RGBA8 format that supports renderable + host-readable. Not every
+  // Vulkan driver exposes a 3-channel renderable format, so capture via RGBA
+  // and strip alpha on CPU.
+  pl_fmt fmt = pl_find_fmt(vk_->gpu, PL_FMT_UNORM, 4, 8, 0,
+                            static_cast<pl_fmt_caps>(PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE |
+                                                      PL_FMT_CAP_HOST_READABLE | PL_FMT_CAP_BLITTABLE));
+  if (!fmt) {
+    std::cerr << "GpuRenderer: no RGBA8 format with renderable+host_readable" << std::endl;
+    return false;
+  }
+
+  struct pl_tex_params tp = {};
+  tp.w = width;
+  tp.h = height;
+  tp.format = fmt;
+  tp.renderable = true;
+  tp.host_readable = true;
+  tp.blit_dst = true;  // required by pl_frame_clear (blit-based)
+  tp.sampleable = true;  // pl_render_image may sample the target when compositing
+  tp.debug_tag = PL_DEBUG_TAG;
+  if (!pl_tex_recreate(vk_->gpu, &osd_capture_tex_, &tp)) {
+    std::cerr << "GpuRenderer: pl_tex_recreate (osd_capture_tex_) failed" << std::endl;
+    return false;
+  }
+
+  // Build a sRGB pl_frame target on the capture tex. RGBA mapping mirrors
+  // what pl_frame_from_swapchain would produce for an RGBA swapchain.
+  struct pl_frame target = {};
+  target.num_planes = 1;
+  target.planes[0].texture = osd_capture_tex_;
+  target.planes[0].components = 4;
+  target.planes[0].component_mapping[0] = PL_CHANNEL_R;
+  target.planes[0].component_mapping[1] = PL_CHANNEL_G;
+  target.planes[0].component_mapping[2] = PL_CHANNEL_B;
+  target.planes[0].component_mapping[3] = PL_CHANNEL_A;
+  target.repr = pl_color_repr_rgb;
+  target.color = pl_color_space_srgb;
+  target.crop.x0 = 0;
+  target.crop.y0 = 0;
+  target.crop.x1 = static_cast<float>(width);
+  target.crop.y1 = static_cast<float>(height);
+
+  // Clear to the same background as render(), then composite the scene.
+  const float bg[3] = {54.0f / 255.0f, 69.0f / 255.0f, 79.0f / 255.0f};
+  pl_frame_clear(vk_->gpu, &target, bg);
+
+  compose_frame(target, width, height,
+                ops, num_ops, overlays, num_overlays,
+                text_overlays, num_text_overlays);
+
+  // Download as RGBA8 into a temporary buffer, then pack to RGB24 into the
+  // caller-provided buffer (dropping alpha).
+  const size_t row_bytes = static_cast<size_t>(width) * 4;
+  std::vector<uint8_t> rgba_buf(row_bytes * static_cast<size_t>(height));
+
+  struct pl_tex_transfer_params xfer = {};
+  xfer.tex = osd_capture_tex_;
+  xfer.ptr = rgba_buf.data();
+  xfer.row_pitch = row_bytes;
+  if (!pl_tex_download(vk_->gpu, &xfer)) {
+    std::cerr << "GpuRenderer: pl_tex_download (osd) failed" << std::endl;
+    return false;
+  }
+
+  for (int y = 0; y < height; ++y) {
+    const uint8_t* src = rgba_buf.data() + static_cast<size_t>(y) * row_bytes;
+    uint8_t* dst = out_rgb24 + static_cast<size_t>(y) * out_pitch;
+    for (int x = 0; x < width; ++x) {
+      dst[x * 3 + 0] = src[x * 4 + 0];
+      dst[x * 3 + 1] = src[x * 4 + 1];
+      dst[x * 3 + 2] = src[x * 4 + 2];
+    }
   }
 
   return true;
