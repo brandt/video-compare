@@ -27,18 +27,17 @@ makepkg -sic
 
 Install [via Homebrew](https://formulae.brew.sh/formula/video-compare):
 
-```sh
-brew install video-compare
-```
+The standard Homebrew formula for `video-compare` depends on the regular `ffmpeg` formula, which currently does not include `libvmaf` support. For full VMAF support and broader codec compatibility, you must install the `ffmpeg-full` formula first, and then install `video-compare` from source. If you already have `video-compare` installed, you will need to uninstall beforehand.
 
-For more advanced use cases, it is also recommended to install [ffmpeg-full](https://formulae.brew.sh/formula/ffmpeg-full)
-instead of the default FFmpeg:
+TODO: Update the `video-compare` Homebrew formula to depend on `ffmpeg-full` and remove this caveat.
 
 ```sh
 brew install ffmpeg-full
+brew install --build-from-source video-compare
 ```
 
-The standard formula is somewhat minimal, while `ffmpeg-full` adds broader codec and format support (e.g., JPEG XL).
+> [!NOTE]  
+> If the `ffmpeg-full` formula is updated in the future, you may also need to reinstall `video-compare` to ensure it links against the updated `ffmpeg-full` library versions.
 
 ### Pre-compiled Windows 10 binaries
 
@@ -291,6 +290,12 @@ On Fedora Linux the required development packages can be installed via `dnf`:
 dnf install make gcc-c++ ffmpeg-devel SDL2-devel SDL2_ttf-devel
 ```
 
+On macOS the required libraries can be installed via Homebrew:
+
+```sh
+brew install sdl3 sdl2_ttf ffmpeg-full
+```
+
 ### Instructions
 
 Compile the source code via GNU Make:
@@ -311,7 +316,7 @@ Note that root privileges are required to perform this operation in most environ
 
 1. Audio playback is not supported.
 2. Keep time-shifts below a few seconds for the best experience.
-3. Seeks require re-synchronization on the closest keyframe (i.e., I-frame).
+3. Seeks require re-synchronization on the keyframe (i.e., I-frame) preceding the target timestamp.
 
 ## Practical tips
 

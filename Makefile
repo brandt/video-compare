@@ -59,12 +59,21 @@ ifneq "$(wildcard /opt/homebrew/opt/libplacebo)" ""
 endif
 LDLIBS += -lplacebo
 
-# Default: don't use pkg-config unless user explicitly enables it
-# Usage: make USE_PKG_CONFIG=1
-USE_PKG_CONFIG ?= 0
+# Default: try to use pkg-config if available and SDL3 is provided by pkg-config.
+# Contributors can still force behavior with `make USE_PKG_CONFIG=0` or `=1`.
+# Decide the default based on whether pkg-config advertises SDL3.
+PKG_CONFIG_EXISTS := $(shell command -v pkg-config 2>/dev/null || true)
+PKG_HAS_SDL3 := $(shell $(PKG_CONFIG_EXISTS) >/dev/null 2>&1 && pkg-config --exists sdl3 SDL3_ttf && echo 1 || echo 0)
+
+ifeq ($(PKG_HAS_SDL3),1)
+  USE_PKG_CONFIG ?= 1
+else
+  USE_PKG_CONFIG ?= 0
+endif
 
 ifeq ($(USE_PKG_CONFIG),1)
-  LDLIBS += $(shell pkg-config --libs libavformat libavcodec libavfilter libavutil libswscale libswresample sdl3 SDL3_ttf)
+  CXXFLAGS += $(shell pkg-config --cflags libavformat libavcodec libavfilter libavutil libswscale libswresample sdl3 SDL3_ttf)
+  LDLIBS   += $(shell pkg-config --libs libavformat libavcodec libavfilter libavutil libswscale libswresample sdl3 SDL3_ttf)
 else
   LDLIBS += -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lSDL3_ttf -lSDL3
 endif
