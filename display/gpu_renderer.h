@@ -94,7 +94,9 @@ class GpuRenderer {
   bool resize(int width, int height);
 
   // Access the underlying pl_gpu (for overlay texture creation).
-  pl_gpu gpu() const { return vk_ ? vk_->gpu : nullptr; }
+  pl_gpu gpu() const {
+    return vk_ ? vk_->gpu : nullptr;
+  }
 
   // Upload an RGBA CPU surface as an overlay texture.
   // Returns a pl_tex that can be used as pl_overlay.tex.
@@ -102,7 +104,21 @@ class GpuRenderer {
   // GpuRenderer (recreated as needed, destroyed on cleanup).
   pl_tex upload_overlay_tex(const uint8_t* rgba_data, int width, int height, int stride);
 
-  bool is_initialized() const { return swapchain_ != nullptr; }
+  bool is_initialized() const {
+    return swapchain_ != nullptr;
+  }
+
+  // Dimensions of the most recent successful upload for `side`, in texture
+  // pixels. Returns 0 if no frame has been uploaded yet. Callers building
+  // `SideRenderOp`s need this to express src coords in the texture's own
+  // coordinate space when the uploaded frame is smaller than the display's
+  // layout dimensions (e.g. a 720p right video against a 2160p left).
+  int side_upload_width(int side) const {
+    return (side >= 0 && side < kSideCount) ? upload_w_[side] : 0;
+  }
+  int side_upload_height(int side) const {
+    return (side >= 0 && side < kSideCount) ? upload_h_[side] : 0;
+  }
 
  private:
   pl_log log_;
@@ -117,6 +133,8 @@ class GpuRenderer {
   pl_tex frame_tex_[kSideCount][4];
   struct pl_frame mapped_frames_[kSideCount];
   bool frame_mapped_[kSideCount];
+  int upload_w_[kSideCount]{0, 0};
+  int upload_h_[kSideCount]{0, 0};
 
   // Overlay texture (reused across frames).
   pl_tex overlay_tex_;
