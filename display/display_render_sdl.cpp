@@ -557,9 +557,28 @@ void Display::sdl_finalize_deferred(const AVFrame* left_frame, const AVFrame* ri
     possibly_save_selected_area(left_frame, right_frame);
   }
   if (selection_.auto_crop_black_borders_requested()) {
-    // Auto-crop detection reads from rgb_cache_ which is only populated on
-    // the GPU render path. Surface a one-shot notice in the SDL fallback.
-    notify_user("Auto-crop requires the GPU (libplacebo) renderer");
+    // SDL path: the post-format_converter frames delivered here are already at
+    // max_width_ × max_height_ in one of RGB24 / RGB48LE / X2RGB10LE — exactly
+    // what detect_black_border_crop dispatches on. Run detection directly on
+    // the delivered frames; route the result through the same PendingCropRequest
+    // pipeline the GPU path uses, so stacking + BACKSPACE behave identically.
+    const SDL_Rect left_rect = detect_black_border_crop(left_frame);
+    const SDL_Rect right_rect = detect_black_border_crop(right_frame);
+    const bool left_cropped = (left_rect.w != video_width_ || left_rect.h != video_height_);
+    const bool right_cropped = (right_rect.w != video_width_ || right_rect.h != video_height_);
+    if (!left_cropped && !right_cropped) {
+      notify_user("No black borders detected");
+    } else {
+      PendingCropRequest req{};
+      req.per_side_rects = true;
+      req.rect_left = left_rect;
+      req.rect_right = right_rect;
+      req.valid = true;
+      req.apply_left = left_cropped;
+      req.apply_right = right_cropped;
+      req.right_target_index = active_right_index_;
+      selection_.set_pending_crop_request(req);
+    }
     selection_.cancel_auto_crop_black_borders();
   }
   if (selection_.crop_mode()) {

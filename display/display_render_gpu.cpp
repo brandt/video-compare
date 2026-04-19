@@ -757,8 +757,8 @@ bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
     // submit a per-side crop request through the existing crop pipeline so it
     // stacks in crop_history_ and is clearable via BACKSPACE.
     if (selection_.auto_crop_black_borders_requested()) {
-      const SDL_Rect left_rect = detect_black_border_crop(rgb_cache_.left(), requires_10_bpc());
-      const SDL_Rect right_rect = detect_black_border_crop(rgb_cache_.right(), requires_10_bpc());
+      const SDL_Rect left_rect = detect_black_border_crop(rgb_cache_.left());
+      const SDL_Rect right_rect = detect_black_border_crop(rgb_cache_.right());
       const bool left_cropped = (left_rect.w != video_width_ || left_rect.h != video_height_);
       const bool right_cropped = (right_rect.w != video_width_ || right_rect.h != video_height_);
       if (!left_cropped && !right_cropped) {
