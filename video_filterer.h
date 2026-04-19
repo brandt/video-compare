@@ -1,7 +1,6 @@
 #pragma once
 #include <atomic>
 #include <mutex>
-#include "config.h"
 #include "core_types.h"
 #include "demuxer.h"
 #include "side_aware.h"

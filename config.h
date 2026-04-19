@@ -2,7 +2,7 @@
 #include <string>
 #include <vector>
 #include "core_types.h"
-#include "display/display.h"
+#include "display/display_modes.h"
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/rational.h>
@@ -60,14 +60,14 @@ struct VideoCompareConfig {
   bool disable_auto_filters{false};
   bool start_in_subtraction_mode{false};
   bool start_in_fullscreen{false};
-  Display::AspectLockMode aspect_lock_mode{Display::AspectLockMode::Off};
-  Display::AspectViewMode aspect_view_mode{Display::AspectViewMode::Stretch};
+  DisplayAspectLockMode aspect_lock_mode{DisplayAspectLockMode::Off};
+  DisplayAspectViewMode aspect_view_mode{DisplayAspectViewMode::Stretch};
 
   int display_number{0};
   std::tuple<int, int> window_size{-1, -1};
 
-  Display::Mode display_mode{Display::Mode::Split};
-  Display::Loop auto_loop_mode{Display::Loop::Off};
+  DisplayMode display_mode{DisplayMode::Split};
+  DisplayLoop auto_loop_mode{DisplayLoop::Off};
 
   size_t frame_buffer_size{50};
 

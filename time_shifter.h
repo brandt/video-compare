@@ -1,7 +1,6 @@
 #pragma once
 #include <cmath>
 #include <cstdint>
-#include "config.h"
 #include "ffmpeg.h"
 
 extern "C" {

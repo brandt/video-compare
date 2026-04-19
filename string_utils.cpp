@@ -6,6 +6,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include "video_decoder.h"
 
 extern "C" {
 #include <libavutil/pixdesc.h>

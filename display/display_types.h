@@ -3,6 +3,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include "display_modes.h"
 #include "string_utils.h"
 
 namespace MetadataProperties {
@@ -81,10 +82,6 @@ struct PendingCropRequest {
   size_t right_target_index{0};
 };
 
-enum class DisplayMode { Split, VStack, HStack };
-enum class DisplayLoop { Off, ForwardOnly, PingPong };
-enum class DisplayAspectLockMode { Off, Window, Content };
-enum class DisplayAspectViewMode { Stretch, Original, Preset16x9, Preset4x3, Preset1x1 };
 enum class DisplayDiffMode { LegacyAbs, AbsLinear, AbsSqrt, SignedDiverging };
 enum class SelectionState { None, Started, Completed };
 enum class CropTargetSide { Undefined, Left, Right, Both };

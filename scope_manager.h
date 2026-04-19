@@ -7,8 +7,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include "config.h"
 #include "scope_window.h"
+#include "config.h"
 extern "C" {
 #include <libavutil/frame.h>
 }
