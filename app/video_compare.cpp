@@ -1463,6 +1463,11 @@ void VideoCompare::compare() {
           // Seek all right videos and track failures
           bool seek_failed = false;
 
+          // Collected per-side seek targets so the post-seek frame-drain loop in
+          // pop_and_reset can advance past the landed-on keyframe to the exact
+          // requested frame.
+          std::map<Side, float> right_seek_positions;
+
           for (auto& pair : side_states) {
             const Side& side = pair.first;
 
@@ -1493,6 +1498,8 @@ void VideoCompare::compare() {
               // Add the static and dynamic time shifts to the next right position.
               next_right_position += time_shifter_.static_shift() * AV_TIME_TO_SEC;
               next_right_position += static_cast<float>(time_shifter_.dynamic_shift(static_cast<int64_t>((next_right_position - right_state.start_time_) / AV_TIME_TO_SEC), false)) * AV_TIME_TO_SEC;
+
+              right_seek_positions[side] = next_right_position;
 
 #ifdef _DEBUG
               std::cout << "SEEK: next_right_position=" << (int)(next_right_position * 1000) << " (side=" << side.to_string() << "), backward=" << backward << std::endl;
@@ -1567,32 +1574,68 @@ void VideoCompare::compare() {
           // Pop the first post-seek frame off the converted queue and seed the ring's
           // current slot with it. The caller clears the ring beforehand so that the
           // fresh current has no stale history or prefetch alongside it.
-          auto pop_and_reset = [&](SideState& side_state, int64_t* effective_time_shift = nullptr) {
+          //
+          // av_seek_frame(..., AVSEEK_FLAG_BACKWARD) lands the demuxer on the
+          // keyframe at-or-before the requested time. During normal playback the
+          // main loop's advance_ring() naturally steps past that keyframe to the
+          // frame that matches the clicked time, but while paused nothing else
+          // advances — we would be stuck on the keyframe. When `drain_to_target`
+          // is true (timeline clicks, arrow seeks, timestamp paste) we drain
+          // intermediate frames here so paused scrubbing lands on the exact
+          // clicked frame. `target_position_sec` is the seek target in the
+          // side's own time axis (start_time_ plus any time shift for the right),
+          // so it can be compared directly against the side's raw (pre-shift) PTS.
+          //
+          // Pure `+`/`-` frame shifts that spill past the ring-pivot fast path
+          // skip the drain: each popped frame blocks the main loop on a pipeline
+          // decode, and users press the shift keys rapidly. The slight landing
+          // imprecision matches the pre-drain behavior they were already
+          // tolerating for that specific case.
+          auto pop_and_reset = [&](SideState& side_state, const float target_position_sec, const bool drain_to_target, int64_t* effective_time_shift = nullptr) {
             AVFrameUniquePtr first_frame{nullptr, avframe_deleter};
-            converted_frame_queues_[side_state.side_]->pop(first_frame);
-
-            if (first_frame != nullptr) {
-              side_state.pts_ = first_frame->pts;
-
-              // if the effective time shift is provided, update it and subtract it from the PTS
-              if (effective_time_shift != nullptr) {
-                *effective_time_shift += time_shifter_.dynamic_shift(first_frame->pts);
-                side_state.pts_ -= *effective_time_shift;
-              }
-
-              side_state.previous_decoded_picture_number_ = -1;
-              side_state.decoded_picture_number_ = 1;
-              side_state.ring.set_current(std::move(first_frame));
-            } else {
+            if (!converted_frame_queues_[side_state.side_]->pop(first_frame) || first_frame == nullptr) {
 #ifdef _DEBUG
               std::cout << "Side state frame is nullptr: " << side_state.side_.to_string() << std::endl;
 #endif
+              return;
             }
+
+            if (drain_to_target) {
+              const int64_t target_pts = static_cast<int64_t>(std::llround((static_cast<double>(target_position_sec) - side_state.start_time_) / AV_TIME_TO_SEC));
+
+              // Keep the most recently popped frame whose PTS is < target_pts, so
+              // that if we run out of frames (EOF / stopped queue) we don't throw
+              // away progress.
+              while (first_frame->pts < target_pts) {
+                AVFrameUniquePtr next_frame{nullptr, avframe_deleter};
+                if (!converted_frame_queues_[side_state.side_]->pop(next_frame) || next_frame == nullptr) {
+                  break;
+                }
+                first_frame = std::move(next_frame);
+              }
+            }
+
+            side_state.pts_ = first_frame->pts;
+
+            // if the effective time shift is provided, update it and subtract it from the PTS
+            if (effective_time_shift != nullptr) {
+              *effective_time_shift += time_shifter_.dynamic_shift(first_frame->pts);
+              side_state.pts_ -= *effective_time_shift;
+            }
+
+            side_state.previous_decoded_picture_number_ = -1;
+            side_state.decoded_picture_number_ = 1;
+            side_state.ring.set_current(std::move(first_frame));
           };
+
+          // Only user-initiated scrubs (timeline click, arrow keys, timestamp
+          // paste) need to land exactly on the target while paused. Pure `+`/`-`
+          // fall-throughs skip the drain to stay responsive.
+          const bool drain_to_target = !pure_right_frame_shift;
 
           if (should_seek(LEFT)) {
             left.ring.clear();
-            pop_and_reset(left);
+            pop_and_reset(left, next_left_position, drain_to_target);
           }
 
           // Nudge near-zero residual shifts away from zero so the right demuxer lands
@@ -1607,7 +1650,7 @@ void VideoCompare::compare() {
 
               right_state.ring.clear();
               right_state.effective_time_shift_ = time_shifter_.static_shift();
-              pop_and_reset(right_state, &right_state.effective_time_shift_);
+              pop_and_reset(right_state, right_seek_positions[side], drain_to_target, &right_state.effective_time_shift_);
             }
           }
 
