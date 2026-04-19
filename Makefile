@@ -112,3 +112,15 @@ clean:
 
 install: $(target)
 	install -s video-compare $(BINDIR)
+
+.PHONY: format-diff
+format-diff:
+	git clang-format --diff
+
+.PHONY: format-staged
+format-staged:
+	git clang-format
+
+.PHONY: format-all
+format-all:
+	git ls-files '*.c' '*.cpp' '*.cc' '*.h' '*.hpp' | xargs -r clang-format -i
