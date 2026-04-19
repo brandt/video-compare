@@ -370,7 +370,6 @@ class Display {
 
   SDL_Texture* get_side_texture(int side) const;
   void update_side_texture(int side, const void* pixels, int pitch);
-  void update_texture(const SDL_Rect* rect, const void* pixels, int pitch, const std::string& message);
 
   int round_and_clamp(const float value);
 

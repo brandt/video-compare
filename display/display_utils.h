@@ -86,6 +86,10 @@ inline int get_metadata_int_value(const AVFrame* frame, const std::string& key, 
 
 SDL_DisplayID display_id_for_index(int index);
 
+// Crop a packed RGB AVFrame in-place by adjusting its data pointer and dimensions.
+// Defined in display_render.cpp (clipped to source bounds; throws on unknown formats).
+AVFrame* crop_rgb_frame(const AVFrame* src, const SDL_Rect& roi, SDL_Rect* out_effective_roi = nullptr);
+
 std::string get_file_name_and_extension(const std::string& file_path);
 std::string get_file_stem(const std::string& file_path);
 std::string format_right_file_label(const std::string& left_file_name, const std::string& right_file_name, const size_t right_file_number);
