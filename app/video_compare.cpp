@@ -1157,7 +1157,7 @@ void VideoCompare::compare() {
 
       int shift_right_frames = display_->get_shift_right_frames();
 
-      // Auto-align: pick the right-buffer offset whose frame has the highest PSNR
+      // Auto-align: pick the right-buffer offset whose frame has the highest SSIM
       // against the current left frame, and fold that offset into the frame-shift.
       // The existing pure-right-frame-shift pivot path then moves the right cursor
       // with no re-decode.
@@ -1168,27 +1168,27 @@ void VideoCompare::compare() {
           const int min_off = -right_ring.history_size();
           const int max_off = right_ring.prefetch_size();
           int best_offset = 0;
-          float best_psnr = -std::numeric_limits<float>::max();
+          float best_ssim = -std::numeric_limits<float>::max();
           int evaluated = 0;
           for (int off = min_off; off <= max_off; ++off) {
             const AVFrame* rframe = right_ring.at(off);
             if (rframe == nullptr) {
               continue;
             }
-            const float psnr = display_->compute_frame_psnr(left_current, rframe);
+            const float ssim = display_->compute_frame_ssim(left_current, rframe);
             ++evaluated;
-            if (psnr > best_psnr) {
-              best_psnr = psnr;
+            if (ssim > best_ssim) {
+              best_ssim = ssim;
               best_offset = off;
             }
           }
           if (evaluated == 0) {
             display_->set_pending_message("Auto-align: no right frames available");
           } else if (best_offset == 0) {
-            display_->set_pending_message(string_sprintf("Auto-align: already aligned (PSNR %.2f)", best_psnr));
+            display_->set_pending_message(string_sprintf("Auto-align: already aligned (SSIM %.5f)", best_ssim));
           } else {
             shift_right_frames += best_offset;
-            display_->set_pending_message(string_sprintf("Auto-align: shift %+d frame%s (PSNR %.2f)", best_offset, std::abs(best_offset) == 1 ? "" : "s", best_psnr));
+            display_->set_pending_message(string_sprintf("Auto-align: shift %+d frame%s (SSIM %.5f)", best_offset, std::abs(best_offset) == 1 ? "" : "s", best_ssim));
           }
         } else {
           display_->set_pending_message("Auto-align: no left frame available");

@@ -33,8 +33,8 @@ std::string compute_ssim(const float* left_plane, const float* right_plane, int 
 // PSNR over matched grayscale planes. Returns "inf" when identical.
 std::string compute_psnr(const float* left_plane, const float* right_plane, int width, int height);
 
-// Convenience: convert two RGB frames to grayscale and compute PSNR as float.
+// Convenience: convert two RGB frames to grayscale and compute SSIM as float.
 // Returns -max on invalid input; +max on identical frames.
-float compute_frame_psnr(const AVFrame* left_frame, const AVFrame* right_frame, bool is_10bpc);
+float compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame, bool is_10bpc);
 
 }  // namespace MetricsCalculator

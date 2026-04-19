@@ -231,7 +231,7 @@ std::string compute_psnr(const float* left_plane, const float* right_plane, cons
   return string_sprintf("%.3f", -10.f * log10f(static_cast<float>(mse)));
 }
 
-float compute_frame_psnr(const AVFrame* left_frame, const AVFrame* right_frame, const bool is_10bpc) {
+float compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame, const bool is_10bpc) {
   if (left_frame == nullptr || right_frame == nullptr) {
     return -std::numeric_limits<float>::max();
   }
@@ -245,22 +245,25 @@ float compute_frame_psnr(const AVFrame* left_frame, const AVFrame* right_frame, 
   float* left_gray = rgb_to_grayscale(left_frame->data[0], left_frame->linesize[0], width, height, is_10bpc);
   float* right_gray = rgb_to_grayscale(right_frame->data[0], right_frame->linesize[0], width, height, is_10bpc);
 
-  double mse = 0.0;
-  const float* lp = left_gray;
-  const float* rp = right_gray;
-  for (int i = 0; i < width * height; i++) {
-    const float diff = *(lp++) - *(rp++);
-    mse += static_cast<double>(diff) * static_cast<double>(diff);
+  static constexpr int overlap = 4;
+  static constexpr int block_size = 8;
+
+  float ssim_sum = 0.0f;
+  int count = 0;
+
+  for (int y = 0; y < height - (block_size - 1); y += block_size - overlap) {
+    for (int x = 0; x < width - (block_size - 1); x += block_size - overlap, ++count) {
+      ssim_sum += compute_ssim_block(left_gray, right_gray, width, x, y, block_size);
+    }
   }
-  mse /= static_cast<double>(width) * static_cast<double>(height);
 
   delete[] left_gray;
   delete[] right_gray;
 
-  if (mse == 0.0) {
-    return std::numeric_limits<float>::max();
+  if (count == 0) {
+    return -std::numeric_limits<float>::max();
   }
-  return -10.f * log10f(static_cast<float>(mse));
+  return ssim_sum / static_cast<float>(count);
 }
 
 }  // namespace MetricsCalculator

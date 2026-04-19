@@ -546,9 +546,9 @@ bool Display::get_auto_align_requested() const {
   return playback_.auto_align_requested();
 }
 
-// Public wrapper around MetricsCalculator::compute_frame_psnr for alignment consumers in video_compare.cpp.
-float Display::compute_frame_psnr(const AVFrame* left_frame, const AVFrame* right_frame) {
-  return MetricsCalculator::compute_frame_psnr(left_frame, right_frame, requires_10_bpc());
+// Public wrapper around MetricsCalculator::compute_frame_ssim for alignment consumers in video_compare.cpp.
+float Display::compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame) {
+  return MetricsCalculator::compute_frame_ssim(left_frame, right_frame, requires_10_bpc());
 }
 
 // Current playback speed multiplier (1.0 = real-time).

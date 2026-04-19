@@ -9,7 +9,7 @@
 > - `metadata_textures/surfaces_`, `left/right_metadata_`, `metadata_dirty_`, `build_metadata_textures`, `render_metadata_overlay`, `ensure_metadata_textures_current` → `MetadataPanel` in [metadata_panel.h](../metadata_panel.h).
 > - `show_help_`, `show_metadata_`, `help_textures/surfaces_`, `pending_message_`/`message_*_`/`gpu_active_message_`, `rebuild_help_textures`, `render_help`, `set_pending_message`, `clamp_overlay_offsets` (partial) → `OverlayManager` in [overlay_manager.h](../overlay_manager.h).
 > - `play_`, `buffer_play_loop_mode_`, `playback_speed_*_`, seek / navigation / shift_right_frames / auto_align fields → `PlaybackController` in [playback_controller.h](../playback_controller.h).
-> - PSNR/SSIM/rgb_to_grayscale/format_pixel/get_and_format_rgb_yuv_pixel/get_rgb_pixel/convert_rgb_to_yuv/compute_frame_psnr → `MetricsCalculator` namespace in [metrics_calculator.h](../metrics_calculator.h).
+> - PSNR/SSIM/rgb_to_grayscale/format_pixel/get_and_format_rgb_yuv_pixel/get_rgb_pixel/convert_rgb_to_yuv/compute_frame_ssim → `MetricsCalculator` namespace in [metrics_calculator.h](../metrics_calculator.h).
 > - `BitDepthTraits`, `clamp_u32`, `clamp_int_to_byte*` → [pixel_format_utils.h](../pixel_format_utils.h).
 > - Free utilities + constants (colors, zoom/speed steps, `check_sdl`, `clamp_range`, `to_frect`, `AVFramePtr`, etc.) → [display_utils.h](../display_utils.h) / [display_utils.cpp](../display_utils.cpp).
 >
