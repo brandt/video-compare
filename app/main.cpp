@@ -561,7 +561,7 @@ int main(int argc, char** argv) {
          {"display-mode", {"-m", "--mode"}, "display mode (layout), 'split' for split screen (default), 'vstack' for vertical stack, 'hstack' for horizontal stack", 1},
          {"window-size", {"-w", "--window-size"}, "override window size, specified as [width]x[height] (e.g. 800x600, 1280x or x480)", 1},
          {"window-fit-display", {"-W", "--window-fit-display"}, "calculate the window size to fit within the usable display bounds while maintaining the video aspect ratio", 0},
-         {"aspect-lock", {"-k", "--aspect-lock"}, "aspect lock mode during resizing: 'off' (default), 'window' for initial window ratio, 'content' for current video/content ratio", 1},
+         {"aspect-lock", {"-k", "--aspect-lock"}, "aspect lock mode during resizing: 'content' (default) for current video/content ratio, 'window' for initial window ratio, 'off' to disable", 1},
          {"aspect-view-mode", {"-x", "--aspect-view-mode"}, "initial aspect view mode: 'stretch' (default), 'original', '16:9', '4:3', or '1:1'", 1},
          {"auto-loop-mode", {"-a", "--auto-loop-mode"}, "auto-loop playback when buffer fills, 'off' for continuous streaming (default), 'on' for forward-only mode, 'pp' for ping-pong mode", 1},
          {"frame-buffer-size", {"-f", "--frame-buffer-size"}, "frame buffer size (e.g. 10, 70 or 150), default is 50", 1},
