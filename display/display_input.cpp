@@ -234,7 +234,7 @@ bool Display::handle_right_video_index_shortcut(const SDL_Keycode keycode, const
   return true;
 }
 
-// F, Shift+F (save selected area), Shift+R/L/B (crop per side), BACKSPACE (clear crop).
+// F, Shift+F (save selected area), Shift+R/L/B (crop per side), Shift+K (auto-crop black borders), BACKSPACE (clear crop).
 bool Display::handle_crop_save_keys(const SDL_Keycode keycode, const bool is_shift_down) {
   auto toggle_crop_mode_for_side = [&](const CropTargetSide side) {
     selection_.toggle_crop_for_side(side);
@@ -255,6 +255,13 @@ bool Display::handle_crop_save_keys(const SDL_Keycode keycode, const bool is_shi
         image_saver_.request_save_frames();
       }
       return true;
+    case SDLK_K:
+      if (is_shift_down) {
+        selection_.reset_crop_mode();
+        selection_.request_auto_crop_black_borders();
+        return true;
+      }
+      return false;
     case SDLK_R:
       if (is_shift_down) { toggle_crop_mode_for_side(CropTargetSide::Right); return true; }
       return false;

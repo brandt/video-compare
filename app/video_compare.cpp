@@ -875,11 +875,17 @@ bool VideoCompare::handle_pending_crop_request(const Side& active_right) {
     }
     const auto clamp_to = [](const int value, const int min_value, const int max_value) { return std::max(min_value, std::min(value, max_value)); };
 
+    // When per_side_rects is set (auto-crop path), pick the rect for this
+    // resolved side; otherwise fall back to the shared single-rect value.
+    const SDL_Rect& source_rect = crop_request.per_side_rects
+                                      ? (side == resolved_left_side ? crop_request.rect_left : crop_request.rect_right)
+                                      : crop_request.rect;
+
     SDL_Rect mapped = {
-        clamp_to(static_cast<int>(std::llround(static_cast<double>(crop_request.rect.x) * side_w / max_width_)), 0, side_w - 1),
-        clamp_to(static_cast<int>(std::llround(static_cast<double>(crop_request.rect.y) * side_h / max_height_)), 0, side_h - 1),
-        std::max(kMinCropDimension, static_cast<int>(std::llround(static_cast<double>(crop_request.rect.w) * side_w / max_width_))),
-        std::max(kMinCropDimension, static_cast<int>(std::llround(static_cast<double>(crop_request.rect.h) * side_h / max_height_))),
+        clamp_to(static_cast<int>(std::llround(static_cast<double>(source_rect.x) * side_w / max_width_)), 0, side_w - 1),
+        clamp_to(static_cast<int>(std::llround(static_cast<double>(source_rect.y) * side_h / max_height_)), 0, side_h - 1),
+        std::max(kMinCropDimension, static_cast<int>(std::llround(static_cast<double>(source_rect.w) * side_w / max_width_))),
+        std::max(kMinCropDimension, static_cast<int>(std::llround(static_cast<double>(source_rect.h) * side_h / max_height_))),
     };
     mapped.w = std::min(mapped.w, side_w - mapped.x);
     mapped.h = std::min(mapped.h, side_h - mapped.y);

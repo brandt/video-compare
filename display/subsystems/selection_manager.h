@@ -17,6 +17,7 @@ class SelectionManager {
   bool wrap() const { return wrap_; }
 
   bool save_selected_area_requested() const { return save_selected_area_; }
+  bool auto_crop_black_borders_requested() const { return auto_crop_black_borders_; }
   bool crop_mode() const { return crop_mode_; }
   CropTargetSide crop_target_side() const { return crop_target_side_; }
 
@@ -42,6 +43,10 @@ class SelectionManager {
   void request_save_selected_area() { save_selected_area_ = true; }
   void cancel_save_selected_area();  // clears flag + state_
 
+  // --- Auto-crop-black-borders request flag (one-shot, consumed next frame) ---
+  void request_auto_crop_black_borders() { auto_crop_black_borders_ = true; }
+  void cancel_auto_crop_black_borders() { auto_crop_black_borders_ = false; }
+
   // --- Crop mode ---
   void start_crop_for_side(CropTargetSide side);
   void reset_crop_mode();
@@ -61,6 +66,7 @@ class SelectionManager {
   Vector2D end_{0.0F, 0.0F};
   bool wrap_{false};
   bool save_selected_area_{false};
+  bool auto_crop_black_borders_{false};
   bool crop_mode_{false};
   CropTargetSide crop_target_side_{CropTargetSide::Undefined};
   PendingCropRequest pending_crop_request_;

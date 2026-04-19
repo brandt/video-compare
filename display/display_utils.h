@@ -90,6 +90,13 @@ SDL_DisplayID display_id_for_index(int index);
 // Defined in display_render.cpp (clipped to source bounds; throws on unknown formats).
 AVFrame* crop_rgb_frame(const AVFrame* src, const SDL_Rect& roi, SDL_Rect* out_effective_roi = nullptr);
 
+// Scan a packed RGB AVFrame for black borders on all four edges and return the
+// inner content rect. `is_10bpc` selects between RGB24 (3 bytes/pixel) and
+// RGB48LE (3 × uint16_t little-endian, 10-bit payload). Returns the full-frame
+// rect when no borders are detected; callers should compare against the input
+// dimensions to decide whether to apply a crop.
+SDL_Rect detect_black_border_crop(const AVFrame* rgb, bool is_10bpc);
+
 std::string get_file_name_and_extension(const std::string& file_path);
 std::string get_file_stem(const std::string& file_path);
 std::string format_right_file_label(const std::string& left_file_name, const std::string& right_file_name, const size_t right_file_number);

@@ -556,6 +556,12 @@ void Display::sdl_finalize_deferred(const AVFrame* left_frame, const AVFrame* ri
   if (selection_.save_selected_area_requested()) {
     possibly_save_selected_area(left_frame, right_frame);
   }
+  if (selection_.auto_crop_black_borders_requested()) {
+    // Auto-crop detection reads from rgb_cache_ which is only populated on
+    // the GPU render path. Surface a one-shot notice in the SDL fallback.
+    notify_user("Auto-crop requires the GPU (libplacebo) renderer");
+    selection_.cancel_auto_crop_black_borders();
+  }
   if (selection_.crop_mode()) {
     possibly_apply_crop();
   }

@@ -1,5 +1,7 @@
 #include "display_utils.h"
 #include <libgen.h>
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <regex>
@@ -94,4 +96,86 @@ std::string format_libav_version(unsigned version) {
   int minor = (version >> 8) & 0xff;
   int micro = version & 0xff;
   return string_sprintf("%2u.%2u.%3u", major, minor, micro);
+}
+
+SDL_Rect detect_black_border_crop(const AVFrame* rgb, const bool is_10bpc) {
+  const int w = rgb ? rgb->width : 0;
+  const int h = rgb ? rgb->height : 0;
+  const SDL_Rect full = {0, 0, std::max(0, w), std::max(0, h)};
+  if (!rgb || w <= 0 || h <= 0 || rgb->data[0] == nullptr) {
+    return full;
+  }
+
+  // Threshold and pass-fraction picked for robustness: luma ≤ 16 in 8-bit
+  // tolerates legal-range black (YUV 16–235 mapping to RGB 0–255 bottoms out
+  // around 0–16 in practice); 99% per row/col absorbs stray bright pixels
+  // from compression noise. RGB48LE stores 10-bit data left-shifted into a
+  // 16-bit container (per metrics_calculator::get_rgb_pixel), so the 16-bit-
+  // scale threshold is `16 << 8`.
+  const int luma_threshold_8bit = 16;
+  const int luma_threshold = is_10bpc ? (luma_threshold_8bit << 8) : luma_threshold_8bit;
+  constexpr float kPassFraction = 0.99F;
+  constexpr float kMaxScanFraction = 0.40F;  // Don't consume more than 40% of each dim.
+
+  const int bytes_per_pixel = is_10bpc ? 6 : 3;
+  const int stride = rgb->linesize[0];
+  const uint8_t* base = rgb->data[0];
+
+  auto row_is_black = [&](int y) {
+    const uint8_t* row = base + static_cast<ptrdiff_t>(y) * stride;
+    int black_px = 0;
+    if (is_10bpc) {
+      const uint16_t* p = reinterpret_cast<const uint16_t*>(row);
+      for (int x = 0; x < w; ++x, p += 3) {
+        const int y_lum = luma709(p[0], p[1], p[2]);
+        if (y_lum <= luma_threshold) ++black_px;
+      }
+    } else {
+      const uint8_t* p = row;
+      for (int x = 0; x < w; ++x, p += 3) {
+        const int y_lum = luma709(p[0], p[1], p[2]);
+        if (y_lum <= luma_threshold) ++black_px;
+      }
+    }
+    return black_px >= static_cast<int>(std::ceil(kPassFraction * static_cast<float>(w)));
+  };
+
+  auto col_is_black = [&](int x, int y_start, int y_end) {
+    const ptrdiff_t px_offset = static_cast<ptrdiff_t>(x) * bytes_per_pixel;
+    const int span = y_end - y_start;
+    int black_px = 0;
+    if (is_10bpc) {
+      for (int y = y_start; y < y_end; ++y) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(base + static_cast<ptrdiff_t>(y) * stride + px_offset);
+        const int y_lum = luma709(p[0], p[1], p[2]);
+        if (y_lum <= luma_threshold) ++black_px;
+      }
+    } else {
+      for (int y = y_start; y < y_end; ++y) {
+        const uint8_t* p = base + static_cast<ptrdiff_t>(y) * stride + px_offset;
+        const int y_lum = luma709(p[0], p[1], p[2]);
+        if (y_lum <= luma_threshold) ++black_px;
+      }
+    }
+    return black_px >= static_cast<int>(std::ceil(kPassFraction * static_cast<float>(span)));
+  };
+
+  const int max_top = static_cast<int>(std::floor(static_cast<float>(h) * kMaxScanFraction));
+  const int max_bottom = static_cast<int>(std::floor(static_cast<float>(h) * kMaxScanFraction));
+  const int max_left = static_cast<int>(std::floor(static_cast<float>(w) * kMaxScanFraction));
+  const int max_right = static_cast<int>(std::floor(static_cast<float>(w) * kMaxScanFraction));
+
+  int top = 0;
+  while (top < max_top && row_is_black(top)) ++top;
+  int bottom = h;
+  while (bottom > h - max_bottom && row_is_black(bottom - 1)) --bottom;
+  if (bottom <= top) return full;
+
+  int left = 0;
+  while (left < max_left && col_is_black(left, top, bottom)) ++left;
+  int right = w;
+  while (right > w - max_right && col_is_black(right - 1, top, bottom)) --right;
+  if (right <= left) return full;
+
+  return SDL_Rect{left, top, right - left, bottom - top};
 }

@@ -643,7 +643,8 @@ bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
   // GPU-fast.
   const bool need_rgb = diff_processor_.subtraction_mode() || print_mouse_position_and_color_ ||
                         print_image_similarity_metrics_ || show_quality_metrics_ ||
-                        selection_.save_selected_area_requested() || image_saver_.save_frames_requested();
+                        selection_.save_selected_area_requested() || selection_.auto_crop_black_borders_requested() ||
+                        image_saver_.save_frames_requested();
   bool have_rgb = false;
   if (need_rgb) {
     have_rgb = rgb_cache_.ensure(left_frame, right_frame, video_width_, video_height_, requires_10_bpc());
@@ -750,6 +751,30 @@ bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
           last_vmaf_right_pts_ = right_frame->pts;
         }
       }
+    }
+
+    // Auto-crop black borders: scan each cached RGB frame independently and
+    // submit a per-side crop request through the existing crop pipeline so it
+    // stacks in crop_history_ and is clearable via BACKSPACE.
+    if (selection_.auto_crop_black_borders_requested()) {
+      const SDL_Rect left_rect = detect_black_border_crop(rgb_cache_.left(), requires_10_bpc());
+      const SDL_Rect right_rect = detect_black_border_crop(rgb_cache_.right(), requires_10_bpc());
+      const bool left_cropped = (left_rect.w != video_width_ || left_rect.h != video_height_);
+      const bool right_cropped = (right_rect.w != video_width_ || right_rect.h != video_height_);
+      if (!left_cropped && !right_cropped) {
+        notify_user("No black borders detected");
+      } else {
+        PendingCropRequest req{};
+        req.per_side_rects = true;
+        req.rect_left = left_rect;
+        req.rect_right = right_rect;
+        req.valid = true;
+        req.apply_left = left_cropped;
+        req.apply_right = right_cropped;
+        req.right_target_index = active_right_index_;
+        selection_.set_pending_crop_request(req);
+      }
+      selection_.cancel_auto_crop_black_borders();
     }
   } else if (need_rgb) {
     // One-shot keys still need to be cleared so they don't re-fire next frame.

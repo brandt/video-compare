@@ -75,6 +75,13 @@ class Vector2D {
 
 struct PendingCropRequest {
   SDL_Rect rect{0, 0, 0, 0};
+  // Used in place of `rect` when per_side_rects is true. Allows auto-crop to
+  // submit different crop rectangles per side (e.g. when each video has a
+  // differently-sized letterbox). Coords are in max_width_ x max_height_ space,
+  // matching `rect`.
+  SDL_Rect rect_left{0, 0, 0, 0};
+  SDL_Rect rect_right{0, 0, 0, 0};
+  bool per_side_rects{false};
   bool valid{false};
   bool clear_requested{false};
   bool apply_left{false};
