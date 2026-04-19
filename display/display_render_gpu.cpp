@@ -807,29 +807,14 @@ void Display::gpu_build_main_video_ops(const RenderContext& ctx, std::vector<Gpu
   const auto& zoom_rect = ctx.zoom_rect;
   const int split_x = ctx.split_x;
 
-  // Src coords passed below are in layout space (where a full side occupies
-  // video_width_ × video_height_). The actual uploaded texture for a side can
-  // be smaller if that side's native resolution is below the max (e.g. 720p
-  // vs 2160p). Scale layout → texture coords per side so libplacebo upscales
-  // the texture to fill the dst rect, matching the SDL path's behavior.
-  auto side_scale = [&](int side) -> std::pair<float, float> {
-    const int tex_w = gpu_renderer_.side_upload_width(side);
-    const int tex_h = gpu_renderer_.side_upload_height(side);
-    if (tex_w <= 0 || tex_h <= 0 || video_width_ <= 0 || video_height_ <= 0) {
-      return {1.f, 1.f};
-    }
-    return {static_cast<float>(tex_w) / static_cast<float>(video_width_), static_cast<float>(tex_h) / static_cast<float>(video_height_)};
-  };
-
   auto push_op = [&](int side, int src_x, int src_y, int src_w, int src_h, const SDL_Rect& video_quad) {
-    const auto [sx, sy] = side_scale(side);
     const SDL_FRect screen_rect = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad, zoom_rect));
     GpuRenderer::SideRenderOp op{};
     op.side = side;
-    op.src_x0 = static_cast<float>(src_x) * sx;
-    op.src_y0 = static_cast<float>(src_y) * sy;
-    op.src_x1 = static_cast<float>(src_x + src_w) * sx;
-    op.src_y1 = static_cast<float>(src_y + src_h) * sy;
+    op.src_x0 = static_cast<float>(src_x);
+    op.src_y0 = static_cast<float>(src_y);
+    op.src_x1 = static_cast<float>(src_x + src_w);
+    op.src_y1 = static_cast<float>(src_y + src_h);
     op.dst_x0 = screen_rect.x;
     op.dst_y0 = screen_rect.y;
     op.dst_x1 = screen_rect.x + screen_rect.w;
@@ -922,9 +907,7 @@ void Display::gpu_build_zoom_magnifier_ops(const RenderContext& ctx,
   const float sy1 = center_layout_y + video_src_half_h;
 
   // Push a side render op whose src rect is in *layout* coords (the per-side
-  // frame offset is applied here), dst in FBO coords. Layout coords are then
-  // scaled into the side's uploaded texture space so smaller-resolution
-  // sources get upscaled by libplacebo to fill the dst rect.
+  // frame offset is applied here), dst in FBO coords.
   auto push_zoom_slice = [&](int side,
                               float layout_x0, float layout_y0, float layout_x1, float layout_y1,
                               float dst_x0, float dst_y0, float dst_x1, float dst_y1) {
@@ -935,14 +918,10 @@ void Display::gpu_build_zoom_magnifier_ops(const RenderContext& ctx,
     const float fsy0 = clamp_range(layout_y0 - y_off, 0.f, static_cast<float>(video_height_));
     const float fsy1 = clamp_range(layout_y1 - y_off, 0.f, static_cast<float>(video_height_));
     if (fsx1 <= fsx0 || fsy1 <= fsy0 || dst_x1 <= dst_x0 || dst_y1 <= dst_y0) return;
-    const int tex_w = gpu_renderer_.side_upload_width(side);
-    const int tex_h = gpu_renderer_.side_upload_height(side);
-    const float sx = (tex_w > 0 && video_width_ > 0) ? (static_cast<float>(tex_w) / static_cast<float>(video_width_)) : 1.f;
-    const float sy = (tex_h > 0 && video_height_ > 0) ? (static_cast<float>(tex_h) / static_cast<float>(video_height_)) : 1.f;
     GpuRenderer::SideRenderOp op{};
     op.side = side;
-    op.src_x0 = fsx0 * sx; op.src_y0 = fsy0 * sy;
-    op.src_x1 = fsx1 * sx; op.src_y1 = fsy1 * sy;
+    op.src_x0 = fsx0; op.src_y0 = fsy0;
+    op.src_x1 = fsx1; op.src_y1 = fsy1;
     op.dst_x0 = dst_x0; op.dst_y0 = dst_y0;
     op.dst_x1 = dst_x1; op.dst_y1 = dst_y1;
     ops.push_back(op);

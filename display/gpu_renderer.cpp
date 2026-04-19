@@ -190,8 +190,6 @@ bool GpuRenderer::upload_frame(int side, const AVFrame* frame) {
   }
 
   frame_mapped_[side] = true;
-  upload_w_[side] = frame->width;
-  upload_h_[side] = frame->height;
   return true;
 }
 

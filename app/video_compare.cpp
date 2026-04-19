@@ -412,9 +412,18 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
 }
 
 void VideoCompare::recreate_format_converter_for_side(const Side& side, const int sws_flags) {
-  const AVPixelFormat output_pixel_format = determine_pixel_format(config_, hdr_passthrough_active_);
-
+  // In GPU-renderer mode (libplacebo does color/format work at render time),
+  // the format converter is used purely to rescale sub-max frames up to
+  // max_width_ × max_height_ — preserving the filterer's native output format.
+  // This keeps every uploaded texture at identical dims, avoiding fractional
+  // src-crop artifacts at the split boundary. In SDL-renderer mode the
+  // converter handles both format conversion and dim scaling as before. At
+  // ctor time display_ is not yet constructed; assume GPU (matches the
+  // filterer ctor assumption) and let the SDL-fallback rebuild correct it.
+  const bool gpu_color = !display_ || display_->get_gpu_renderer_active();
   const auto& filterer = video_filterers_.at(side);
+  const AVPixelFormat output_pixel_format = gpu_color ? filterer->dest_pixel_format() : determine_pixel_format(config_, hdr_passthrough_active_);
+
   ready_to_seek_.init(ReadyToSeek::ProcessorThread::Converter, side);
   format_converters_[side] = std::make_unique<FormatConverter>(filterer->dest_width(), filterer->dest_height(), max_width_, max_height_, filterer->dest_pixel_format(), output_pixel_format, video_decoders_[side]->color_space(),
                                                                video_decoders_[side]->color_range(), side, sws_flags);
@@ -730,15 +739,34 @@ void VideoCompare::format_convert_video(const Side& side) {
 
       if (filtered_frame_queues_[side]->pop(frame_filtered)) {
         if (display_ && display_->get_gpu_renderer_active()) {
-          // GPU renderer: pass filtered frame through without CPU format conversion.
-          // Ensure frame_key metadata is set (normally done by FormatConverter).
-          const AVDictionaryEntry* gen = av_dict_get(frame_filtered->metadata, "filter_generation", nullptr, 0);
-          const std::string frame_key = std::to_string(frame_filtered->pts) + ":" + (gen ? gen->value : "0");
-          set_frame_key(frame_filtered.get(), frame_key);
-          av_dict_set(&frame_filtered->metadata, "original_width", std::to_string(frame_filtered->width).c_str(), 0);
-          av_dict_set(&frame_filtered->metadata, "original_height", std::to_string(frame_filtered->height).c_str(), 0);
+          // GPU renderer: no CPU format conversion, but rescale sub-max frames
+          // up to max_width_ × max_height_ so every uploaded texture has the
+          // same dimensions. This is what keeps the libplacebo split-render's
+          // src crop on an integer texel grid — mismatched-dim textures would
+          // otherwise introduce fractional src_x1 values as the split moves,
+          // producing visible 0–3 px cyclic stretch at the boundary.
+          const bool dims_match = (static_cast<size_t>(frame_filtered->width) == format_converters_[side]->dest_width() &&
+                                   static_cast<size_t>(frame_filtered->height) == format_converters_[side]->dest_height());
+          if (dims_match) {
+            const AVDictionaryEntry* gen = av_dict_get(frame_filtered->metadata, "filter_generation", nullptr, 0);
+            const std::string frame_key = std::to_string(frame_filtered->pts) + ":" + (gen ? gen->value : "0");
+            set_frame_key(frame_filtered.get(), frame_key);
+            av_dict_set(&frame_filtered->metadata, "original_width", std::to_string(frame_filtered->width).c_str(), 0);
+            av_dict_set(&frame_filtered->metadata, "original_height", std::to_string(frame_filtered->height).c_str(), 0);
 
-          converted_frame_queues_[side]->push(std::move(frame_filtered));
+            converted_frame_queues_[side]->push(std::move(frame_filtered));
+          } else {
+            AVFrameUniquePtr frame_converted{av_frame_alloc(), avframe_and_data_deleter};
+            if (av_frame_copy_props(frame_converted.get(), frame_filtered.get()) < 0) {
+              throw std::runtime_error("Copying filtered frame properties");
+            }
+            if (av_image_alloc(frame_converted->data, frame_converted->linesize, format_converters_[side]->dest_width(), format_converters_[side]->dest_height(), format_converters_[side]->dest_pixel_format(), 64) < 0) {
+              throw std::runtime_error("Allocating rescaled picture");
+            }
+            (*format_converters_[side])(frame_filtered.get(), frame_converted.get());
+
+            converted_frame_queues_[side]->push(std::move(frame_converted));
+          }
         } else {
           // scale and convert pixel format before pushing to frame queue for displaying
           AVFrameUniquePtr frame_converted{av_frame_alloc(), avframe_and_data_deleter};

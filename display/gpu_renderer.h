@@ -108,18 +108,6 @@ class GpuRenderer {
     return swapchain_ != nullptr;
   }
 
-  // Dimensions of the most recent successful upload for `side`, in texture
-  // pixels. Returns 0 if no frame has been uploaded yet. Callers building
-  // `SideRenderOp`s need this to express src coords in the texture's own
-  // coordinate space when the uploaded frame is smaller than the display's
-  // layout dimensions (e.g. a 720p right video against a 2160p left).
-  int side_upload_width(int side) const {
-    return (side >= 0 && side < kSideCount) ? upload_w_[side] : 0;
-  }
-  int side_upload_height(int side) const {
-    return (side >= 0 && side < kSideCount) ? upload_h_[side] : 0;
-  }
-
  private:
   pl_log log_;
   pl_vk_inst vk_inst_;
@@ -133,8 +121,6 @@ class GpuRenderer {
   pl_tex frame_tex_[kSideCount][4];
   struct pl_frame mapped_frames_[kSideCount];
   bool frame_mapped_[kSideCount];
-  int upload_w_[kSideCount]{0, 0};
-  int upload_h_[kSideCount]{0, 0};
 
   // Overlay texture (reused across frames).
   pl_tex overlay_tex_;
