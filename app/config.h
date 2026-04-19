@@ -34,7 +34,7 @@ struct InputVideo {
   std::string video_filters;
   std::string demuxer;
   std::string decoder;
-  std::string hw_accel_spec;
+  std::string hw_accel_spec{"auto"};
 
   std::string color_space;
   std::string color_range;

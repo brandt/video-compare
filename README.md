@@ -134,6 +134,9 @@ Compare an AV1 video against itself with and without film grain synthesis applie
 
     video-compare --right-decoder libdav1d:export_side_data=film_grain input_av1.mkv __
 
+By default, `--hwaccel` is `auto`, which picks the first hardware acceleration type supported by the decoder;
+pass `none` to disable hardware acceleration entirely.
+
 Set the same hardware acceleration type for both videos:
 
     video-compare --hwaccel cuda video1.mp4 video2.mp4
@@ -141,6 +144,10 @@ Set the same hardware acceleration type for both videos:
 Set the hardware acceleration type for the left video only:
 
     video-compare --left-hwaccel videotoolbox video1.mp4 video2.mp4
+
+Disable hardware acceleration for the right video only:
+
+    video-compare --right-hwaccel none video1.mp4 video2.mp4
 
 By default, HDR videos are automatically color space converted to sRGB with an initial 500-nit peak light
 level. This default can be overridden with a custom peak light level, such as 850 nits. The specified peak

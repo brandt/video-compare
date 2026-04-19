@@ -70,15 +70,20 @@ VideoDecoder::VideoDecoder(const Side& side,
   ffmpeg::check(avcodec_parameters_to_context(codec_context_, codec_parameters));
 
   // optionally set up hardware acceleration
-  if (!hw_accel_spec.empty()) {
+  const size_t colon_pos = hw_accel_spec.find(":");
+  const std::string hw_accel_first_token = (colon_pos == std::string::npos) ? hw_accel_spec : hw_accel_spec.substr(0, colon_pos);
+  const bool hw_accel_auto = hw_accel_first_token == "auto";
+  const bool hw_accel_disabled = hw_accel_spec.empty() || hw_accel_first_token == "none";
+
+  if (!hw_accel_disabled) {
     const char* device = nullptr;
 
-    const size_t colon_pos = hw_accel_spec.find(":");
-
-    if (colon_pos == std::string::npos) {
-      hw_accel_name_ = hw_accel_spec;
-    } else {
-      hw_accel_name_ = hw_accel_spec.substr(0, colon_pos);
+    if (hw_accel_auto) {
+      // "auto" accepts no device or options suffix
+      if (colon_pos != std::string::npos && !hw_accel_spec.substr(colon_pos + 1).empty()) {
+        throw ffmpeg::Error{"HW acceleration 'auto' does not accept a device or options suffix"};
+      }
+    } else if (colon_pos != std::string::npos) {
       auto device_name = hw_accel_spec.substr(colon_pos + 1);
 
       if (!device_name.empty()) {
@@ -86,34 +91,67 @@ VideoDecoder::VideoDecoder(const Side& side,
       }
     }
 
-    const AVHWDeviceType hw_accel_type = av_hwdevice_find_type_by_name(hw_accel_name_.c_str());
+    AVHWDeviceType hw_accel_type = AV_HWDEVICE_TYPE_NONE;
 
-    if (hw_accel_type == AV_HWDEVICE_TYPE_NONE) {
-      throw ffmpeg::Error{"Could not find HW acceleration: " + hw_accel_name_};
-    }
+    if (hw_accel_auto) {
+      // Iterate the codec's HW configs and pick the first that creates successfully
+      AVBufferRef* hw_device_ctx = nullptr;
 
-    for (int i = 0;; i++) {
-      const AVCodecHWConfig* config = avcodec_get_hw_config(codec_, i);
-
-      if (!config) {
-        throw ffmpeg::Error{string_sprintf("Decoder %s does not support HW device %s", codec_->name, hw_accel_name_.c_str())};
-      }
-
-      if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == hw_accel_type) {
+      for (int i = 0;; i++) {
+        const AVCodecHWConfig* config = avcodec_get_hw_config(codec_, i);
+        if (!config) {
+          break;
+        }
+        if (!(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+          continue;
+        }
+        if (av_hwdevice_ctx_create(&hw_device_ctx, config->device_type, nullptr, hwaccel_options, 0) < 0) {
+          hw_device_ctx = nullptr;
+          continue;
+        }
+        hw_accel_type = config->device_type;
+        hw_accel_name_ = av_hwdevice_get_type_name(hw_accel_type);
         hw_pixel_format_ = config->pix_fmt;
         break;
       }
+
+      if (hw_device_ctx == nullptr) {
+        log_warning(string_sprintf("Auto HW acceleration not available for decoder %s; falling back to software decoding", codec_->name));
+      } else {
+        ffmpeg::check_dict_is_empty(hwaccel_options, string_sprintf("HW acceleration %s", hw_accel_name_.c_str()));
+        codec_context_->hw_device_ctx = hw_device_ctx;
+      }
+    } else {
+      hw_accel_name_ = hw_accel_first_token;
+      hw_accel_type = av_hwdevice_find_type_by_name(hw_accel_name_.c_str());
+
+      if (hw_accel_type == AV_HWDEVICE_TYPE_NONE) {
+        throw ffmpeg::Error{"Could not find HW acceleration: " + hw_accel_name_};
+      }
+
+      for (int i = 0;; i++) {
+        const AVCodecHWConfig* config = avcodec_get_hw_config(codec_, i);
+
+        if (!config) {
+          throw ffmpeg::Error{string_sprintf("Decoder %s does not support HW device %s", codec_->name, hw_accel_name_.c_str())};
+        }
+
+        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == hw_accel_type) {
+          hw_pixel_format_ = config->pix_fmt;
+          break;
+        }
+      }
+
+      AVBufferRef* hw_device_ctx;
+
+      if (av_hwdevice_ctx_create(&hw_device_ctx, hw_accel_type, device, hwaccel_options, 0) < 0) {
+        throw ffmpeg::Error{"Failed to create a HW device context for " + hw_accel_name_};
+      }
+
+      ffmpeg::check_dict_is_empty(hwaccel_options, string_sprintf("HW acceleration %s", hw_accel_name_.c_str()));
+
+      codec_context_->hw_device_ctx = hw_device_ctx;
     }
-
-    AVBufferRef* hw_device_ctx;
-
-    if (av_hwdevice_ctx_create(&hw_device_ctx, hw_accel_type, device, hwaccel_options, 0) < 0) {
-      throw ffmpeg::Error{"Failed to create a HW device context for " + hw_accel_name_};
-    }
-
-    ffmpeg::check_dict_is_empty(hwaccel_options, string_sprintf("HW acceleration %s", hw_accel_name_.c_str()));
-
-    codec_context_->hw_device_ctx = hw_device_ctx;
   }
 
   // parse and remove any video-compare specific decoder options
