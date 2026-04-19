@@ -19,6 +19,7 @@
 >
 > The invariants and behaviors documented below are unchanged; only the addresses have moved, and the mega-functions have been decomposed into focused sub-phases.
 
+
 ## Status (2026-04-17) — all four phases complete
 
 ### Scope of "complete"
@@ -53,9 +54,11 @@ In practice the Apple Silicon CPU absorbs the readback + upload at 4K HDR 60fps 
 
 **Phase 4 — features needing GPU→CPU readback: COMPLETE.** Scope of original plan revised: only the full-screen screenshot's OSD capture truly needs `pl_tex_download`. Zoom magnifier is just another set of `SideRenderOp`s; save-selected-area reuses the Phase 3 `rgb_frames_` cache. All three work in GPU mode now.
 
+
 ## Goal
 
 Replace the CPU-side video processing pipeline (decode → filter → sws_scale → memcpy → SDL texture upload) with a GPU-accelerated pipeline using libplacebo's Vulkan renderer. Target: **4K HDR 60fps** on Apple Silicon, matching mpv's `vo=gpu-next` performance.
+
 
 ## Current pipeline (CPU-bound)
 
@@ -69,6 +72,7 @@ decoder(yuv420p10le)
   ≈ 60ms total per frame → ~16.5 fps at 4K
 ```
 
+
 ## Proposed pipeline (GPU-accelerated)
 
 ```
@@ -80,6 +84,7 @@ decoder(yuv420p10le)
 ```
 
 Everything between decode and present moves to a single GPU call. No sws_scale, no FormatConverter, no texture memcpy.
+
 
 ## Architecture: Option A (libplacebo owns the swapchain)
 
@@ -98,33 +103,33 @@ SDL_Window (SDL_WINDOW_VULKAN)
 
 ### What moves to libplacebo
 
-| Component | Current | libplacebo |
-|-----------|---------|------------|
-| YUV→RGB conversion | FormatConverter / sws_scale | automatic in `pl_render_image` |
-| Color space (BT.2020→709) | zscale filter in VideoFilterer | automatic from `pl_frame.color` |
-| Tone mapping (PQ/HLG→SDR) | zscale + tonemap filter | built-in: hable, mobius, reinhard, bt.2390, clip, spline |
-| HDR passthrough | SDL_COLORSPACE_HDR10 texture | set target `pl_color_space` to match source |
-| Scaling | not currently done in filter | `pl_render_params.upscaler` / `downscaler` |
-| Dithering | not currently done | automatic at output bit depth |
-| Peak detection | MaxCLL from metadata | `pl_peak_detect_params` (GPU histogram) |
-| Video texture upload | SDL_LockTexture + memcpy (17ms) | `pl_map_avframe_ex` (<1ms, DMA) |
-| Video rendering | SDL_RenderTexture (3μs) | `pl_render_image` (<1ms, GPU shader) |
-| Display present | SDL_RenderPresent (40μs) | `pl_swapchain_submit_frame` + `swap_buffers` |
+| Component                 | Current                                    | libplacebo
+|---------------------------|--------------------------------------------|-------------
+| YUV→RGB conversion        | FormatConverter / sws_scale                | automatic in `pl_render_image`
+| Color space (BT.2020→709) | zscale filter in VideoFilterer             | automatic from `pl_frame.color`
+| Tone mapping (PQ/HLG→SDR) | zscale + tonemap filter                    | built-in: hable, mobius, reinhard, bt.2390, clip, spline
+| HDR passthrough           | SDL_COLORSPACE_HDR10 texture               | set target `pl_color_space` to match source
+| Scaling                   | not currently done in filter               | `pl_render_params.upscaler` / `downscaler`
+| Dithering                 | not currently done                         | automatic at output bit depth
+| Peak detection            | MaxCLL from metadata                       | `pl_peak_detect_params` (GPU histogram)
+| Video texture upload      | SDL_LockTexture + memcpy (17ms)            | `pl_map_avframe_ex` (<1ms, DMA)
+| Video rendering           | SDL_RenderTexture (3μs)                    | `pl_render_image` (<1ms, GPU shader)
+| Display present           | SDL_RenderPresent (40μs)                   | `pl_swapchain_submit_frame` + `swap_buffers`
 
 ### What stays on CPU / needs alternative
 
-| Component | Current | Replacement |
-|-----------|---------|-------------|
-| **Text rendering** | SDL_ttf → SDL_CreateTextureFromSurface | SDL_ttf → CPU surface → `pl_tex_upload` → `pl_overlay` |
-| **Help overlay** | ~30 SDL text textures + semi-transparent rect | Composite as `pl_overlay` array on the target frame |
-| **Metadata overlay** | ~20 dynamic SDL text textures | Same: `pl_overlay` |
-| **Message/notification** | SDL text texture with alpha fade | `pl_overlay` with alpha |
-| **Progress dots** | SDL_RenderLine / SDL_RenderRect | Render to small CPU surface → `pl_overlay`, or Vulkan draw commands |
-| **Split line** | SDL_RenderLine | Render to 1-pixel-wide `pl_overlay`, or Vulkan draw |
-| **Selection/crop rect** | SDL_RenderFillRect / SDL_RenderRect | `pl_overlay` or Vulkan draw |
-| **Zoom window** | SDL_RenderReadPixels → texture | `pl_tex_download` from rendered frame → re-upload as `pl_overlay` |
-| **Screenshot** | SDL_RenderReadPixels → PNG/JXL | `pl_tex_download` from rendered frame |
-| **Scope windows** | Separate SDL_Renderer per window | Keep as-is (independent windows, not performance-critical) |
+| Component                 | Current                                   | Replacement
+|---------------------------|-------------------------------------------|--------------
+| **Text rendering**        | SDL_ttf → SDL_CreateTextureFromSurface    | SDL_ttf → CPU surface → `pl_tex_upload` → `pl_overlay`
+| **Help overlay**          | ~30 SDL text textures + semi-transparent rect | Composite as `pl_overlay` array on the target frame
+| **Metadata overlay**      | ~20 dynamic SDL text textures             | Same: `pl_overlay`
+| **Message/notification**  | SDL text texture with alpha fade          | `pl_overlay` with alpha
+| **Progress dots**         | SDL_RenderLine / SDL_RenderRect           | Render to small CPU surface → `pl_overlay`, or Vulkan draw commands
+| **Split line**            | SDL_RenderLine                            | Render to 1-pixel-wide `pl_overlay`, or Vulkan draw
+| **Selection/crop rect**   | SDL_RenderFillRect / SDL_RenderRect       | `pl_overlay` or Vulkan draw
+| **Zoom window**           | SDL_RenderReadPixels → texture            | `pl_tex_download` from rendered frame → re-upload as `pl_overlay`
+| **Screenshot**            | SDL_RenderReadPixels → PNG/JXL            | `pl_tex_download` from rendered frame
+| **Scope windows**         | Separate SDL_Renderer per window          | Keep as-is (independent windows, not performance-critical)
 
 ### Implementation phases
 
@@ -206,19 +211,19 @@ The comparison tool's core feature — split view — needs special handling:
 
 ### Files affected
 
-| File | Changes |
-|------|---------|
-| **display.h** | Replace SDL_Renderer/SDL_Texture members with pl_vulkan/pl_swapchain/pl_renderer. Add pl_tex arrays for overlays. Keep SDL_Window. |
-| **display.cpp** | Major rewrite: init (Vulkan surface + libplacebo), texture upload → pl_map_avframe_ex, rendering → pl_render_image, HUD → pl_overlay, zoom/screenshot → pl_tex_download. |
-| **video_compare.cpp** | Remove FormatConverter stage entirely. Pipeline becomes: decode → filter (minimal) → frame ring → display. Pass raw AVFrames to display instead of RGB-converted frames. |
-| **video_compare.h** | Remove format_converters_ map. |
-| **video_filterer.cpp** | Remove all tonemap/colorspace filters (they move to libplacebo). Filter chain becomes: fps + deinterlace + rotation + crop only. Remove output_pixel_format parameter. |
-| **format_converter.cpp/h** | Delete entirely (libplacebo handles all conversion). |
-| **config.h** | Add tone mapping algorithm selection (maps to pl_tone_map_function). |
-| **main.cpp** | Expose tone mapping algorithm CLI flag. |
-| **makefile** | Add `-lplacebo` to LDLIBS. |
-| **scope_window.cpp** | No changes (keeps its own SDL_Renderer). |
-| **png_saver.cpp, jxl_saver.cpp** | Screenshot source changes from RGB frame to pl_tex_download output. |
+| File                              | Changes
+|-----------------------------------|-----------
+| **display.h**                     | Replace SDL_Renderer/SDL_Texture members with pl_vulkan/pl_swapchain/pl_renderer. Add pl_tex arrays for overlays. Keep SDL_Window.
+| **display.cpp**                   | Major rewrite: init (Vulkan surface + libplacebo), texture upload → pl_map_avframe_ex, rendering → pl_render_image, HUD → pl_overlay, zoom/screenshot → pl_tex_download.
+| **video_compare.cpp**             | Remove FormatConverter stage entirely. Pipeline becomes: decode → filter (minimal) → frame ring → display. Pass raw AVFrames to display instead of RGB-converted frames.
+| **video_compare.h**               | Remove format_converters_ map.
+| **video_filterer.cpp**            | Remove all tonemap/colorspace filters (they move to libplacebo). Filter chain becomes: fps + deinterlace + rotation + crop only. Remove output_pixel_format parameter.
+| **format_converter.cpp/h**        | Delete entirely (libplacebo handles all conversion).
+| **config.h**                      | Add tone mapping algorithm selection (maps to pl_tone_map_function).
+| **main.cpp**                      | Expose tone mapping algorithm CLI flag.
+| **makefile**                      | Add `-lplacebo` to LDLIBS.
+| **scope_window.cpp**              | No changes (keeps its own SDL_Renderer).
+| **png_saver.cpp, jxl_saver.cpp**  | Screenshot source changes from RGB frame to pl_tex_download output.
 
 ### Dependencies
 
@@ -232,15 +237,15 @@ Build: add `pkg-config --cflags --libs libplacebo` to makefile, or `-I/opt/homeb
 
 ### Risk assessment
 
-| Risk | Mitigation |
-|------|------------|
-| MoltenVK compatibility | mpv uses this exact stack on macOS; well-tested |
-| First-frame shader stutter | `pl_cache` for persistent shader cache |
-| Color accuracy vs current CPU path | libplacebo uses higher-precision math; result should be equal or better |
-| HUD rendering complexity | Phase 2 can be deferred; initially skip HUD or use a minimal overlay approach |
-| Split-view rendering | Two `pl_render_image` calls with `target.crop` — straightforward |
-| Linux/Windows portability | Vulkan is native on both; no MoltenVK needed |
-| Subtraction mode | Compute diff on CPU, upload as single frame — or use custom pl_shader |
+| Risk                                | Mitigation
+|-------------------------------------|------------
+| MoltenVK compatibility              | mpv uses this exact stack on macOS; well-tested
+| First-frame shader stutter          | `pl_cache` for persistent shader cache
+| Color accuracy vs current CPU path  | libplacebo uses higher-precision math; result should be equal or better
+| HUD rendering complexity            | Phase 2 can be deferred; initially skip HUD or use a minimal overlay approach
+| Split-view rendering                | Two `pl_render_image` calls with `target.crop` — straightforward
+| Linux/Windows portability           | Vulkan is native on both; no MoltenVK needed
+| Subtraction mode                    | Compute diff on CPU, upload as single frame — or use custom pl_shader
 
 ### Performance expectations
 

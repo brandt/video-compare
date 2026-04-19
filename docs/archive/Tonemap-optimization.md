@@ -279,11 +279,11 @@ The remaining ~2.1-core steady-state gap vs SDR is the HLG→PQ `zscale=t=smpte2
 
 **Approaches tested:**
 
-| approach | upload time | notes |
-|---|---:|---|
-| `SDL_UpdateTexture`, shared texture, sub-rects | 53ms | original — Metal fence wait per texture |
-| `SDL_LockTexture`, per-side double-buffered | 105ms | **worse** — Metal locks on command buffer, not individual textures; 2 textures = 2 waits |
-| `SDL_LockTexture`, per-side single-buffered | **17ms** | **3× faster** — one lock per side, full-frame upload |
+| approach                                        | upload time | notes
+|-------------------------------------------------|------------:|-------
+| `SDL_UpdateTexture`, shared texture, sub-rects  |        53ms | original — Metal fence wait per texture
+| `SDL_LockTexture`, per-side double-buffered     |       105ms | **worse** — Metal locks on command buffer, not individual textures; 2 textures = 2 waits
+| `SDL_LockTexture`, per-side single-buffered     |    **17ms** | **3× faster** — one lock per side, full-frame upload
 
 **What was implemented:**
 

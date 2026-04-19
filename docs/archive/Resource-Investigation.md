@@ -169,11 +169,11 @@ ffmpeg -i testdata/large-2.mov -map 0 -c:v copy -c:a copy -c:s copy \
 
 Same `ffmpeg-full`-linked binary, same machine, 5 s and 15 s runs:
 
-| run           | user@5s | user@15s | Δ/10s wall | steady-state | RSS@15s | CPU% |
-|---------------|--------:|---------:|-----------:|-------------:|--------:|-----:|
-| HDR           |   25.54 |    81.72 |      56.18 |  5.62 cores  | 4.47 GB | 554% |
-| SDR           |   20.34 |    65.31 |      44.97 |  4.50 cores  | 4.42 GB | 444% |
-| Δ (tonemap)   |   +5.20 |   +16.41 |     +11.21 | +1.12 cores  |  +50 MB | +110%|
+| run           | user@5s | user@15s | Δ/10s wall | steady-state | RSS@15s |  CPU% |
+|---------------|--------:|---------:|-----------:|-------------:|--------:|------:|
+| HDR           |   25.54 |    81.72 |      56.18 |  5.62 cores  | 4.47 GB |  554% |
+| SDR           |   20.34 |    65.31 |      44.97 |  4.50 cores  | 4.42 GB |  444% |
+| Δ (tonemap)   |   +5.20 |   +16.41 |     +11.21 | +1.12 cores  |  +50 MB | +110% |
 
 **Isolated cost of HDR tonemapping:** ~1.12 extra cores during steady state, ~5 s extra startup user-CPU, **~50 MB extra RSS (negligible)**. So the HDR tonemap path, while real, explains only about 40 % of the ffmpeg-full vs mainline CPU gap and essentially none of the ~800 MB RSS gap.
 
@@ -248,13 +248,13 @@ This debunks the earlier hypothesis that libavfilter was routing 10-bit format c
 
 | run                      | user@5s | user@15s | Δ/10s | steady-state | RSS@15s |  CPU% |
 |--------------------------|--------:|---------:|------:|-------------:|--------:|------:|
-| HDR                      |   25.86 |    82.27 | 56.41 |  5.64 cores  | 4.28 GB | 559%  |
-| True SDR                 |   15.27 |    47.40 | 32.13 |  3.21 cores  | 4.07 GB | 326%  |
+| HDR                      |   25.86 |    82.27 | 56.41 |  5.64 cores  | 4.28 GB |  559% |
+| True SDR                 |   15.27 |    47.40 | 32.13 |  3.21 cores  | 4.07 GB |  326% |
 | Δ (tonemap, isolated)    |  +10.59 |   +34.87 |+24.28 | +2.43 cores  | +210 MB | +233% |
 
 ### Profile confirms (3 s sample, true-SDR, steady-state)
 
-| module      | HDR samples | True-SDR samples | mainline (HDR passthrough) |
+| module      | HDR samples | True-SDR samples |  mainline (HDR passthrough) |
 |-------------|------------:|-----------------:|----------------------------:|
 | libavcodec  |        1152 |             1182 |                        1125 |
 | libswscale  |        1707 |              265 |                         274 |
