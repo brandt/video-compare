@@ -4,7 +4,7 @@
 #include <map>
 #include <string>
 #include "display_modes.h"
-#include "string_utils.h"
+#include "core/strings/string_utils.h"
 
 namespace MetadataProperties {
 constexpr const char* RESOLUTION = "Resolution";

@@ -4,7 +4,7 @@
 #include <iomanip>
 #include <regex>
 #include <sstream>
-#include "string_utils.h"
+#include "core/strings/string_utils.h"
 
 SDL_DisplayID display_id_for_index(int index) {
   int count = 0;

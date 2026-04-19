@@ -1,8 +1,8 @@
 #include "overlay_manager.h"
 #include <algorithm>
-#include "controls.h"
+#include "display/controls.h"
 #include "../display_utils.h"
-#include "string_utils.h"
+#include "core/strings/string_utils.h"
 
 OverlayManager::~OverlayManager() {
   destroy_help_resources();

@@ -1,4 +1,4 @@
-#include "display.h"
+#include "display/display.h"
 #include <libgen.h>
 #include <algorithm>
 #include <atomic>
@@ -13,19 +13,21 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include "controls.h"
+#include "display/controls.h"
 #include "display_utils.h"
-#include "ffmpeg.h"
-#include "jxl_saver.h"
-#include "metrics_calculator.h"
+#include "core/ffmpeg/ffmpeg.h"
+#include "display/jxl_saver.h"
+#include "analysis/metrics/metrics_calculator.h"
 #include "pixel_format_utils.h"
-#include "scope_window.h"
-#include "source_code_pro_regular_ttf.h"
-#include "version.h"
-#include "video_compare_icon.h"
-#include "vmaf_calculator.h"
+#include "analysis/scopes/scope_window.h"
+#include "assets/fonts/source_code_pro_regular_ttf.h"
+#include "app/version.h"
+#include "assets/icons/video_compare_icon.h"
+#include "analysis/metrics/vmaf_calculator.h"
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>
+#include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>

@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <vector>
 #include "../display_utils.h"
-#include "string_utils.h"
+#include "core/strings/string_utils.h"
 
 MetadataPanel::~MetadataPanel() {
   destroy_resources();

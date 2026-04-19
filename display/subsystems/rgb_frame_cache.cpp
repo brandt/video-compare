@@ -1,6 +1,6 @@
 #include "rgb_frame_cache.h"
-#include "core_types.h"
-#include "format_converter.h"
+#include "core/core_types.h"
+#include "media/format_converter.h"
 extern "C" {
 #include <libavutil/imgutils.h>
 }

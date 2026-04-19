@@ -10,19 +10,19 @@
 #include <string>
 #include <tuple>
 #include <vector>
-#include "core_types.h"
+#include "core/core_types.h"
 #include "subsystems/difference_processor.h"
 #include "display_types.h"
 #include "display_utils.h"
-#include "gpu_renderer.h"
+#include "display/gpu_renderer.h"
 #include "subsystems/image_saver.h"
 #include "subsystems/metadata_panel.h"
 #include "subsystems/overlay_manager.h"
 #include "pixel_format_utils.h"
 #include "subsystems/playback_controller.h"
 #include "subsystems/rgb_frame_cache.h"
-#include "row_workers.h"
-#include "scope_window.h"
+#include "core/concurrency/row_workers.h"
+#include "analysis/scopes/scope_window.h"
 #include "subsystems/selection_manager.h"
 #include "subsystems/view_transform.h"
 extern "C" {

@@ -4,8 +4,8 @@
 #include <iostream>
 #include <string>
 #include <thread>
-#include "jxl_saver.h"
-#include "string_utils.h"
+#include "display/jxl_saver.h"
+#include "core/strings/string_utils.h"
 
 namespace {
 

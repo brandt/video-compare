@@ -69,8 +69,8 @@ else
   LDLIBS += -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lSDL3_ttf -lSDL3
 endif
 
-cpp_src = $(wildcard *.cpp) $(wildcard display/*.cpp) $(wildcard display/subsystems/*.cpp)
-c_src = $(wildcard *.c)
+cpp_src = $(wildcard *.cpp) $(wildcard */*.cpp) $(wildcard */*/*.cpp)
+c_src = $(wildcard *.c) $(wildcard */*.c)
 obj = $(cpp_src:.cpp=.o) $(c_src:.c=.o)
 dep = $(obj:.o=.d)
 target = video-compare

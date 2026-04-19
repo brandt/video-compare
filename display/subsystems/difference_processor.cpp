@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 #include "../display_utils.h"
-#include "row_workers.h"
+#include "core/concurrency/row_workers.h"
 extern "C" {
 #include <libavutil/frame.h>
 }
