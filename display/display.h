@@ -174,6 +174,10 @@ class Display {
   OverlayManager overlay_;
 
   bool input_received_{true};
+  // Reported by VideoCompare each refresh. Drives the SEEK badge in the play-
+  // state tracker — true while left/right PTS diverge during post-seek or
+  // sync-adjust catch-up. Defaults to true (assume in sync).
+  bool playback_in_sync_{true};
   // Frame-ring occupancy relative to current playback position. Rendered in
   // the HUD opposite the FPS counters when show_fps_ is on.
   int frame_buffer_before_{0};
@@ -490,4 +494,7 @@ class Display {
     frame_buffer_before_ = before;
     frame_buffer_after_ = after;
   }
+
+  // Left/right PTS sync state (pushed by VideoCompare). Drives the SEEK badge.
+  void set_playback_in_sync(bool in_sync) { playback_in_sync_ = in_sync; }
 };

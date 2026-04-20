@@ -281,18 +281,48 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         push_text(vid_str, small_font_, FPS_VIDEO_COLOR, vid_x, fps_y, TextAlign::Left);
         push_text(ui_str, small_font_, FPS_UI_COLOR, ui_x, fps_y, TextAlign::Left);
 
-        // Ring-buffer occupancy counter, mirrored on the left at ~33% across
-        // so it visually pairs with the FPS readout on the right.
+        // Play state badge (left) + ring-buffer occupancy counter (right),
+        // mirrored at ~33% across so the pair visually balances the FPS
+        // readout on the right.
+        //
+        // Priority: SEEK > loop modes > play/pause. SEEK surfaces during any
+        // period where the two sides' PTS have diverged (post-seek drain,
+        // sync-adjust catch-up, playing-seek keyframe→target ramp-up) so the
+        // user has a visible cue that the pipeline is transiently catching up.
+        std::string state_str;
+        SDL_Color state_color = TEXT_COLOR;
+        const Loop loop_mode = playback_.loop_mode();
+        if (!playback_in_sync_) {
+          state_str = "[SEEK]";
+          state_color = ZOOM_COLOR;
+        } else if (loop_mode == Loop::ForwardOnly) {
+          state_str = "[LOOP >]";
+          state_color = LOOP_FW_LABEL_COLOR;
+        } else if (loop_mode == Loop::PingPong) {
+          state_str = "[LOOP <>]";
+          state_color = LOOP_PP_LABEL_COLOR;
+        } else if (playback_.play()) {
+          state_str = "[PLAY]";
+          state_color = POSITION_COLOR;
+        } else {
+          state_str = "[PAUSE]";
+          state_color = TEXT_COLOR;
+        }
+
         const std::string buf_str = string_sprintf("[<- %d | %d ->]", frame_buffer_before_, frame_buffer_after_);
 
-        int buf_w = 0, buf_h = 0;
+        int state_w = 0, state_h = 0, buf_w = 0, buf_h = 0;
+        TTF_GetStringSize(small_font_, state_str.c_str(), 0, &state_w, &state_h);
         TTF_GetStringSize(small_font_, buf_str.c_str(), 0, &buf_w, &buf_h);
 
-        const int buf_anchor_x = drawable_width_ / 3;  // ~33% across (mirror of 2/3)
-        const int buf_x = buf_anchor_x - buf_w / 2 + border_extension_;
-        const int buf_y = drawable_height_ - line1_y_ - buf_h;
+        const int left_pair_w = state_w + double_border_extension_ + gap + buf_w + double_border_extension_;
+        const int left_anchor_x = drawable_width_ / 3;  // ~33% across (mirror of 2/3)
+        const int state_x = left_anchor_x - left_pair_w / 2 + border_extension_;
+        const int buf_x = state_x + state_w + double_border_extension_ + gap;
+        const int left_y = drawable_height_ - line1_y_ - std::max(state_h, buf_h);
 
-        push_text(buf_str, small_font_, BUFFER_COLOR, buf_x, buf_y, TextAlign::Left);
+        push_text(state_str, small_font_, state_color, state_x, left_y, TextAlign::Left);
+        push_text(buf_str, small_font_, BUFFER_COLOR, buf_x, left_y, TextAlign::Left);
       }
 
       // Zoom factor — bottom-left (top-right in VStack). Precision varies

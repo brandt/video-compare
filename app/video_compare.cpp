@@ -1628,10 +1628,20 @@ void VideoCompare::compare() {
             side_state.ring.set_current(std::move(first_frame));
           };
 
-          // Only user-initiated scrubs (timeline click, arrow keys, timestamp
-          // paste) need to land exactly on the target while paused. Pure `+`/`-`
-          // fall-throughs skip the drain to stay responsive.
-          const bool drain_to_target = !pure_right_frame_shift;
+          // Drain only when paused and not doing a pure `+`/`-` frame shift.
+          // Rationale:
+          //   - Playing seeks: the main loop's timer-based catch-up already
+          //     advances rapidly from the keyframe to the target (us_until_target
+          //     goes negative, skip_update stays false). Blocking the main
+          //     thread here would freeze the UI for a full GOP duration and
+          //     leaves stale overlay values (e.g. quality metrics) visible.
+          //   - Pure `+`/`-` fall-throughs: each popped frame blocks on a
+          //     pipeline decode and users press these keys rapidly, so tolerate
+          //     the landing imprecision for responsiveness.
+          //   - Paused user-initiated scrubs (timeline click, arrow keys,
+          //     timestamp paste): drain so the single paused frame shown after
+          //     the click is exactly the clicked frame.
+          const bool drain_to_target = !pure_right_frame_shift && !display_->get_play();
 
           if (should_seek(LEFT)) {
             left.ring.clear();
@@ -1843,6 +1853,7 @@ void VideoCompare::compare() {
 
       if (frame_offset >= 0 && last_common_frame_index >= 0) {
         const bool is_playback_in_sync = is_in_sync(left.pts_, right_ptr->pts_, left.delta_pts_, right_ptr->delta_pts_);
+        display_->set_playback_in_sync(is_playback_in_sync);
         display_->set_frame_buffer_counts(left.ring.history_size(), left.ring.prefetch_size());
 
         // reduce refresh rate to 10 Hz for faster re-syncing
