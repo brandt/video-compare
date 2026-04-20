@@ -27,3 +27,8 @@ video-compare
 # Image files
 *.png
 *.jxl
+
+# Input simulation script
+vc_script.txt
+*.log
+tmp

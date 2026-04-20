@@ -564,7 +564,8 @@ int main(int argc, char** argv) {
          {"aspect-lock", {"-k", "--aspect-lock"}, "aspect lock mode during resizing: 'content' (default) for current video/content ratio, 'window' for initial window ratio, 'off' to disable", 1},
          {"aspect-view-mode", {"-x", "--aspect-view-mode"}, "initial aspect view mode: 'stretch' (default), 'original', '16:9', '4:3', or '1:1'", 1},
          {"auto-loop-mode", {"-a", "--auto-loop-mode"}, "auto-loop playback when buffer fills, 'off' for continuous streaming (default), 'on' for forward-only mode, 'pp' for ping-pong mode", 1},
-         {"frame-buffer-size", {"-f", "--frame-buffer-size"}, "frame buffer size (e.g. 10, 70 or 150), default is 50", 1},
+         {"frame-buffer-size", {"-f", "--frame-buffer-size"}, "decoded RGB frame ring capacity per side (history + prefetch each), default is 12; raise for a deeper scrub history, lower for less memory", 1},
+         {"packet-buffer-size", {"--packet-buffer-size"}, "encoded packet spill buffer size per side, with optional suffix (e.g. 128M, 1G, 512000000), default is 256M", 1},
          {"time-shift", {"-t", "--time-shift"}, "shift the time stamps of the right video by a user-specified time offset, optionally with a multiplier (e.g. 0.150, -0.1, x1.04+0.1, x25.025/24-1:30.5)", 1},
          {"wheel-sensitivity", {"-s", "--wheel-sensitivity"}, "mouse wheel sensitivity (e.g. 0.5, -1 or 1.7), default is 1; negative values invert the input direction", 1},
          {"color-space", {"-C", "--color-space"}, "set the color space matrix, specified as [matrix] for the same on both sides, or [l-matrix?]:[r-matrix?] for different values (e.g. 'bt709' or 'bt2020nc:')", 1},
@@ -774,6 +775,35 @@ int main(int argc, char** argv) {
         if (config.frame_buffer_size < 1) {
           throw std::logic_error{"Frame buffer size must be at least 1"};
         }
+      }
+      if (args["packet-buffer-size"]) {
+        const std::string raw = args["packet-buffer-size"];
+        std::smatch sm;
+        const std::regex re("^(\\d+)\\s*([KMGkmg]?)(i?[Bb]?)$");
+        if (!std::regex_match(raw, sm, re)) {
+          throw std::logic_error{"Cannot parse packet buffer size (required format: [bytes] with optional K/M/G suffix, e.g. 128M, 1G, 512000000)"};
+        }
+        const uint64_t base = std::stoull(sm[1].str());
+        const char suffix = sm[2].length() > 0 ? static_cast<char>(std::tolower(sm[2].str()[0])) : '\0';
+        uint64_t multiplier = 1;
+        switch (suffix) {
+          case 'k':
+            multiplier = 1ULL << 10;
+            break;
+          case 'm':
+            multiplier = 1ULL << 20;
+            break;
+          case 'g':
+            multiplier = 1ULL << 30;
+            break;
+          default:
+            multiplier = 1;
+        }
+        const uint64_t bytes = base * multiplier;
+        if (bytes == 0) {
+          throw std::logic_error{"Packet buffer size must be greater than 0"};
+        }
+        config.packet_buffer_bytes = static_cast<size_t>(bytes);
       }
       if (args["time-shift"]) {
         const std::string time_shift_arg = args["time-shift"];

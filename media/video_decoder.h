@@ -30,6 +30,14 @@ class VideoDecoder : public SideAware {
   bool receive(AVFrame* frame, Demuxer* demuxer);
 
   void flush();
+
+  // Reset the PTS-extrapolation fields (first_pts_, previous_pts_, next_pts_)
+  // so the next decoded frame is treated as if it were the first one seen.
+  // Call alongside flush() on an L1 re-decode so the decoder's own timestamp
+  // extrapolation doesn't taint frames decoded starting from a keyframe
+  // mid-stream. `avcodec_flush_buffers` handles codec state; this handles
+  // the VideoDecoder's own PTS bookkeeping layered on top.
+  void reset_pts_state();
   bool swap_dimensions() const;
   unsigned width() const;
   unsigned height() const;

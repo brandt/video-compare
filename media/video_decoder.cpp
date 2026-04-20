@@ -241,6 +241,12 @@ void VideoDecoder::flush() {
   avcodec_flush_buffers(codec_context_);
 }
 
+void VideoDecoder::reset_pts_state() {
+  first_pts_ = AV_NOPTS_VALUE;
+  previous_pts_ = 0;
+  next_pts_ = AV_NOPTS_VALUE;
+}
+
 unsigned VideoDecoder::width() const {
   return codec_context_->width;
 }

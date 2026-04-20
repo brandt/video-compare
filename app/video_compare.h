@@ -14,6 +14,7 @@
 #include "display/display.h"
 #include "media/format_converter.h"
 #include "media/buffering/frame_ring.h"
+#include "media/buffering/packet_ring.h"
 #include "core/data/queue.h"
 #include "analysis/scope_manager.h"
 #include "core/single_decoder_mode.h"
@@ -221,6 +222,7 @@ class VideoCompare {
 
   const Display::Loop auto_loop_mode_;
   const size_t frame_buffer_size_;
+  const size_t packet_buffer_bytes_;
   TimeShifter time_shifter_;
 
   std::map<Side, std::unique_ptr<Demuxer>> demuxers_;
@@ -231,6 +233,7 @@ class VideoCompare {
   VideoFilterContext video_filter_context_;
 
   std::map<Side, std::unique_ptr<PacketQueue>> packet_queues_;
+  std::map<Side, std::unique_ptr<PacketRing>> packet_rings_;
   std::map<Side, std::shared_ptr<DecodedFrameQueue>> decoded_frame_queues_;
   std::map<Side, std::unique_ptr<FrameQueue>> filtered_frame_queues_;
   std::map<Side, std::unique_ptr<FrameQueue>> converted_frame_queues_;

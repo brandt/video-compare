@@ -1,4 +1,5 @@
 #include "app/video_compare.h"
+#include "app/debug_input_script.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <chrono>
@@ -22,7 +23,12 @@ extern "C" {
 #include <libavutil/time.h>
 }
 
-static constexpr size_t QUEUE_SIZE = 5;
+// Inter-stage queue depth between demuxer → decoder → filter → converter.
+// Phase 3 shrank this from 5 to 3: now that the PacketRing is the main
+// spill buffer, these queues just need enough headroom to smooth out
+// burstiness across pipeline stages, not to cache seconds of content.
+// Shrinking recoups frame memory (proportionally more at 4K HDR).
+static constexpr size_t QUEUE_SIZE = 3;
 
 static constexpr uint32_t SLEEP_PERIOD_MS = 10;
 
@@ -42,6 +48,9 @@ static auto avpacket_deleter = [](AVPacket* packet) {
   av_packet_unref(packet);
   delete packet;
 };
+
+// For packets returned by av_packet_alloc / av_packet_clone (not `new`d).
+static auto avpacket_free_deleter = [](AVPacket* packet) { av_packet_free(&packet); };
 
 static auto avframe_deleter = [](AVFrame* frame) { av_frame_free(&frame); };
 
@@ -174,7 +183,7 @@ static void sleep_for_ms(const uint32_t ms) {
 VideoCompare::~VideoCompare() = default;
 
 VideoCompare::VideoCompare(const VideoCompareConfig& config)
-    : config_(config), same_decoded_video_both_sides_(produces_same_decoded_video(config)), auto_loop_mode_(config.auto_loop_mode), frame_buffer_size_(config.frame_buffer_size), time_shifter_(config.time_shift) {
+    : config_(config), same_decoded_video_both_sides_(produces_same_decoded_video(config)), auto_loop_mode_(config.auto_loop_mode), frame_buffer_size_(config.frame_buffer_size), packet_buffer_bytes_(config.packet_buffer_bytes), time_shifter_(config.time_shift) {
   auto install_processor = [&](auto& processor_map, const ReadyToSeek::ProcessorThread thread, const Side& side, auto processor) {
     processor_map[side] = std::move(processor);
     ready_to_seek_.init(thread, side);
@@ -285,6 +294,7 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
   for (const auto& pair : demuxers_) {
     const Side& side = pair.first;
     packet_queues_[side] = std::make_unique<PacketQueue>(QUEUE_SIZE);
+    packet_rings_[side] = std::make_unique<PacketRing>(packet_buffer_bytes_, demuxers_[side]->time_base());
     decoded_frame_queues_[side] = std::make_shared<DecodedFrameQueue>(QUEUE_SIZE);
     filtered_frame_queues_[side] = std::make_unique<FrameQueue>(QUEUE_SIZE);
     converted_frame_queues_[side] = std::make_unique<FrameQueue>(QUEUE_SIZE);
@@ -515,6 +525,11 @@ void VideoCompare::operator()() {
     stages_.emplace_back([this, side]() { format_convert_video(side); });
   }
 
+  // If VIDEO_COMPARE_INPUT_SCRIPT points to a script file, spawn a detached
+  // thread that drives the SDL event queue per the script. See
+  // app/debug_input_script.h for the format.
+  debug_input_script::start_from_env();
+
   compare();
 
   for (auto& stage : stages_) {
@@ -556,6 +571,12 @@ void VideoCompare::demultiplex(const Side& side) {
 
       // Move into queue if first video stream
       if (packet->stream_index == demuxers_[side]->video_stream_index()) {
+        // Clone into the encoded-packet spill buffer for the L1 re-decode path.
+        // Fails silently on OOM (av_packet_clone returns nullptr); the live
+        // pipeline still gets the original.
+        if (AVPacket* cloned = av_packet_clone(packet.get())) {
+          packet_rings_[side]->append(PacketRing::PacketPtr(cloned, avpacket_free_deleter));
+        }
         packet_queues_[side]->push(std::move(packet));
       }
     }
@@ -957,6 +978,11 @@ void VideoCompare::dump_debug_info(const int frame_number, const int64_t effecti
   for (const auto& pair : packet_queues_) {
     std::cout << pair.first.to_string() << " packet demuxer: size=" << pair.second->size() << ", is_stopped=" << pair.second->is_stopped() << ", quit=" << pair.second->is_quit() << std::endl;
   }
+  for (const auto& pair : packet_rings_) {
+    const auto s = pair.second->stats();
+    std::cout << pair.first.to_string() << " packet ring: bytes=" << s.bytes_used << "/" << s.byte_budget << ", packets=" << s.packet_count << ", ranges=" << s.range_count << ", keyframes=" << s.keyframe_count << ", pts=[" << s.pts_min << "," << s.pts_max << "]"
+              << (s.l1_disabled ? " [L1-disabled]" : "") << std::endl;
+  }
   for (const auto& pair : decoded_frame_queues_) {
     std::cout << pair.first.to_string() << " decoder: size=" << pair.second->size() << ", is_stopped=" << pair.second->is_stopped() << ", quit=" << pair.second->is_quit() << std::endl;
   }
@@ -1051,6 +1077,38 @@ void VideoCompare::compare() {
     double next_refresh_at = 0;
 
     const bool log_event_routing = env_flag_enabled("VIDEO_COMPARE_LOG_EVENT_ROUTING");
+    const bool show_packet_ring = env_flag_enabled("VIDEO_COMPARE_SHOW_PACKET_RING");
+    const bool log_seek_timing = env_flag_enabled("VIDEO_COMPARE_LOG_SEEK_TIMING");
+    const bool log_l1_stages = env_flag_enabled("VIDEO_COMPARE_LOG_L1_STAGES");
+
+    // GOP heuristic: if the keyframe-to-target distance exceeds this many
+    // seconds, fall back to L2. L1 decodes serially on the main thread; L2
+    // uses the 4-stage pipeline in parallel plus a demuxer seek. For small
+    // kf-to-target distances L1 wins; for large distances L2 wins. Default
+    // 0.5 s — empirically around the crossover point on macOS HW decoders.
+    //
+    // Amortization: when we seed the ring's history with pre-target frames
+    // (see L1 landing code below), subsequent backward presses hit L0 pivots,
+    // so one L1 fire covers up to frame_buffer_size_ presses. The threshold
+    // accounts for that by being tolerant of single-press cases at the cost
+    // of more-aggressive mashing scenarios (which amortize regardless).
+    double l1_max_kf_distance_sec = 0.5;
+    if (const char* raw = std::getenv("VIDEO_COMPARE_L1_MAX_KF_DISTANCE_SEC"); raw && *raw) {
+      try { l1_max_kf_distance_sec = std::stod(raw); } catch (...) {}
+    }
+
+    // Loop-mode eager-materialize cap: how many seconds of PacketRing content
+    // to decode into the FrameRing when the user enters `,` / `.` loop mode.
+    // Default 5 s. At 4K HDR (≈47.5 MiB/frame × 60 fps) that's ≈14 GiB — set
+    // lower (or use lower-res content) if memory is tight. At 1080p RGB24 5 s
+    // at 30 fps is ≈940 MiB per side.
+    double loop_cap_sec = 5.0;
+    if (const char* raw = std::getenv("VIDEO_COMPARE_LOOP_CAP_SEC"); raw && *raw) {
+      try { loop_cap_sec = std::stod(raw); } catch (...) {}
+    }
+    // Track loop-mode transitions so we can materialize on entry and shrink
+    // the ring back down on exit.
+    Display::Loop previous_loop_mode = Display::Loop::Off;
 
     for (uint64_t frame_number = 0;; ++frame_number) {
       // Set FPS message if needed. GPU renderer shows persistent FPS
@@ -1183,6 +1241,276 @@ void VideoCompare::compare() {
       };
       intake_prefetch();
 
+      // Trim each side's PacketRing to its byte budget. Safe to call every tick:
+      // no-op when under budget; the demuxer thread producer is mutex-synced.
+      // The packet ring stores raw demuxer-PTS; we protect the current displayed
+      // frame's PTS (same time base as packet PTS). Before the first frame
+      // arrives we pass INT64_MIN, which keeps everything while still enforcing
+      // byte budget by dropping farthest ranges.
+      for (auto& pair : side_states) {
+        SideState& ss = pair.second;
+        auto it = packet_rings_.find(ss.side_);
+        if (it == packet_rings_.end() || !it->second) continue;
+        const AVFrame* current = ss.ring.current_frame();
+        const int64_t protect_pts = (current != nullptr) ? current->pts : INT64_MIN;
+        it->second->evict_to_budget(protect_pts);
+      }
+
+      // Periodic PacketRing readout (env-gated; off by default).
+      if (show_packet_ring && (frame_number % 60) == 0) {
+        for (const auto& pair : packet_rings_) {
+          const auto s = pair.second->stats();
+          std::cerr << "[packet-ring " << pair.first.to_string() << "] bytes=" << s.bytes_used << "/" << s.byte_budget << " packets=" << s.packet_count << " ranges=" << s.range_count << " keyframes=" << s.keyframe_count << " pts=[" << s.pts_min << "," << s.pts_max << "]"
+                    << (s.l1_disabled ? " L1-DISABLED" : "") << std::endl;
+        }
+      }
+
+      // Loop-mode eager-materialize on entry, shrink on exit.
+      //
+      // When the user presses `,` or `.` (or when auto-loop fires), the decoded
+      // FrameRing only holds ≈frame_buffer_size_ frames — way too short to be
+      // useful for visual comparison. On mode entry we barrier the pipeline,
+      // grow each side's FrameRing, and eagerly decode the most recent
+      // `loop_cap_sec` seconds from the PacketRing into the ring's history.
+      // On exit we shrink the ring back to `frame_buffer_size_`.
+      {
+        const Display::Loop current_loop_mode = display_->get_buffer_play_loop_mode();
+        if (log_seek_timing && current_loop_mode != previous_loop_mode) {
+          std::cerr << "[loop] mode transition " << static_cast<int>(previous_loop_mode) << "→" << static_cast<int>(current_loop_mode) << std::endl;
+        }
+        if (previous_loop_mode == Display::Loop::Off && current_loop_mode != Display::Loop::Off) {
+          // === Entering loop mode: materialize ===
+          // Capture per-side current frame PTS (AV_TIME_BASE μs since start) so
+          // we know where to stop decoding.
+          std::map<Side, int64_t> current_frame_pts;
+          for (auto& p : side_states) {
+            const AVFrame* cf = p.second.ring.current_frame();
+            if (cf != nullptr) current_frame_pts[p.first] = cf->pts;
+          }
+          if (!current_frame_pts.empty()) {
+            if (log_seek_timing) std::cerr << "[loop] materialize begin, cap=" << loop_cap_sec << "s" << std::endl;
+            display_->set_pending_message("Loop: decoding buffered range…");
+            const auto loop_t_start = std::chrono::steady_clock::now();
+
+            // --- Barrier (same pattern as L1) ---
+            const auto all_sides = [](const Side&) { return true; };
+            ready_to_seek_.reset_all();
+            for (auto& p : seeking_per_side_) p.second.store(true, std::memory_order_relaxed);
+            for (auto& p : packet_queues_) {
+              p.second->stop();
+              p.second->empty();
+            }
+            auto loop_empty_queues = [&]() {
+              for (auto& p : decoded_frame_queues_) p.second->empty();
+              for (auto& p : filtered_frame_queues_) p.second->empty();
+              for (auto& p : converted_frame_queues_) p.second->empty();
+            };
+            while (!ready_to_seek_.all_are_idle_where(all_sides)) {
+              loop_empty_queues();
+              sleep_for_ms(SLEEP_PERIOD_MS);
+            }
+            loop_empty_queues();
+            // Stop worker dec.flush race (same fix as in L1).
+            for (auto& p : seeking_per_side_) p.second.store(false, std::memory_order_relaxed);
+
+            // --- Reinit filterers (close_src was called during barrier) ---
+            for (auto& p : video_filterers_) {
+              p.second->consume_filter_change();
+              p.second->reinit();
+            }
+
+            // --- Per-side eager decode ---
+            // Capacity: enough for cap_sec seconds at a generous frame-rate
+            // assumption. Excess capacity is harmless — FrameRing only holds
+            // what gets pushed.
+            const double framerate_guess = 60.0;
+            const size_t frame_count_guess = static_cast<size_t>(std::ceil(loop_cap_sec * framerate_guess)) + 8;
+            const int64_t cap_us = static_cast<int64_t>(loop_cap_sec * AV_TIME_BASE);
+
+            try {
+              for (auto& p : side_states) {
+                const Side& side = p.first;
+                SideState& ss = p.second;
+                auto cfp_it = current_frame_pts.find(side);
+                if (cfp_it == current_frame_pts.end()) continue;
+                const int64_t target_us = cfp_it->second;
+                const int64_t start_us = target_us - cap_us;
+
+                auto ring_it = packet_rings_.find(side);
+                if (ring_it == packet_rings_.end() || !ring_it->second) continue;
+
+                const AVRational stream_tb = demuxers_[side]->time_base();
+                const int64_t demuxer_start_us = demuxers_[side]->start_time();
+                // Convert loop-start (μs since start) back to stream tb for
+                // PacketRing lookup: add start_time to get packet-relative, then
+                // rescale. Clamp to 0 so we never ask for negative stream pts.
+                const int64_t start_raw = av_rescale_q(std::max<int64_t>(start_us + demuxer_start_us, 0), AV_TIME_BASE_Q, stream_tb);
+                auto hit = ring_it->second->keyframe_at_or_before(start_raw);
+                if (!hit.has_value()) continue;  // no keyframe; skip side
+
+                VideoDecoder& dec = *video_decoders_[side];
+                VideoFilterer& flt = *video_filterers_[side];
+                FormatConverter& cvt = *format_converters_[side];
+                dec.flush();
+                dec.reset_pts_state();
+
+                ss.ring.clear();
+                ss.ring.set_capacities(frame_count_guess, frame_count_guess);
+
+                const bool gpu_on = (display_ && display_->get_gpu_renderer_active());
+                // Push one decoded frame into the ring's prefetch if within loop
+                // range. Returns true when we've passed target_us (past end of
+                // loop); caller should stop feeding packets.
+                auto push_decoded = [&](AVFrame* decoded_raw) -> bool {
+                  AVFrameSharedPtr decoded_sw;
+                  if (decoded_raw->format == dec.hw_pixel_format()) {
+                    decoded_sw = AVFrameSharedPtr{av_frame_alloc(), avframe_deleter};
+                    if (av_hwframe_transfer_data(decoded_sw.get(), decoded_raw, 0) < 0) return false;
+                    if (av_frame_copy_props(decoded_sw.get(), decoded_raw) < 0) return false;
+                  } else {
+                    decoded_sw = AVFrameSharedPtr{av_frame_clone(decoded_raw), avframe_deleter};
+                    if (!decoded_sw) return false;
+                  }
+                  if (!flt.send(decoded_sw.get())) return false;
+                  while (true) {
+                    AVFrameUniquePtr filtered{av_frame_alloc(), avframe_deleter};
+                    if (!flt.receive(filtered.get())) break;
+                    AVFrameUniquePtr out;
+                    if (gpu_on) {
+                      const bool dims_match = (static_cast<size_t>(filtered->width) == cvt.dest_width() && static_cast<size_t>(filtered->height) == cvt.dest_height());
+                      if (dims_match) {
+                        const AVDictionaryEntry* gen = av_dict_get(filtered->metadata, "filter_generation", nullptr, 0);
+                        const std::string frame_key = std::to_string(filtered->pts) + ":" + (gen ? gen->value : "0");
+                        set_frame_key(filtered.get(), frame_key);
+                        av_dict_set(&filtered->metadata, "original_width", std::to_string(filtered->width).c_str(), 0);
+                        av_dict_set(&filtered->metadata, "original_height", std::to_string(filtered->height).c_str(), 0);
+                        out = AVFrameUniquePtr{filtered.release(), avframe_deleter};
+                      } else {
+                        AVFrameUniquePtr rescaled{av_frame_alloc(), avframe_and_data_deleter};
+                        if (av_frame_copy_props(rescaled.get(), filtered.get()) < 0) return false;
+                        if (av_image_alloc(rescaled->data, rescaled->linesize, cvt.dest_width(), cvt.dest_height(), cvt.dest_pixel_format(), 64) < 0) return false;
+                        cvt(filtered.get(), rescaled.get());
+                        out = std::move(rescaled);
+                      }
+                    } else {
+                      AVFrameUniquePtr converted{av_frame_alloc(), avframe_and_data_deleter};
+                      if (av_frame_copy_props(converted.get(), filtered.get()) < 0) return false;
+                      if (av_image_alloc(converted->data, converted->linesize, cvt.dest_width(), cvt.dest_height(), cvt.dest_pixel_format(), 64) < 0) return false;
+                      cvt(filtered.get(), converted.get());
+                      out = std::move(converted);
+                    }
+                    if (out->pts > target_us) return true;  // past end
+                    if (out->pts < start_us) continue;       // before start
+                    // In range: push to prefetch tail.
+                    if (!ss.ring.push_prefetch(std::move(out))) break;
+                  }
+                  return false;
+                };
+
+                bool stop = false;
+                hit->range->iterate_from(hit->absolute_buffer_index, [&](const AVPacket* src_pkt) -> bool {
+                  if (stop) return false;
+                  AVPacket* cloned = av_packet_clone(src_pkt);
+                  if (!cloned) return false;
+                  dec.send(cloned);
+                  av_packet_free(&cloned);
+                  while (!stop) {
+                    AVFrame* raw = av_frame_alloc();
+                    if (!raw) return false;
+                    if (!dec.receive(raw, demuxers_[side].get())) {
+                      av_frame_free(&raw);
+                      break;
+                    }
+                    const bool past = push_decoded(raw);
+                    av_frame_free(&raw);
+                    if (past) stop = true;
+                  }
+                  return !stop;
+                });
+                if (!stop) {
+                  dec.send(nullptr);
+                  while (!stop) {
+                    AVFrame* raw = av_frame_alloc();
+                    if (!raw) break;
+                    if (!dec.receive(raw, demuxers_[side].get())) {
+                      av_frame_free(&raw);
+                      break;
+                    }
+                    const bool past = push_decoded(raw);
+                    av_frame_free(&raw);
+                    if (past) stop = true;
+                  }
+                }
+
+                // Shift all prefetched frames through to fill history with the
+                // oldest-first layout. After the loop, current = newest decoded
+                // frame and history contains the rest in reverse-time order.
+                while (ss.ring.prefetch_size() > 0) ss.ring.advance();
+              }
+            } catch (const std::exception& ex) {
+              std::cerr << "[loop-materialize] exception: " << ex.what() << std::endl;
+            } catch (...) {
+              std::cerr << "[loop-materialize] unknown exception" << std::endl;
+            }
+
+            // Fix up per-side SideState bookkeeping. Use each side's final
+            // current frame (post-materialize) to re-establish pts_.
+            for (auto& p : side_states) {
+              const Side& side = p.first;
+              SideState& ss = p.second;
+              AVFrame* cur_frame = ss.ring.current_frame();
+              if (cur_frame == nullptr) continue;
+              if (side.is_left()) {
+                ss.effective_time_shift_ = 0;
+                ss.pts_ = cur_frame->pts;
+              } else {
+                ss.effective_time_shift_ = time_shifter_.static_shift() + time_shifter_.dynamic_shift(cur_frame->pts);
+                ss.pts_ = cur_frame->pts - ss.effective_time_shift_;
+              }
+              ss.previous_decoded_picture_number_ = -1;
+              ss.decoded_picture_number_ = 1;
+            }
+
+            // Post-materialize cleanup: flush decoders + reinit filterers so the
+            // pipeline resumes clean; seek demuxers just past current so
+            // packet_queues_ refill from there on loop exit.
+            for (auto& p : video_decoders_) {
+              p.second->flush();
+              p.second->reset_pts_state();
+            }
+            for (auto& p : video_filterers_) p.second->reinit();
+            for (auto& p : demuxers_) {
+              const Side& side = p.first;
+              auto cfp_it = current_frame_pts.find(side);
+              if (cfp_it == current_frame_pts.end()) continue;
+              const double start_time_sec = static_cast<double>(demuxers_[side]->start_time()) * AV_TIME_TO_SEC;
+              const double target_sec = (static_cast<double>(cfp_it->second) * AV_TIME_TO_SEC) + start_time_sec + 0.001;
+              p.second->seek(static_cast<float>(target_sec), true);
+            }
+            for (auto& p : packet_queues_) p.second->restart();
+            for (auto& p : decoded_frame_queues_) p.second->restart();
+            for (auto& p : filtered_frame_queues_) p.second->restart();
+            for (auto& p : converted_frame_queues_) p.second->restart();
+
+            const auto loop_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - loop_t_start).count();
+            const int left_span = left.ring.history_plus_current_size();
+            const int right_span = right_ptr->ring.history_plus_current_size();
+            display_->set_pending_message(string_sprintf("Loop: %.1fs buffered (%d/%d frames, %lldms)", loop_cap_sec, left_span, right_span, static_cast<long long>(loop_elapsed)));
+            if (log_seek_timing) std::cerr << "[loop] materialize done in " << loop_elapsed << "ms, left=" << left_span << " right=" << right_span << " frames" << std::endl;
+            frame_offset = 0;
+          }
+        } else if (previous_loop_mode != Display::Loop::Off && current_loop_mode == Display::Loop::Off) {
+          // === Exiting loop mode: shrink FrameRing back to frame_buffer_size_ ===
+          // set_capacities evicts extras from the back of each deque, keeping
+          // the most recent frames around the cursor.
+          for (auto& p : side_states) {
+            p.second.ring.set_capacities(frame_buffer_size_, frame_buffer_size_);
+          }
+          display_->set_pending_message("Loop: exit");
+        }
+        previous_loop_mode = current_loop_mode;
+      }
+
       // handle HDR display state change (window moved between HDR/SDR displays)
       const bool hdr_changed = handle_hdr_state_change();
 
@@ -1231,6 +1559,14 @@ void VideoCompare::compare() {
 
       // if seeking is required, drain packet and frame queues
       if ((seek_relative != 0.0F) || (shift_right_frames != 0) || force_seek_current_position) {
+        const auto seek_t_start = std::chrono::steady_clock::now();
+        const char* seek_tier = "L2";  // default; pivot / L1 paths override below
+        int64_t seek_target_pts_log = AV_NOPTS_VALUE;  // populated by L1 when known
+        auto log_seek = [&](const char* override_tier = nullptr) {
+          if (!log_seek_timing) return;
+          const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - seek_t_start).count();
+          std::cerr << "[seek-timing] tier=" << (override_tier ? override_tier : seek_tier) << " shift_right_frames=" << shift_right_frames << " seek_relative=" << seek_relative << " target_pts=" << seek_target_pts_log << " elapsed_us=" << elapsed_us << std::endl;
+        };
         // Any activity entering the seek block permanently disables sticky single-
         // decoder mode: once the right side has diverged from the left (in PTS, crop,
         // or filter), it can't silently re-converge without the user explicitly resetting
@@ -1304,6 +1640,7 @@ void VideoCompare::compare() {
         }
 
         if (backward_pivot_possible) {
+          seek_tier = "L0back";
           const int n = -shift_right_frames;
           for (auto& pair : side_states) {
             if (!pair.first.is_right()) {
@@ -1327,6 +1664,7 @@ void VideoCompare::compare() {
           // Don't sync until the next iteration (consistent with the full-seek path).
           skip_update = true;
         } else if (forward_pivot_possible) {
+          seek_tier = "L0forward";
           const int n = shift_right_frames;
           for (auto& pair : side_states) {
             if (!pair.first.is_right()) {
@@ -1351,6 +1689,463 @@ void VideoCompare::compare() {
         } else {
           // Predicate: does this side participate in this seek?
           const auto should_seek = [pure_right_frame_shift](const Side& s) -> bool { return !pure_right_frame_shift || s.is_right(); };
+
+          // =====================================================================
+          // L1 re-decode fast path.
+          //
+          // When the user's seek target is close enough to the nearest keyframe
+          // in our PacketRing, we can drive the decoder(s) inline from the
+          // keyframe instead of a full L2 pipeline drain. Scope includes:
+          //   - pure right frame shift (`-` / `+`), either direction
+          //   - relative seeks (Shift+A/D, arrow keys, PageUp/Down)
+          //   - absolute seeks (paused timeline click)
+          //
+          // Eligibility gates below fall back to L2 if any fail.
+          //   - force_seek_current_position (crop/HDR/filter reconfig): L2 handles
+          //     dimension recalc and format-converter recreation; L1 stays simpler.
+          //   - single_decoder_mode: shared decoder between sides is incompatible
+          //     with independent L1 per-side flushes.
+          //   - GOP heuristic (VIDEO_COMPARE_L1_MAX_KF_DISTANCE_SEC, default 0.5s):
+          //     keeps L1 off long-GOP content where L2's parallel pipeline wins.
+          // =====================================================================
+          bool l1_eligible = !force_seek_current_position && !single_decoder_mode_.enabled();
+          const char* l1_skip_reason = force_seek_current_position ? "force-seek-current-position" : (single_decoder_mode_.enabled() ? "single-decoder" : nullptr);
+
+          std::map<Side, int64_t> l1_target_pts;         // raw demuxer-time_base PTS (for PacketRing lookup)
+          std::map<Side, int64_t> l1_target_frame_pts;   // AV_TIME_BASE microseconds-since-start (for decoded-frame comparison)
+          std::map<Side, float> l1_target_sec;           // seconds (for post-L1 demuxer reseek)
+
+          // Compute per-side target position (seconds in the side's own axis).
+          // Scoped so the locals don't collide with L2's target-calc below
+          // when we fall through.
+          float l1_next_left_position_cache = 0.0F;  // valid iff l1_eligible && should_seek(LEFT)
+          auto compute_side_target_sec = [&](const Side& side, const SideState& ss) -> float {
+            if (side.is_left()) return l1_next_left_position_cache;
+            const float right_position = left.pts_ * AV_TIME_TO_SEC + ss.start_time_;
+            const bool right_is_single_frame = media_frame_detection_states_.at(side).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame;
+            float eff = seek_relative;
+            if (right_is_single_frame && !seek_from_start) eff = ss.delta_pts_ * AV_TIME_TO_SEC;
+            float pos = (seek_from_start && !right_is_single_frame) ? (shortest_duration_ * eff + ss.start_time_) : (right_position + eff);
+            const float min_right_position = (ss.first_pts_ > INT64_MIN) ? (ss.first_pts_ * AV_TIME_TO_SEC + ss.start_time_) : ss.start_time_;
+            pos = std::max(pos, min_right_position);
+            pos += time_shifter_.static_shift() * AV_TIME_TO_SEC;
+            pos += static_cast<float>(time_shifter_.dynamic_shift(static_cast<int64_t>((pos - ss.start_time_) / AV_TIME_TO_SEC), false)) * AV_TIME_TO_SEC;
+            return pos;
+          };
+          // LEFT target (if participating). Mirrors L2's left calc.
+          if (l1_eligible && should_seek(LEFT)) {
+            const bool left_is_sf = media_frame_detection_states_.at(LEFT).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame;
+            const float min_left = (left.first_pts_ > INT64_MIN) ? (left.first_pts_ * AV_TIME_TO_SEC + left.start_time_) : left.start_time_;
+            const float left_pos = left.pts_ * AV_TIME_TO_SEC + left.start_time_;
+            float eff = seek_relative;
+            if (left_is_sf && !seek_from_start) eff = left.delta_pts_ * AV_TIME_TO_SEC;
+            float pos = (seek_from_start && !left_is_sf) ? (shortest_duration_ * eff + left.start_time_) : (left_pos + eff);
+            l1_next_left_position_cache = std::max(pos, min_left);
+          }
+
+          // Per-side eligibility: all seeking sides must have a valid PacketRing
+          // that covers the target and a keyframe close enough to it.
+          if (l1_eligible) {
+            for (auto& pair : side_states) {
+              const Side& side = pair.first;
+              if (!should_seek(side)) continue;
+              SideState& ss = pair.second;
+
+              const bool this_is_single_frame = media_frame_detection_states_.at(side).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame;
+              if (this_is_single_frame) {
+                l1_eligible = false;
+                l1_skip_reason = "single-frame-media";
+                break;
+              }
+
+              auto ring_it = packet_rings_.find(side);
+              if (ring_it == packet_rings_.end() || !ring_it->second) {
+                l1_eligible = false;
+                l1_skip_reason = "no-packet-ring";
+                break;
+              }
+              if (ring_it->second->l1_disabled()) {
+                l1_eligible = false;
+                l1_skip_reason = "l1-disabled";
+                break;
+              }
+
+              const float target_sec = compute_side_target_sec(side, ss);
+              const AVRational stream_tb = demuxers_[side]->time_base();
+              const int64_t target_in_av_time = static_cast<int64_t>(std::llround((static_cast<double>(target_sec) - ss.start_time_) * static_cast<double>(AV_TIME_BASE)));
+              const int64_t target_raw_pts = av_rescale_q(target_in_av_time, AV_TIME_BASE_Q, stream_tb);
+
+              if (!ring_it->second->covers(target_raw_pts)) {
+                l1_eligible = false;
+                l1_skip_reason = "target-not-covered";
+                if (log_seek_timing) {
+                  const auto s = ring_it->second->stats();
+                  std::cerr << "[l1-skip] side=" << side.to_string() << " target_pts=" << target_raw_pts << " ring_pts=[" << s.pts_min << "," << s.pts_max << "] bytes=" << s.bytes_used << " tb=" << stream_tb.num << "/" << stream_tb.den << std::endl;
+                }
+                break;
+              }
+
+              // GOP heuristic.
+              auto kf_hit = ring_it->second->keyframe_at_or_before(target_raw_pts);
+              if (!kf_hit.has_value()) {
+                l1_eligible = false;
+                l1_skip_reason = "no-keyframe-hit";
+                break;
+              }
+              const int64_t kf_distance_ticks = target_raw_pts - kf_hit->kf_pts;
+              const double kf_distance_sec = static_cast<double>(kf_distance_ticks) * static_cast<double>(stream_tb.num) / static_cast<double>(stream_tb.den);
+              if (kf_distance_sec > l1_max_kf_distance_sec) {
+                l1_eligible = false;
+                l1_skip_reason = "gop-too-long";
+                if (log_seek_timing) {
+                  std::cerr << "[l1-skip] side=" << side.to_string() << " kf_distance=" << kf_distance_sec << "s > " << l1_max_kf_distance_sec << "s" << std::endl;
+                }
+                break;
+              }
+
+              l1_target_pts[side] = target_raw_pts;
+              l1_target_frame_pts[side] = target_in_av_time;
+              l1_target_sec[side] = target_sec;
+            }
+          }
+          if (log_seek_timing && !l1_eligible && l1_skip_reason) {
+            std::cerr << "[l1-skip] reason=" << l1_skip_reason << std::endl;
+          }
+
+          if (l1_eligible) {
+            // ==== L1 path ====
+            seek_tier = "L1";
+            // Log the target for the first seeking right side (there's at most
+            // one active right at a time from the user's perspective).
+            for (auto& p : l1_target_pts) {
+              seek_target_pts_log = p.second;
+              break;
+            }
+            if (log_l1_stages) std::cerr << "[l1-stage] enter" << std::endl;
+            ready_to_seek_.reset_all();
+            for (auto& pair : seeking_per_side_) {
+              pair.second.store(should_seek(pair.first), std::memory_order_relaxed);
+            }
+            for (auto& pair : packet_queues_) {
+              if (!should_seek(pair.first)) continue;
+              pair.second->stop();
+              pair.second->empty();
+            }
+            auto l1_empty_frame_queues = [&]() {
+              for (auto& p : decoded_frame_queues_)
+                if (should_seek(p.first)) p.second->empty();
+              for (auto& p : filtered_frame_queues_)
+                if (should_seek(p.first)) p.second->empty();
+              for (auto& p : converted_frame_queues_)
+                if (should_seek(p.first)) p.second->empty();
+            };
+            while (!ready_to_seek_.all_are_idle_where(should_seek)) {
+              l1_empty_frame_queues();
+              sleep_for_ms(SLEEP_PERIOD_MS);
+            }
+            l1_empty_frame_queues();
+            if (log_l1_stages) std::cerr << "[l1-stage] barrier-idle" << std::endl;
+
+            // CRITICAL: clear seeking flags now that the barrier has idled.
+            // While is_seeking is true, the decode_video worker calls
+            // video_decoders_[side]->flush() every 10 ms in its sleep loop
+            // (app/video_compare.cpp:574). That races with the main-thread
+            // avcodec_send_packet below and crashes the decoder.
+            //
+            // Clearing the flags while all queues remain stopped keeps the
+            // workers sleeping passively (is_stopped && !is_seeking → just
+            // sleep_for_ms, no codec access).
+            for (auto& pair : seeking_per_side_) {
+              if (should_seek(pair.first)) pair.second.store(false, std::memory_order_relaxed);
+            }
+
+            // Per-seeking-side: flush decoder, reinit filter graph, feed packets
+            // from keyframe, capture the frame whose PTS >= target, seed
+            // ring.history with the pre-target frames, set ring.current().
+            //
+            // FFmpeg send/receive/reinit can throw. Wrap so L1 fallback to L2
+            // instead of tearing down the program.
+            bool l1_ok = true;
+            const char* l1_fail_reason = nullptr;
+            try {
+            // Filter graph was close_src'd during the barrier; consume any
+            // pending filter-change request (so a pending crop snapshot applies)
+            // and rebuild the graph so it accepts frames again.
+            for (auto& pair : video_filterers_) {
+              if (!should_seek(pair.first)) continue;
+              pair.second->consume_filter_change();
+              pair.second->reinit();
+            }
+            if (log_l1_stages) std::cerr << "[l1-stage] filter-reinit-done" << std::endl;
+            for (auto& pair : side_states) {
+              const Side& side = pair.first;
+              if (!should_seek(side)) continue;
+              SideState& side_state = pair.second;
+
+              const int64_t target_pts = l1_target_pts[side];
+              const int64_t target_frame_pts = l1_target_frame_pts[side];
+              auto hit = packet_rings_[side]->keyframe_at_or_before(target_pts);
+              if (!hit.has_value()) {
+                l1_ok = false;
+                l1_fail_reason = "no-keyframe-hit";
+                break;
+              }
+
+              VideoDecoder& dec = *video_decoders_[side];
+              VideoFilterer& flt = *video_filterers_[side];
+              FormatConverter& cvt = *format_converters_[side];
+
+              if (log_l1_stages) std::cerr << "[l1-stage] side=" << side.to_string() << " before dec.flush" << std::endl;
+              dec.flush();
+              dec.reset_pts_state();
+              if (log_l1_stages) std::cerr << "[l1-stage] side=" << side.to_string() << " after dec.flush, kf_pts=" << hit->kf_pts << " target_pts=" << target_pts << " kf_idx=" << hit->absolute_buffer_index << std::endl;
+
+              AVFrameUniquePtr captured{nullptr, avframe_and_data_deleter};
+              // Pre-target frames we decode on the way to target_frame_pts.
+              // After landing we seed these into the ring's history so subsequent
+              // backward presses hit the L0 pivot path rather than re-firing L1
+              // and re-decoding the same GOP.
+              //
+              // Capped at frame_buffer_size_ entries (FrameRing's history
+              // capacity); excess entries at the front are dropped as we walk
+              // forward so only the most recent pre-target frames are kept.
+              std::deque<AVFrameUniquePtr> pre_target_frames;
+              const std::size_t history_cap = frame_buffer_size_;
+
+              // Pump one decoded frame path: hw-transfer, filter, convert,
+              // check vs target_pts. Captures and stops when landed.
+              auto try_land = [&](AVFrame* decoded_raw) -> bool {
+                AVFrameSharedPtr decoded_sw;
+                if (decoded_raw->format == dec.hw_pixel_format()) {
+                  decoded_sw = AVFrameSharedPtr{av_frame_alloc(), avframe_deleter};
+                  if (av_hwframe_transfer_data(decoded_sw.get(), decoded_raw, 0) < 0) return false;
+                  if (av_frame_copy_props(decoded_sw.get(), decoded_raw) < 0) return false;
+                } else {
+                  // Take a ref-owning shared_ptr wrapping the raw frame (no copy).
+                  decoded_sw = AVFrameSharedPtr{av_frame_clone(decoded_raw), avframe_deleter};
+                  if (!decoded_sw) return false;
+                }
+
+                if (!flt.send(decoded_sw.get())) return false;
+                const bool gpu_on = (display_ && display_->get_gpu_renderer_active());
+                while (true) {
+                  AVFrameUniquePtr filtered{av_frame_alloc(), avframe_deleter};
+                  if (!flt.receive(filtered.get())) break;
+
+                  AVFrameUniquePtr out;
+                  if (gpu_on) {
+                    // Mirror the GPU branch of format_convert_video: if filtered
+                    // dims match destination, pass the filtered frame through
+                    // with frame_key + original_w/h metadata tagged; otherwise
+                    // rescale via the format converter.
+                    const bool dims_match = (static_cast<size_t>(filtered->width) == cvt.dest_width() && static_cast<size_t>(filtered->height) == cvt.dest_height());
+                    if (dims_match) {
+                      const AVDictionaryEntry* gen = av_dict_get(filtered->metadata, "filter_generation", nullptr, 0);
+                      const std::string frame_key = std::to_string(filtered->pts) + ":" + (gen ? gen->value : "0");
+                      set_frame_key(filtered.get(), frame_key);
+                      av_dict_set(&filtered->metadata, "original_width", std::to_string(filtered->width).c_str(), 0);
+                      av_dict_set(&filtered->metadata, "original_height", std::to_string(filtered->height).c_str(), 0);
+                      out = AVFrameUniquePtr{filtered.release(), avframe_deleter};
+                    } else {
+                      AVFrameUniquePtr rescaled{av_frame_alloc(), avframe_and_data_deleter};
+                      if (av_frame_copy_props(rescaled.get(), filtered.get()) < 0) return false;
+                      if (av_image_alloc(rescaled->data, rescaled->linesize, cvt.dest_width(), cvt.dest_height(), cvt.dest_pixel_format(), 64) < 0) return false;
+                      cvt(filtered.get(), rescaled.get());
+                      out = std::move(rescaled);
+                    }
+                  } else {
+                    AVFrameUniquePtr converted{av_frame_alloc(), avframe_and_data_deleter};
+                    if (av_frame_copy_props(converted.get(), filtered.get()) < 0) return false;
+                    if (av_image_alloc(converted->data, converted->linesize, cvt.dest_width(), cvt.dest_height(), cvt.dest_pixel_format(), 64) < 0) return false;
+                    cvt(filtered.get(), converted.get());
+                    out = std::move(converted);
+                  }
+
+                  // VideoFilterer::receive rewrites pts to AV_TIME_BASE μs
+                  // since demuxer start_time; compare against target_frame_pts
+                  // which is in the same unit.
+                  if (out->pts >= target_frame_pts) {
+                    captured = std::move(out);
+                    return true;
+                  }
+                  // Pre-target: stash for replay into ring.history (capped).
+                  if (history_cap > 0) {
+                    pre_target_frames.push_back(std::move(out));
+                    while (pre_target_frames.size() > history_cap) pre_target_frames.pop_front();
+                  }
+                }
+                return false;
+              };
+
+              // Feed packets from keyframe forward; stop on landing.
+              bool landed = false;
+              hit->range->iterate_from(hit->absolute_buffer_index, [&](const AVPacket* src_pkt) -> bool {
+                if (landed) return false;
+                AVPacket* cloned = av_packet_clone(src_pkt);
+                if (!cloned) return false;
+                dec.send(cloned);  // EAGAIN tolerated — we'll receive more on the next send
+                av_packet_free(&cloned);
+
+                while (true) {
+                  AVFrame* raw = av_frame_alloc();
+                  if (!raw) return false;
+                  if (!dec.receive(raw, demuxers_[side].get())) {
+                    av_frame_free(&raw);
+                    break;
+                  }
+                  const bool got = try_land(raw);
+                  av_frame_free(&raw);
+                  if (got) {
+                    landed = true;
+                    return false;
+                  }
+                }
+                return !landed;
+              });
+
+              // Decoder may still have buffered frames (B-frame reorder delay).
+              // Enter draining mode with a NULL packet and keep receiving.
+              if (!landed) {
+                dec.send(nullptr);
+                while (!landed) {
+                  AVFrame* raw = av_frame_alloc();
+                  if (!raw) break;
+                  if (!dec.receive(raw, demuxers_[side].get())) {
+                    av_frame_free(&raw);
+                    break;
+                  }
+                  const bool got = try_land(raw);
+                  av_frame_free(&raw);
+                  if (got) landed = true;
+                }
+              }
+
+              if (!captured) {
+                l1_ok = false;
+                l1_fail_reason = "no-landed-frame";
+                break;
+              }
+              if (log_l1_stages) std::cerr << "[l1-stage] side=" << side.to_string() << " landed pts=" << captured->pts << std::endl;
+
+              // Seed ring: replay pre-target frames into history, then land
+              // current on the target. Each push_prefetch + advance() moves a
+              // frame into current and kicks the previous current into history
+              // (see FrameRing::advance). After the loop, history holds the
+              // pre-target frames in playback order and current is the target.
+              side_state.ring.clear();
+              while (!pre_target_frames.empty()) {
+                if (!side_state.ring.push_prefetch(std::move(pre_target_frames.front()))) break;
+                pre_target_frames.pop_front();
+                side_state.ring.advance();
+              }
+              // LEFT has no time shift. RIGHT's shift composes static + dynamic
+              // (mirrors pop_and_reset's right-only shift handling in L2).
+              if (side.is_left()) {
+                side_state.effective_time_shift_ = 0;
+                side_state.pts_ = captured->pts;
+              } else {
+                side_state.effective_time_shift_ = time_shifter_.static_shift() + time_shifter_.dynamic_shift(captured->pts);
+                side_state.pts_ = captured->pts - side_state.effective_time_shift_;
+              }
+              side_state.previous_decoded_picture_number_ = -1;
+              side_state.decoded_picture_number_ = 1;
+              side_state.ring.set_current(std::move(captured));
+              if (log_l1_stages) std::cerr << "[l1-stage] side=" << side.to_string() << " seeded history=" << side_state.ring.history_size() << std::endl;
+            }
+            } catch (const std::exception& ex) {
+              l1_ok = false;
+              l1_fail_reason = "ffmpeg-exception";
+              std::cerr << "[l1-exception] " << ex.what() << std::endl;
+            } catch (...) {
+              l1_ok = false;
+              l1_fail_reason = "unknown-exception";
+              std::cerr << "[l1-exception] unknown" << std::endl;
+            }
+            if (log_l1_stages) std::cerr << "[l1-stage] exit ok=" << l1_ok << std::endl;
+
+            if (!l1_ok) {
+              // Decode failure mid-L1 (decoder error, EOF mid-GOP, OOM on frame
+              // alloc, HW-decoder state trouble). Unwind the seek-in-progress
+              // and fall through to the L2 branch: clear flags, restart queues
+              // so the L2 barrier-wait succeeds.
+              if (log_seek_timing) {
+                std::cerr << "[l1-fail] reason=" << (l1_fail_reason ? l1_fail_reason : "unknown") << " — falling back to L2" << std::endl;
+              }
+
+              // Flush decoder state and let L2 re-run the barrier cleanly.
+              for (auto& p : video_decoders_)
+                if (should_seek(p.first)) {
+                  p.second->flush();
+                  p.second->reset_pts_state();
+                }
+              for (auto& p : packet_queues_)
+                if (should_seek(p.first)) p.second->restart();
+              for (auto& p : decoded_frame_queues_)
+                if (should_seek(p.first)) p.second->restart();
+              for (auto& p : filtered_frame_queues_)
+                if (should_seek(p.first)) p.second->restart();
+              for (auto& p : converted_frame_queues_)
+                if (should_seek(p.first)) p.second->restart();
+              for (auto& p : seeking_per_side_) p.second.store(false, std::memory_order_relaxed);
+
+              seek_tier = "L1->L2";   // tag the timing log for visibility
+              l1_eligible = false;     // force L2 path below
+            } else {
+              // Post-L1 cleanup: decoders/filterers now carry mid-stream state
+              // from the inline run. Flush + reinit so the pipeline resumes on a
+              // clean slate, then nudge each demuxer to just past target_pts so
+              // packet_queues_ refill from there rather than replaying the GOP
+              // we just decoded.
+              for (auto& p : video_decoders_) {
+                if (!should_seek(p.first)) continue;
+                p.second->flush();
+                p.second->reset_pts_state();
+              }
+              for (auto& p : video_filterers_) {
+                if (!should_seek(p.first)) continue;
+                p.second->reinit();
+              }
+
+              // Reposition each demuxer so the pipeline resumes with frames
+              // strictly AFTER target. Seeking backward to a keyframe ≤ target
+              // would make the pipeline re-emit the pre-target frames we
+              // already seeded into history, corrupting prefetch ordering
+              // (first `+` would visually jump backward).
+              //
+              // Strategy: seek forward — `backward=false` makes av_seek_frame
+              // land on the next keyframe at-or-after the requested time.
+              // If that fails (sparse-keyframe input with no subsequent
+              // keyframe), fall back to the backward seek and accept the minor
+              // prefetch-ordering artifact; sync_frame_queue self-corrects it
+              // within a frame or two.
+              for (auto& p : demuxers_) {
+                const Side& side = p.first;
+                if (!should_seek(side)) continue;
+                const float target_sec = l1_target_sec[side];
+                const bool fwd_ok = p.second->seek(target_sec + 0.001F, false);
+                if (!fwd_ok) {
+                  p.second->seek(target_sec + 0.001F, true);
+                }
+              }
+
+              for (auto& p : packet_queues_)
+                if (should_seek(p.first)) p.second->restart();
+              for (auto& p : decoded_frame_queues_)
+                if (should_seek(p.first)) p.second->restart();
+              for (auto& p : filtered_frame_queues_)
+                if (should_seek(p.first)) p.second->restart();
+              for (auto& p : converted_frame_queues_)
+                if (should_seek(p.first)) p.second->restart();
+              for (auto& p : seeking_per_side_) p.second.store(false, std::memory_order_relaxed);
+
+              skip_update = true;
+            }
+          }
+
+          if (l1_eligible) {
+            // L1 handled it — skip the L2 body.
+            goto after_seek_block;
+          }
 
           ready_to_seek_.reset_all();
           // Mark per-side seeking for the sides that will participate. Left workers
@@ -1667,6 +2462,8 @@ void VideoCompare::compare() {
           // don't sync until the next iteration to prevent freezing when comparing a single image
           skip_update = true;
         }  // end of full-seek branch
+      after_seek_block:;
+        log_seek();
       }
 
       bool store_frames = false;
@@ -1833,7 +2630,32 @@ void VideoCompare::compare() {
 
       const bool no_activity = !skip_update && !adjusting && !store_frames;
       const bool end_of_file = no_activity && all_stopped;
-      const bool buffer_is_full = left.ring.history_plus_current_size() == static_cast<int>(frame_buffer_size_) && right_ptr->ring.history_plus_current_size() == static_cast<int>(frame_buffer_size_);
+      // Auto-loop trigger: was "FrameRing full" (≈frame_buffer_size_ frames, a
+      // fraction of a second with -f 12). Now triggers when each PacketRing
+      // holds at least `loop_cap_sec` of content so the first auto-loop has
+      // a meaningful span. Falls back to the FrameRing-full criterion if any
+      // side lacks a PacketRing.
+      bool buffer_is_full = true;
+      for (auto& p : side_states) {
+        SideState& ss = p.second;
+        auto ring_it = packet_rings_.find(ss.side_);
+        if (ring_it == packet_rings_.end() || !ring_it->second) {
+          buffer_is_full = ss.ring.history_plus_current_size() == static_cast<int>(frame_buffer_size_);
+          if (!buffer_is_full) break;
+          continue;
+        }
+        const auto s = ring_it->second->stats();
+        if (s.pts_max == INT64_MIN || s.pts_min == INT64_MIN) {
+          buffer_is_full = false;
+          break;
+        }
+        const AVRational stream_tb = demuxers_[ss.side_]->time_base();
+        const double span_sec = static_cast<double>(s.pts_max - s.pts_min) * stream_tb.num / static_cast<double>(stream_tb.den);
+        if (span_sec < loop_cap_sec) {
+          buffer_is_full = false;
+          break;
+        }
+      }
 
       // If we're frame-stepping and hit EOF, stop trying to fetch more frames.
       if (end_of_file && (forward_navigate_frames > 0) && !display_->get_play()) {

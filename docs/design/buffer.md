@@ -55,9 +55,9 @@ All four queues are instances of `Queue<T>` from `core/data/queue.h`. The queue 
 Queue instances and capacities (`app/video_compare.h:34-36`, `app/video_compare.cpp:287-290`):
 
 - `packet_queues_`, `decoded_frame_queues_`, `filtered_frame_queues_`, `converted_frame_queues_`, keyed by `Side` (LEFT / Right(i)).
-- All four created with `QUEUE_SIZE = 5` (`app/video_compare.cpp:25`).
+- All four created with `QUEUE_SIZE = 3` (`app/video_compare.cpp:25`). Phase 3 shrank this from 5 to 3: the PacketRing (§10) is now the main spill buffer, so these queues only need enough headroom to smooth out burstiness across stages.
 
-These inter-stage queues are deliberately shallow. The user-visible buffering is _after_ the converter, in each side's `FrameRing`.
+These inter-stage queues are deliberately shallow. The user-visible buffering is _after_ the converter, in each side's `FrameRing`, and backing it is the per-side `PacketRing` of encoded packets.
 
 ---
 
@@ -108,7 +108,7 @@ while (!ring.prefetch_full()) {
 }
 ```
 
-The non-blocking `try_pop` is what keeps the main thread responsive — intake only drains what the converter thread has already produced; it never waits on decode. Because this runs before the seek block examines ring sizes, a forward `+N` pivot (§5) sees up to `prefetch_capacity_` frames available, not just the raw `QUEUE_SIZE=5` of the converter queue.
+The non-blocking `try_pop` is what keeps the main thread responsive — intake only drains what the converter thread has already produced; it never waits on decode. Because this runs before the seek block examines ring sizes, a forward `+N` pivot (§5) sees up to `prefetch_capacity_` frames available, not just the raw `QUEUE_SIZE=3` of the converter queue.
 
 The post-seek call catches frames the converter produced during the seek drain itself — otherwise they would sit stranded in the converter queue until the _next_ main-loop iteration.
 
@@ -275,32 +275,56 @@ No demuxer involvement, no decode: purely a cursor-browse over already-decoded f
 
 ## 7. Buffer sizing
 
-`frame_buffer_size_` (`app/video_compare.h:223`):
+The decoded RGB buffering is now intentionally small: the heavy lifting lives in the encoded-packet `PacketRing` (§10). The FrameRing exists to give the L0 pivot fast path a few frames of local scrub history without paying decode cost per step.
 
-- Sourced from `config.frame_buffer_size` (default `50`, `app/config.h:72`).
-- CLI: `--frame-buffer-size N` (`app/main.cpp:765-775`), minimum 1.
-- Passed to each `SideState`'s `FrameRing(history_capacity, prefetch_capacity)` at construction (`app/video_compare.cpp:1020`). Both halves get the same capacity.
+`frame_buffer_size_` (`app/video_compare.h:224`):
+
+- Sourced from `config.frame_buffer_size` (default `12`, `app/config.h:72`). Was 50 pre-Phase-3; dropped to 12 because the PacketRing is the real backing store and L1 re-decode (§11) reconstitutes deeper history when needed.
+- CLI: `--frame-buffer-size N` (`app/main.cpp:764-777`), minimum 1.
+- Passed to each `SideState`'s `FrameRing(history_capacity, prefetch_capacity)` at construction. Both halves get the same capacity.
 
 Constants adjacent to it:
 
-- `QUEUE_SIZE = 5` — inter-stage queue depth. Independent of `frame_buffer_size_`.
+- `QUEUE_SIZE = 3` — inter-stage queue depth. Was 5 pre-Phase-3. Independent of `frame_buffer_size_`.
 - `SLEEP_PERIOD_MS = 10` — poll interval for `ready_to_seek_` spin loops.
+- `packet_buffer_bytes` (default 256 MiB, CLI `--packet-buffer-size`) — PacketRing byte budget per side.
 
 Larger `frame_buffer_size_` means:
 
-- More memory (RGB frames at full resolution × 2 sides × 2 halves).
-- Larger backward history for ring-pivot to serve `-` without a full seek.
-- Deeper forward prefetch for `+` without a full seek.
-- Longer in-buffer loop range under `,`/`.`.
-- The auto-loop trigger (§8) takes longer to fire.
+- More memory (RGB frames at full resolution × 2 sides × 2 halves + 1 current slot = `2N+1` per side). At 4K HDR that's ≈47.5 MiB × (2N+1) per 4K-HDR side.
+- More scrub history served by L0 pivots (microseconds per step) before L1 re-decode kicks in.
+- Deeper forward prefetch for `+` without a pipeline catch-up wait.
+- Longer in-buffer loop range under `,`/`.` (until Phase 4 replaces this with eager decode of the PacketRing on loop entry).
+
+Rough memory profile on a 4K HDR + 720p SDR comparison, `--packet-buffer-size 256M`:
+
+| defaults                | peak RSS |
+| ----------------------- | -------- |
+| Phase 3 (`-f 12`, Q=3)  | ≈1.95 GiB |
+| Legacy (`-f 50`, Q=5)   | ≈4.7 GiB  |
+
+The 4K HDR case has ≈47.5 MiB per decoded frame and an OS / SDL / libplacebo baseline of ~800 MiB, so the absolute floor on that workload is ~1.2 GiB regardless of ring size. The architectural win is replacing a growing decoded-RGB buffer with a bounded encoded-packet buffer.
 
 ---
 
-## 8. Auto-loop
+## 8. Loop mode — auto-loop trigger and eager materialize
 
-`auto_loop_mode_` (`app/video_compare.h:222`) is set once at startup from the CLI `--auto-loop-mode` flag: `off`, `on` (→ `Loop::ForwardOnly`), or `pp` (→ `Loop::PingPong`).
+### 8.1 Mode entry and exit
 
-Triggered from the main loop (`app/video_compare.cpp:1996-2001`):
+Loop mode has three states (`app/video_compare.h`, `Display::Loop`): `Off`, `ForwardOnly`, `PingPong`. User toggles via `,` (PingPong) and `.` (ForwardOnly). Auto-loop (below) can also trigger an initial entry.
+
+The main loop tracks the previous loop mode across iterations and fires two hooks on transition (`app/video_compare.cpp`, the loop-mode transition block after packet-ring eviction):
+
+- **Off → non-Off (loop entry)**: eager materialize — barrier the pipeline, flush each decoder, reinit each filter, walk every seeking side's PacketRing from the keyframe ≤ `(current_pts - loop_cap_sec)` forward, decode through `current_pts`, and push each frame into the side's FrameRing. On exit, each ring has history populated with the N−1 pre-target frames and `current` set to the present frame. The FrameRing's history capacity is grown to fit.
+- **non-Off → Off (loop exit)**: `ring.set_capacities(frame_buffer_size_, frame_buffer_size_)` shrinks each ring back to operating size. The most-recent-around-cursor frames are kept; excess is evicted.
+
+Cap controlled by `VIDEO_COMPARE_LOOP_CAP_SEC` (default 5.0 s). At 4K HDR (≈47.5 MiB per decoded frame × 60 fps × 5 s = ≈14 GiB per side) this is memory-expensive; lower it on memory-constrained systems. At 1080p RGB24 5 s × 30 fps ≈ 940 MiB.
+
+Diagnostic: `VIDEO_COMPARE_LOG_SEEK_TIMING=1` emits `[loop] mode transition X→Y` and `[loop] materialize done in Nms, left=K right=K frames`.
+
+### 8.2 Auto-loop
+
+`auto_loop_mode_` (`app/video_compare.h`) is set once at startup from the CLI `--auto-loop-mode` flag: `off`, `on` (→ `Loop::ForwardOnly`), or `pp` (→ `Loop::PingPong`). When non-`Off`, the main loop fires one automatic loop-mode entry as soon as the buffer has collected enough content:
 
 ```cpp
 if (auto_loop_mode_ != Loop::Off && !auto_loop_triggered &&
@@ -310,12 +334,11 @@ if (auto_loop_mode_ != Loop::Off && !auto_loop_triggered &&
 }
 ```
 
-Where:
+`buffer_is_full` now measures PacketRing span against `loop_cap_sec` (Phase 4 rewire). Previously it measured FrameRing size against `frame_buffer_size_`, which fired in a fraction of a second after Phase 3's ring shrink. Fallback: if any side lacks a PacketRing, reverts to the old FrameRing-fill criterion.
 
-- `buffer_is_full` (`:1836`) — both sides' rings have filled their history + current (`history_plus_current_size() == frame_buffer_size_`).
-- `end_of_file` (`:1835`) — every converter queue is stopped AND there's no activity this tick.
+`end_of_file` — every converter queue is stopped AND there's no activity this tick.
 
-The effect is identical to the user pressing `,` or `.`: regular playback flips to in-buffer ring-browse (§6.4). Fires once per process.
+The auto-loop trigger sets `buffer_play_loop_mode` via the display, which the main loop's transition detector picks up and runs the materialize flow in 8.1. Fires once per process.
 
 ---
 
@@ -331,18 +354,66 @@ Consequences:
 
 ---
 
-## 10. Cheat sheet
+## 10. PacketRing — encoded spill buffer
 
-| Action                             | Key             | Seek branch | Drain?    | Demuxer? | Decode?
-| ---------------------------------- | --------------- | ----------- | --------- | -------- | -------
-| Play / pause                       | Space           | —           | —         | —        | —
-| In-buffer loop (PP)                | ,               | —           | —         | —        | —
-| In-buffer loop (FW)                | .               | —           | —         | —        | —
-| Timeline click (paused)            | left-click      | full        | yes       | yes      | yes
-| Timeline click (playing)           | left-click      | full        | no        | yes      | yes
-| Relative seek                      | arrows, PgUp/Dn | full        | if paused | yes      | yes
-| Frame step (paused)                | Shift+A/D       | full        | yes       | yes      | yes
-| Right-shift ±N (pivot fits)        | +/-             | pivot       | —         | —        | —
-| Right-shift ±N (pivot doesn't fit) | +/-             | full        | no        | yes      | yes
-| Clear crop                         | Backspace       | full        | if paused | yes      | yes (filter rebuild)
+`PacketRing` (`media/buffering/packet_ring.h`) is the per-side byte-budgeted ring of cloned `AVPacket`s, fed from the demuxer thread. Its role is to cheaply retain seconds-to-minutes of encoded content around the playback cursor so that backward seeks and frame steps can re-decode from a nearby keyframe without going back out to disk / demuxer.
+
+Shape (mirrors Chromium's `SourceBufferStream` + `SourceBufferRange`):
+
+- A `std::list<std::unique_ptr<PacketRange>> ranges_`, sorted by `first_pts`. A new range opens on a demuxer-seek discontinuity; otherwise appends extend the tail range.
+- Each `PacketRange` owns a deque of packets and a `KeyframeMap` (`std::map<int64_t pts, size_t buffer_index>`). The index uses a `keyframe_map_index_base_` offset so front-GOP evictions don't rewrite all existing entries.
+- Fudge-room adjacency (`2 × max_inter_buffer_distance_`, time-base-floored) decides whether a new packet extends the tail range or opens a new one.
+
+Producer (demuxer thread, `app/video_compare.cpp:562-568`): each video packet is `av_packet_clone`d and `append()`d to the side's PacketRing alongside the existing `packet_queues_` push. Cost is a memcpy of the encoded bytes — trivial compared to decode.
+
+Consumer (main thread):
+
+- `covers(target_pts)` — any live range includes the target.
+- `keyframe_at_or_before(target_pts)` — O(log K) lookup across all ranges; returns the latest keyframe ≤ target along with its absolute buffer index.
+- `iterate_from(index, visitor)` — walks packets in DTS/storage order; used by L1.
+- `evict_to_budget(current_pts)` — called once per main-loop tick (`app/video_compare.cpp:1196-1216`). Drops farthest range first, then chops whole GOPs from the far end of the remaining range, protecting the GOP that contains `current_pts`.
+
+Sizing: `--packet-buffer-size <N[K|M|G]>` (default 256 MiB per side). On a 1080p H.264 clip at ~5 Mbps that's ≈7 minutes of coverage; at 4K HDR HEVC 30 Mbps it's ≈70 seconds.
+
+Diagnostic: set `VIDEO_COMPARE_SHOW_PACKET_RING=1` for periodic `[packet-ring <side>] bytes=… packets=… ranges=… keyframes=… pts=[…]` lines on stderr.
+
+---
+
+## 11. L1 re-decode — fast backward seek
+
+`L1` is a seek tier that sits between the existing L0 ring pivot (§5.2) and L2 full seek (§5.3). It drives the decoder / filter / converter on the main thread, feeding packets out of the PacketRing starting from the keyframe ≤ target, until the target frame is captured. The pipeline is held idle behind a `ReadyToSeek` barrier for the duration.
+
+Dispatch order inside the seek branch (`app/video_compare.cpp:1273-…`):
+
+1. **L0 pivot** — target already in FrameRing history/prefetch → pointer swap only.
+2. **L1 re-decode** — PacketRing covers target AND keyframe-to-target distance ≤ `VIDEO_COMPARE_L1_MAX_KF_DISTANCE_SEC` (default 0.5 s). Drives decode inline.
+3. **L2 full seek** — existing path: stop queues, `av_seek_frame`, `pop_and_reset` drains pipeline to target.
+
+L1 eligibility also requires `!force_seek_current_position` (no pending crop/HDR reconfig), `!single_decoder_mode_`, and non-single-frame media on all seeking sides. Any failure drops to L2; the landing frame is correct either way.
+
+Landing behavior: L1 clears the ring, replays pre-target frames into history via `push_prefetch` + `advance()` loop, then sets the target as `current`. This seeds the ring so subsequent backward presses hit L0 pivots at microsecond cost, amortizing the L1 cost across up to `frame_buffer_size_` presses.
+
+Post-L1 demuxer positioning: after inline decode the main thread seeks each seeking demuxer *forward* to the keyframe at-or-after target+0.001s (`backward=false`). Seeking backward (to keyframe ≤ target) would make the pipeline re-emit the pre-target frames already in history, corrupting prefetch ordering and causing the first `+` press to briefly jump backward. If the forward seek fails on a sparse-keyframe input with no subsequent keyframe, it falls back to the backward seek and relies on `sync_frame_queue` to self-correct within a frame or two.
+
+Worker-thread race note: after the barrier idles, the seek flag is cleared (`app/video_compare.cpp:1528-1531`) so the decoder worker's `ready_to_seek` sleep loop stops calling `avcodec_flush_buffers` — necessary because the main thread is about to flush and send packets on the same codec context. Queues stay stopped so workers don't wake into a decode attempt.
+
+Diagnostic: `VIDEO_COMPARE_LOG_SEEK_TIMING=1` logs `tier=<L0back|L0forward|L1|L1->L2|L2>` and elapsed time per seek, plus `[l1-skip]` lines explaining any L1 eligibility failures. `VIDEO_COMPARE_LOG_L1_STAGES=1` adds per-step L1 trace.
+
+---
+
+## 12. Cheat sheet
+
+| Action                             | Key             | Dispatch                     | Demuxer? | Decode?
+| ---------------------------------- | --------------- | ---------------------------- | -------- | -------
+| Play / pause                       | Space           | —                            | —        | —
+| In-buffer loop (PP)                | ,               | —                            | —        | —
+| In-buffer loop (FW)                | .               | —                            | —        | —
+| Timeline click (paused)            | left-click      | L1 if kf ≤ 0.5 s, else L2    | L2: yes  | yes
+| Timeline click (playing)           | left-click      | L2 (no drain)                | yes      | yes
+| Relative seek                      | arrows, PgUp/Dn | L1 if kf ≤ 0.5 s, else L2    | L2: yes  | yes
+| Frame step (paused)                | Shift+A         | L1 if kf ≤ 0.5 s, else L2    | L2: yes  | yes
+| Forward frame step                 | Shift+D         | `advance_ring` (no seek)     | —        | —
+| Right-shift ±N (in FrameRing)      | +/-             | L0 pivot                     | —        | —
+| Right-shift ±N (out of FrameRing)  | +/-             | L1 if kf ≤ 0.5 s, else L2    | L2: yes  | yes
+| Clear crop                         | Backspace       | L2 (filter rebuild)          | yes      | yes
 

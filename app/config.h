@@ -69,7 +69,13 @@ struct VideoCompareConfig {
   DisplayMode display_mode{DisplayMode::Split};
   DisplayLoop auto_loop_mode{DisplayLoop::Off};
 
-  size_t frame_buffer_size{50};
+  // Decoded RGB ring capacity per side (history + prefetch each).
+  // Shrunk in Phase 3 from 50 → 12: the PacketRing now holds the large
+  // backing store in encoded form, so the decoded ring only needs to cover
+  // ≈0.5 s of playback around the cursor. Increase if you want a deeper
+  // scrub history without paying the L1 re-decode cost.
+  size_t frame_buffer_size{12};
+  size_t packet_buffer_bytes{256ULL << 20};  // 256 MiB default; encoded packet spill buffer
 
   TimeShiftConfig time_shift;
 

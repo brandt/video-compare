@@ -63,6 +63,11 @@ class VideoFilterer : public SideAware {
   bool set_crop_rect(const CropRect* rect);
   bool consume_filter_change();
 
+  // Non-consuming peek at the pending filter-change flag. Used by L1 eligibility
+  // to skip re-decode when a filter rebuild is required; those cases fall
+  // through to the full seek path which calls consume_filter_change() + reinit().
+  bool has_pending_filter_change() const { return filter_changed_.load(std::memory_order_relaxed); }
+
  private:
   struct CropSnapshot {
     CropRect rect{};
