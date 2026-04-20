@@ -653,9 +653,11 @@ bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
 
   // Features that still need CPU pixel access drive an on-demand YUV→RGB
   // conversion. Skipped entirely when none are active to keep the pipeline
-  // GPU-fast.
+  // GPU-fast. `show_quality_metrics_` is gated on `!playback_.play()` to match
+  // the metric-compute branch below — otherwise we'd pay the full-resolution
+  // sws_scale cost on every played frame without using the result.
   const bool need_rgb = diff_processor_.subtraction_mode() || print_mouse_position_and_color_ ||
-                        print_image_similarity_metrics_ || show_quality_metrics_ ||
+                        print_image_similarity_metrics_ || (show_quality_metrics_ && !playback_.play()) ||
                         selection_.save_selected_area_requested() || selection_.auto_crop_black_borders_requested() ||
                         image_saver_.save_frames_requested();
   bool have_rgb = false;
@@ -748,14 +750,11 @@ bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
       print_image_similarity_metrics_ = false;
     }
 
-    // Live on-screen quality metrics (rendered further down). Skipped whenever
-    // the left/right PTS are not in sync: metrics on mis-aligned frames are
-    // meaningless, and the grayscale + PSNR/SSIM work is expensive. The paused
-    // case is also gated — after a seek or `+`/`-` frame shift that spills past
-    // the ring-pivot fast path, sync_frame_queue takes many ticks to advance
-    // the lagging side, and we don't want to pay PSNR/SSIM cost on every one
-    // of those transient pairs even though `!playback_.play()` is true.
-    if (show_quality_metrics_ && playback_in_sync_ && video_width_ > 0 && video_height_ > 0) {
+    // Live on-screen quality metrics (rendered further down). Paused-only —
+    // PSNR/SSIM/VMAF are expensive and running them during playback wastes
+    // CPU on transient frame pairs the user isn't inspecting. When paused,
+    // the pair is stable and all three values can be computed and held.
+    if (show_quality_metrics_ && !playback_.play() && video_width_ > 0 && video_height_ > 0) {
       float* left_gray = MetricsCalculator::rgb_to_grayscale(rgb_cache_.left()->data[0], rgb_cache_.left()->linesize[0], video_width_, video_height_, requires_10_bpc());
       float* right_gray = MetricsCalculator::rgb_to_grayscale(rgb_cache_.right()->data[0], rgb_cache_.right()->linesize[0], video_width_, video_height_, requires_10_bpc());
       last_psnr_ = MetricsCalculator::compute_psnr(left_gray, right_gray, video_width_, video_height_);
@@ -763,12 +762,10 @@ bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
       delete[] left_gray;
       delete[] right_gray;
 
-      if (!playback_.play()) {
-        if (left_frame->pts != last_vmaf_left_pts_ || right_frame->pts != last_vmaf_right_pts_) {
-          last_vmaf_ = VMAFCalculator::instance().compute(rgb_cache_.left(), rgb_cache_.right());
-          last_vmaf_left_pts_ = left_frame->pts;
-          last_vmaf_right_pts_ = right_frame->pts;
-        }
+      if (left_frame->pts != last_vmaf_left_pts_ || right_frame->pts != last_vmaf_right_pts_) {
+        last_vmaf_ = VMAFCalculator::instance().compute(rgb_cache_.left(), rgb_cache_.right());
+        last_vmaf_left_pts_ = left_frame->pts;
+        last_vmaf_right_pts_ = right_frame->pts;
       }
     }
 
