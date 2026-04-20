@@ -174,6 +174,12 @@ class Display {
   OverlayManager overlay_;
 
   bool input_received_{true};
+  // Reported by VideoCompare each refresh; gates live quality-metric compute.
+  bool playback_in_sync_{true};
+  // Frame-ring occupancy relative to current playback position. Rendered in
+  // the HUD opposite the FPS counters when show_fps_ is on.
+  int frame_buffer_before_{0};
+  int frame_buffer_after_{0};
   int64_t previous_left_frame_pts_;
   int64_t previous_right_frame_pts_;
   std::string previous_left_frame_key_;
@@ -479,4 +485,17 @@ class Display {
   size_t get_num_right_videos() const;
   size_t get_active_right_index() const;
   void set_active_right_index(size_t index);
+
+  // VideoCompare reports left/right PTS-sync state so the live-metrics path can
+  // skip PSNR/SSIM/VMAF computation during transient catch-up (e.g. one side
+  // advancing to realign with the other). Metrics on mis-synced pairs are
+  // meaningless and waste CPU. Defaults to true (assume in sync).
+  void set_playback_in_sync(bool in_sync) { playback_in_sync_ = in_sync; }
+
+  // Frame-ring occupancy around the current playback position (for the HUD
+  // counter next to the FPS readout). `before` is history, `after` is prefetch.
+  void set_frame_buffer_counts(int before, int after) {
+    frame_buffer_before_ = before;
+    frame_buffer_after_ = after;
+  }
 };

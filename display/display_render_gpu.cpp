@@ -280,6 +280,19 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
 
         push_text(vid_str, small_font_, FPS_VIDEO_COLOR, vid_x, fps_y, TextAlign::Left);
         push_text(ui_str, small_font_, FPS_UI_COLOR, ui_x, fps_y, TextAlign::Left);
+
+        // Ring-buffer occupancy counter, mirrored on the left at ~33% across
+        // so it visually pairs with the FPS readout on the right.
+        const std::string buf_str = string_sprintf("[<- %d | %d ->]", frame_buffer_before_, frame_buffer_after_);
+
+        int buf_w = 0, buf_h = 0;
+        TTF_GetStringSize(small_font_, buf_str.c_str(), 0, &buf_w, &buf_h);
+
+        const int buf_anchor_x = drawable_width_ / 3;  // ~33% across (mirror of 2/3)
+        const int buf_x = buf_anchor_x - buf_w / 2 + border_extension_;
+        const int buf_y = drawable_height_ - line1_y_ - buf_h;
+
+        push_text(buf_str, small_font_, BUFFER_COLOR, buf_x, buf_y, TextAlign::Left);
       }
 
       // Zoom factor — bottom-left (top-right in VStack). Precision varies
@@ -735,8 +748,14 @@ bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
       print_image_similarity_metrics_ = false;
     }
 
-    // Live on-screen quality metrics (rendered further down).
-    if (show_quality_metrics_ && video_width_ > 0 && video_height_ > 0) {
+    // Live on-screen quality metrics (rendered further down). Skipped whenever
+    // the left/right PTS are not in sync: metrics on mis-aligned frames are
+    // meaningless, and the grayscale + PSNR/SSIM work is expensive. The paused
+    // case is also gated — after a seek or `+`/`-` frame shift that spills past
+    // the ring-pivot fast path, sync_frame_queue takes many ticks to advance
+    // the lagging side, and we don't want to pay PSNR/SSIM cost on every one
+    // of those transient pairs even though `!playback_.play()` is true.
+    if (show_quality_metrics_ && playback_in_sync_ && video_width_ > 0 && video_height_ > 0) {
       float* left_gray = MetricsCalculator::rgb_to_grayscale(rgb_cache_.left()->data[0], rgb_cache_.left()->linesize[0], video_width_, video_height_, requires_10_bpc());
       float* right_gray = MetricsCalculator::rgb_to_grayscale(rgb_cache_.right()->data[0], rgb_cache_.right()->linesize[0], video_width_, video_height_, requires_10_bpc());
       last_psnr_ = MetricsCalculator::compute_psnr(left_gray, right_gray, video_width_, video_height_);

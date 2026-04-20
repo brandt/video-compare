@@ -1843,6 +1843,8 @@ void VideoCompare::compare() {
 
       if (frame_offset >= 0 && last_common_frame_index >= 0) {
         const bool is_playback_in_sync = is_in_sync(left.pts_, right_ptr->pts_, left.delta_pts_, right_ptr->delta_pts_);
+        display_->set_playback_in_sync(is_playback_in_sync);
+        display_->set_frame_buffer_counts(left.ring.history_size(), left.ring.prefetch_size());
 
         // reduce refresh rate to 10 Hz for faster re-syncing
         const bool skip_refresh = !is_playback_in_sync && display_refresh_timer.us_until_target() > -RESYNC_UPDATE_RATE_US;

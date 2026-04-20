@@ -189,8 +189,10 @@ void Display::sdl_run_cpu_work(const RenderContext& ctx,
     print_image_similarity_metrics_ = false;
   }
 
-  // live on-screen quality metrics overlay (toggled by Q key)
-  if (show_quality_metrics_ && left_frame != nullptr && right_frame != nullptr && video_width_ > 0 && video_height_ > 0) {
+  // live on-screen quality metrics overlay (toggled by Q key). Skipped whenever
+  // left/right PTS are not in sync — including paused ticks where sync_frame_queue
+  // is still advancing the lagging side after a seek or frame-shift fall-through.
+  if (show_quality_metrics_ && playback_in_sync_ && left_frame != nullptr && right_frame != nullptr && video_width_ > 0 && video_height_ > 0) {
     float* left_gray = MetricsCalculator::rgb_to_grayscale(left_frame->data[0], left_frame->linesize[0], video_width_, video_height_, requires_10_bpc());
     float* right_gray = MetricsCalculator::rgb_to_grayscale(right_frame->data[0], right_frame->linesize[0], video_width_, video_height_, requires_10_bpc());
 
