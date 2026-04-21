@@ -41,6 +41,7 @@ class Display {
   using AspectLockMode = DisplayAspectLockMode;
   using AspectViewMode = DisplayAspectViewMode;
   using DiffMode = DisplayDiffMode;
+  using PlayState = DisplayPlayState;
 
   std::string mode_to_string(const Mode& mode) {
     switch (mode) {
@@ -441,6 +442,18 @@ class Display {
 
   bool get_quit() const;
   bool get_play() const;
+  /**
+   * Derive the high-level playback state label from play/pause, loop mode,
+   * and PTS-sync status. Used by the HUD badge and by external introspection
+   * (e.g. the debug input socket). Priority: Seek > loop modes > Play > Pause.
+   */
+  PlayState get_play_state() const;
+  /**
+   * Map a PlayState to its human-readable label without decoration.
+   * Returns "SEEK", "LOOP >", "LOOP <>", "PLAY", or "PAUSE".
+   * Callers that want brackets (e.g. the HUD) must add them.
+   */
+  static const char* play_state_label(PlayState state);
   Loop get_buffer_play_loop_mode() const;
   void set_buffer_play_loop_mode(const Loop& mode);
   bool get_buffer_play_forward() const;
@@ -469,6 +482,19 @@ class Display {
   SDL_Rect get_visible_roi_in_single_frame_coordinates() const;
 
   bool get_gpu_renderer_active() const { return gpu_renderer_active_; }
+
+  /** SDL window size in logical (point) coordinates. */
+  int get_window_width() const { return window_width_; }
+  /** SDL window size in logical (point) coordinates. */
+  int get_window_height() const { return window_height_; }
+  /** Renderer drawable size in physical pixels (may differ from window size on high-DPI displays). */
+  int get_drawable_width() const { return drawable_width_; }
+  /** Renderer drawable size in physical pixels (may differ from window size on high-DPI displays). */
+  int get_drawable_height() const { return drawable_height_; }
+  /** Raw SDL_Window handle for the main video-compare window. Used by external
+   *  automation (e.g. the debug input socket) to call SDL_WarpMouseInWindow
+   *  so injected mouse events route correctly. */
+  SDL_Window* get_main_window() const { return window_; }
 
   // Upload a native-format (decoded/filtered) AVFrame for GPU rendering.
   // Must be called before possibly_refresh() when gpu_renderer_active_.

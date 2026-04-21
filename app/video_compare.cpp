@@ -1,6 +1,7 @@
 #include "app/video_compare.h"
 #include "analysis/metrics/metrics_calculator.h"
 #include "app/debug_input_script.h"
+#include "app/debug_input_socket.h"
 #include <unordered_set>
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -526,6 +527,35 @@ bool VideoCompare::handle_hdr_state_change() {
   return true;
 }
 
+PlaybackStateSnapshot VideoCompare::get_playback_state_snapshot() const {
+  std::lock_guard<std::mutex> lock(playback_state_snapshot_mutex_);
+  return playback_state_snapshot_;
+}
+
+const std::string& VideoCompare::get_left_path() const {
+  return config_.left.file_name;
+}
+
+std::string VideoCompare::get_active_right_path() const {
+  const Side active_right = Side::Right(active_right_index_);
+  const auto it = right_video_info_.find(active_right);
+  if (it != right_video_info_.end()) {
+    return it->second.file_name;
+  }
+  // Fallback: if the active index isn't populated for any reason, return the
+  // first registered right video so callers always get a usable path.
+  if (!right_video_info_.empty()) {
+    return right_video_info_.begin()->second.file_name;
+  }
+  return {};
+}
+
+double VideoCompare::get_uptime_seconds() const {
+  const auto now = std::chrono::steady_clock::now();
+  const std::chrono::duration<double> delta = now - start_time_;
+  return delta.count();
+}
+
 void VideoCompare::operator()() {
   // Launch all threads
   for (const auto& pair : demuxers_) {
@@ -541,6 +571,10 @@ void VideoCompare::operator()() {
   // thread that drives the SDL event queue per the script. See
   // app/debug_input_script.h for the format.
   debug_input_script::start_from_env();
+
+  // If VIDEO_COMPARE_INPUT_SOCK is set, bring up an interactive JSON-lines
+  // control server on that Unix domain socket. See app/debug_input_socket.h.
+  debug_input_socket::start_from_env({this, display_.get()});
 
   compare();
 
@@ -3487,6 +3521,22 @@ void VideoCompare::compare() {
           full_cycle_time_deque.clear();
           unique_frame_combo_tags_processed = 0;
         }
+      }
+
+      // Publish the latest playback-position snapshot for external inspectors
+      // (debug input socket, future introspection tools). Runs once per main-
+      // loop iteration after side_states have been advanced; contention on
+      // the mutex is negligible because reads are rare.
+      {
+        const SideState& right_now = *right_ptr;
+        std::lock_guard<std::mutex> lock(playback_state_snapshot_mutex_);
+        playback_state_snapshot_.left_pts_us = left.pts_;
+        playback_state_snapshot_.right_pts_us = right_now.pts_;
+        playback_state_snapshot_.effective_time_shift_us = right_now.effective_time_shift_;
+        playback_state_snapshot_.left_decoded_picture_number = left.previous_decoded_picture_number_;
+        playback_state_snapshot_.right_decoded_picture_number = right_now.previous_decoded_picture_number_;
+        playback_state_snapshot_.frame_number = frame_number;
+        playback_state_snapshot_.initialized = true;
       }
     }
   } catch (...) {

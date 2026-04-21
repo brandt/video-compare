@@ -486,6 +486,44 @@ bool Display::get_play() const {
   return playback_.play();
 }
 
+// High-level playback state (SEEK / LOOP > / LOOP <> / PLAY / PAUSE). The
+// precedence ordering mirrors the HUD badge: a seek-in-flight masks loop
+// mode, which masks play/pause.
+Display::PlayState Display::get_play_state() const {
+  if (!playback_in_sync_) {
+    return PlayState::Seek;
+  }
+  const Loop loop_mode = playback_.loop_mode();
+  if (loop_mode == Loop::ForwardOnly) {
+    return PlayState::LoopForward;
+  }
+  if (loop_mode == Loop::PingPong) {
+    return PlayState::LoopPingPong;
+  }
+  if (playback_.play()) {
+    return PlayState::Play;
+  }
+  return PlayState::Pause;
+}
+
+// Human-readable label for a PlayState, without decoration. The HUD wraps
+// the result in square brackets; other consumers may not want that.
+const char* Display::play_state_label(PlayState state) {
+  switch (state) {
+    case PlayState::Seek:
+      return "SEEK";
+    case PlayState::LoopForward:
+      return "LOOP >";
+    case PlayState::LoopPingPong:
+      return "LOOP <>";
+    case PlayState::Play:
+      return "PLAY";
+    case PlayState::Pause:
+      return "PAUSE";
+  }
+  return "UNKNOWN";
+}
+
 // Current loop mode for buffer playback (Off / ForwardOnly / PingPong).
 Display::Loop Display::get_buffer_play_loop_mode() const {
   return playback_.loop_mode();

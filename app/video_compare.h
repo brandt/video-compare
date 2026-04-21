@@ -1,9 +1,12 @@
 #pragma once
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -173,11 +176,50 @@ struct MediaFrameDetectionState {
   std::atomic<int64_t> last_counted_pts{std::numeric_limits<int64_t>::min()};
 };
 
+/**
+ * Lock-protected snapshot of per-side playback position, republished once per
+ * main-loop iteration by VideoCompare::compare(). Exists because the
+ * authoritative SideState struct is a stack-local inside compare() and cannot
+ * be read from other threads. External inspectors (e.g. the debug input
+ * socket) should call VideoCompare::get_playback_state_snapshot() to obtain a
+ * consistent copy.
+ */
+struct PlaybackStateSnapshot {
+  /** Left-side presentation timestamp, AV_TIME_BASE microseconds. */
+  int64_t left_pts_us{0};
+  /** Right-side presentation timestamp (active right video), AV_TIME_BASE microseconds. */
+  int64_t right_pts_us{0};
+  /** Right-to-left effective time shift in microseconds (user frame-shift + time-shifter). */
+  int64_t effective_time_shift_us{0};
+  /** Monotonic decoded-picture counter for left side; -1 if none decoded yet. */
+  int32_t left_decoded_picture_number{-1};
+  /** Monotonic decoded-picture counter for right side; -1 if none decoded yet. */
+  int32_t right_decoded_picture_number{-1};
+  /** compare() loop iteration at which this snapshot was published. */
+  uint64_t frame_number{0};
+  /** True once compare() has published at least one real update (i.e. the
+   *  other fields reflect real pipeline state rather than defaults). */
+  bool initialized{false};
+};
+
 class VideoCompare {
  public:
   VideoCompare(const VideoCompareConfig& config);
   ~VideoCompare();
   void operator()();
+
+  /** Thread-safe copy of the latest playback-position snapshot published by compare(). */
+  PlaybackStateSnapshot get_playback_state_snapshot() const;
+
+  /** Absolute path of the left-side video as supplied on the command line. */
+  const std::string& get_left_path() const;
+
+  /** Absolute path of the currently-active right-side video (changes as the
+   *  user cycles right videos). */
+  std::string get_active_right_path() const;
+
+  /** Seconds elapsed since the VideoCompare instance was constructed. */
+  double get_uptime_seconds() const;
 
  private:
   void recreate_format_converter_for_side(const Side& side, const int sws_flags);
@@ -335,4 +377,15 @@ class VideoCompare {
 
   // Auto-align: verification state carried across the seek dispatch.
   PendingAutoAlignVerification pending_auto_align_verification_;
+
+  // Thread-safe playback-position snapshot. Written by compare() near the end
+  // of each iteration under playback_state_snapshot_mutex_; read by external
+  // inspectors (e.g. the debug input socket) via get_playback_state_snapshot().
+  mutable std::mutex playback_state_snapshot_mutex_;
+  PlaybackStateSnapshot playback_state_snapshot_;
+
+  // Wall-clock origin for get_uptime_seconds(). Captured in the constructor
+  // initializer list so "uptime" measures from object creation, not from the
+  // moment the main loop starts.
+  const std::chrono::steady_clock::time_point start_time_{std::chrono::steady_clock::now()};
 };

@@ -1,7 +1,6 @@
 #include "app/debug_input_script.h"
 
-#include <algorithm>
-#include <cctype>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -13,119 +12,28 @@
 
 #include <SDL3/SDL.h>
 
+#include "app/debug_input_common.h"
+
 namespace debug_input_script {
 
 namespace {
 
-std::string to_lower(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return s;
-}
+using debug_input_common::ModState;
+using debug_input_common::name_to_keycode;
+using debug_input_common::push_key_event;
+using debug_input_common::push_quit;
+using debug_input_common::sleep_seconds;
+using debug_input_common::to_lower;
 
-// Map a user-supplied key name (case-insensitive) to an SDL_Keycode.
-// Single-character inputs ('a', '-', '5') are handled by the char fallback.
-// Returns SDLK_UNKNOWN if nothing matches.
-SDL_Keycode name_to_keycode(const std::string& raw) {
-  if (raw.empty()) return SDLK_UNKNOWN;
-  const std::string name = to_lower(raw);
+// Tracks whether the scripted-input worker thread is currently running.
+// Set true immediately before the thread is detached; set false by an RAII
+// guard at the top of run_script so any return path clears it.
+std::atomic<bool> g_script_running{false};
 
-  // Single-character fast path.
-  if (name.size() == 1) {
-    const char c = name[0];
-    if (c >= 'a' && c <= 'z') return static_cast<SDL_Keycode>(SDLK_A + (c - 'a'));
-    if (c >= '0' && c <= '9') return static_cast<SDL_Keycode>(SDLK_0 + (c - '0'));
-    switch (c) {
-      case '-': return SDLK_MINUS;
-      case '+': return SDLK_EQUALS;  // SDL usually doesn't have a bare '+' key; '=' works per display_input
-      case '=': return SDLK_EQUALS;
-      case '.': return SDLK_PERIOD;
-      case ',': return SDLK_COMMA;
-      case '/': return SDLK_SLASH;
-      case '\\': return SDLK_BACKSLASH;
-      case ';': return SDLK_SEMICOLON;
-      case '[': return SDLK_LEFTBRACKET;
-      case ']': return SDLK_RIGHTBRACKET;
-      case '`': return SDLK_GRAVE;
-      case ' ': return SDLK_SPACE;
-      default: break;
-    }
-    return SDLK_UNKNOWN;
-  }
-
-  // Named keys.
-  if (name == "space" || name == "spc")          return SDLK_SPACE;
-  if (name == "escape" || name == "esc")         return SDLK_ESCAPE;
-  if (name == "return" || name == "enter")       return SDLK_RETURN;
-  if (name == "tab")                             return SDLK_TAB;
-  if (name == "backspace" || name == "bsp")      return SDLK_BACKSPACE;
-  if (name == "minus")                           return SDLK_MINUS;
-  if (name == "plus" || name == "equals")        return SDLK_EQUALS;
-  if (name == "period" || name == "dot")         return SDLK_PERIOD;
-  if (name == "comma")                           return SDLK_COMMA;
-  if (name == "up")                              return SDLK_UP;
-  if (name == "down")                            return SDLK_DOWN;
-  if (name == "left")                            return SDLK_LEFT;
-  if (name == "right")                           return SDLK_RIGHT;
-  if (name == "pageup" || name == "pgup")        return SDLK_PAGEUP;
-  if (name == "pagedown" || name == "pgdn")      return SDLK_PAGEDOWN;
-  if (name == "home")                            return SDLK_HOME;
-  if (name == "end")                             return SDLK_END;
-  if (name == "delete" || name == "del")         return SDLK_DELETE;
-  if (name == "insert" || name == "ins")         return SDLK_INSERT;
-  if (name == "grave" || name == "backtick" || name == "backquote") return SDLK_GRAVE;
-
-  // F1..F12.
-  if (name.size() >= 2 && name[0] == 'f') {
-    try {
-      const int n = std::stoi(name.substr(1));
-      if (n >= 1 && n <= 12) return static_cast<SDL_Keycode>(SDLK_F1 + (n - 1));
-    } catch (...) {
-      /* fall through */
-    }
-  }
-
-  return SDLK_UNKNOWN;
-}
-
-struct ModState {
-  bool shift{false};
-  bool ctrl{false};
-  bool alt{false};
-
-  SDL_Keymod as_keymod() const {
-    Uint16 m = SDL_KMOD_NONE;
-    if (shift) m |= SDL_KMOD_SHIFT;
-    if (ctrl)  m |= SDL_KMOD_CTRL;
-    if (alt)   m |= SDL_KMOD_ALT;
-    return static_cast<SDL_Keymod>(m);
-  }
+/** RAII guard that clears g_script_running when it goes out of scope. */
+struct RunningGuard {
+  ~RunningGuard() { g_script_running.store(false, std::memory_order_release); }
 };
-
-void push_key_event(bool down, SDL_Keycode key, SDL_Keymod mod) {
-  if (key == SDLK_UNKNOWN) return;
-  SDL_Event ev{};
-  // SDL_Event is a union; ev.type aliases ev.key.type and covers both.
-  ev.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
-  ev.key.timestamp = SDL_GetTicksNS();
-  ev.key.windowID = 0;  // handle_event only filters windowID for WINDOW_* events
-  ev.key.key = key;
-  ev.key.mod = mod;
-  ev.key.down = down;
-  ev.key.repeat = false;
-  SDL_PushEvent(&ev);
-}
-
-void push_quit() {
-  SDL_Event ev{};
-  ev.type = SDL_EVENT_QUIT;
-  ev.quit.timestamp = SDL_GetTicksNS();
-  SDL_PushEvent(&ev);
-}
-
-void sleep_seconds(double sec) {
-  if (sec <= 0.0) return;
-  std::this_thread::sleep_for(std::chrono::duration<double>(sec));
-}
 
 // Split a line into whitespace-separated tokens, up to `max_tokens`. The
 // remainder (if any) is returned as the last token unsplit. Trims surrounding
@@ -153,6 +61,8 @@ bool parse_on_off(const std::string& tok, bool& out) {
 }
 
 void run_script(std::vector<std::string> lines) {
+  // Clears the running flag on any return path (including exceptions).
+  RunningGuard running_guard;
   const bool verbose = std::getenv("VIDEO_COMPARE_INPUT_SCRIPT_LOG") != nullptr;
   ModState mod;
   auto log = [&](const std::string& s) {
@@ -278,12 +188,19 @@ void start_from_env() {
   while (std::getline(file, line)) lines.push_back(line);
   std::cerr << "[input-script] loaded " << lines.size() << " line(s) from " << path << std::endl;
 
+  // Publish running=true before launch so is_running() returns the truth
+  // even if the caller queries before the worker schedules.
+  g_script_running.store(true, std::memory_order_release);
   std::thread(
       [](std::vector<std::string> script) {
         run_script(std::move(script));
       },
       std::move(lines))
       .detach();
+}
+
+bool is_running() {
+  return g_script_running.load(std::memory_order_acquire);
 }
 
 }  // namespace debug_input_script

@@ -38,4 +38,12 @@ namespace debug_input_script {
 //
 void start_from_env();
 
+/**
+ * Whether the scripted input thread is currently executing. Returns true from
+ * the moment start_from_env() launches the worker until the script completes
+ * (successfully or via early exit). Returns false when no script was loaded.
+ * Safe to call from any thread.
+ */
+bool is_running();
+
 }  // namespace debug_input_script
