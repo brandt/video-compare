@@ -184,15 +184,15 @@ If pivot isn't possible (not enough history/prefetch), control falls through to 
 
 ### 5.3 Full seek: barrier, seek, restart
 
-Full seek is heavyweight. Steps (`:1355-1572`):
+Full seek is heavyweight. Steps:
 
-1. **ReadyToSeek barrier** (`:1355-1396`). Per-side flags in `seeking_per_side_` (`app/video_compare.h:262`) tell workers to exit their loops and idle at their barrier. Main thread `stop()`s the packet queue and repeatedly `empty()`s every downstream queue while spin-waiting on `ready_to_seek_.all_are_idle_where(should_seek)`. Empty-calls are repeated because workers can produce one more frame between the flag check and the barrier entry. `pure_right_frame_shift` scopes the barrier to the right sides only, so the left pipeline keeps running.
-2. **Consume pending filter changes** on seeking sides (`:1401-1407`).
-3. **Per-side demuxer seek** (`:1466-1521`):
+1. **ReadyToSeek barrier** via the shared `VideoCompare::enter_seek_barrier(should_walk)` helper (`app/video_compare.cpp`, around the helper definition after `quit_all_queues`). The helper: sets `seeking_per_side_` for each side where `should_walk(side)` is true; stops that side's packet queue; repeatedly `empty()`s every downstream queue while spin-waiting on `ready_to_seek_.all_are_idle_where(should_walk)`; clears the seeking flags once the barrier has idled so the decode worker's 10 ms flush loop stops racing the codec. `pure_right_frame_shift` scopes the barrier to the right sides only, so the left pipeline keeps running. The same helper is also called by loop-mode materialize (§8.1), L1 re-decode (§11), and the auto-align PacketRing walk (`docs/design/auto-align.md`).
+2. **Consume pending filter changes** on seeking sides.
+3. **Per-side demuxer seek**:
    - Target is in seconds on each side's own time axis; the right target includes `TimeShifter::static_shift() + dynamic_shift()` so the subsequent comparison lands aligned with left.
-   - `backward = seek_from_start || seek_relative < 0 || shift_right_frames != 0 || (force_seek_current_position && all_multi_frame)` (`:1459`). `AVSEEK_FLAG_BACKWARD` is required on absolute scrubs because sparse-keyframe inputs (e.g. a single keyframe at PTS 0) reject at-or-after seeks.
-   - On a forward seek that overshoots EOF, the code restores the pre-seek position with a backward seek for every seeking side (`:1524-1538`) and surfaces "Unable to seek past end of file".
-4. **Restart packet/decoded/filtered/converted queues** on seeking sides (`:1547-1564`) so workers can resume pushing.
+   - `backward = seek_from_start || seek_relative < 0 || shift_right_frames != 0 || (force_seek_current_position && all_multi_frame)`. `AVSEEK_FLAG_BACKWARD` is required on absolute scrubs because sparse-keyframe inputs (e.g. a single keyframe at PTS 0) reject at-or-after seeks.
+   - On a forward seek that overshoots EOF, the code restores the pre-seek position with a backward seek for every seeking side and surfaces "Unable to seek past end of file".
+4. **Restart packet/decoded/filtered/converted queues** on seeking sides so workers can resume pushing.
 
 After the demuxer lands, the first frame that will arrive in the converter queue is the keyframe at or before the target, not the target itself.
 
@@ -395,7 +395,7 @@ Landing behavior: L1 clears the ring, replays pre-target frames into history via
 
 Post-L1 demuxer positioning: after inline decode the main thread seeks each seeking demuxer *forward* to the keyframe at-or-after target+0.001s (`backward=false`). Seeking backward (to keyframe ≤ target) would make the pipeline re-emit the pre-target frames already in history, corrupting prefetch ordering and causing the first `+` press to briefly jump backward. If the forward seek fails on a sparse-keyframe input with no subsequent keyframe, it falls back to the backward seek and relies on `sync_frame_queue` to self-correct within a frame or two.
 
-Worker-thread race note: after the barrier idles, the seek flag is cleared (`app/video_compare.cpp:1528-1531`) so the decoder worker's `ready_to_seek` sleep loop stops calling `avcodec_flush_buffers` — necessary because the main thread is about to flush and send packets on the same codec context. Queues stay stopped so workers don't wake into a decode attempt.
+Worker-thread race note: after the barrier idles, the seek flag is cleared (inside `enter_seek_barrier`) so the decoder worker's `ready_to_seek` sleep loop stops calling `avcodec_flush_buffers` — necessary because the main thread is about to flush and send packets on the same codec context. Queues stay stopped so workers don't wake into a decode attempt.
 
 Diagnostic: `VIDEO_COMPARE_LOG_SEEK_TIMING=1` logs `tier=<L0back|L0forward|L1|L1->L2|L2>` and elapsed time per seek, plus `[l1-skip]` lines explaining any L1 eligibility failures. `VIDEO_COMPARE_LOG_L1_STAGES=1` adds per-step L1 trace.
 
@@ -416,4 +416,8 @@ Diagnostic: `VIDEO_COMPARE_LOG_SEEK_TIMING=1` logs `tier=<L0back|L0forward|L1|L1
 | Right-shift ±N (in FrameRing)      | +/-             | L0 pivot                     | —        | —
 | Right-shift ±N (out of FrameRing)  | +/-             | L1 if kf ≤ 0.5 s, else L2    | L2: yes  | yes
 | Clear crop                         | Backspace       | L2 (filter rebuild)          | yes      | yes
+| Auto-align (ring covers window)    | `` ` ``         | run_auto_align → L0 pivot    | —        | —
+| Auto-align (walk needed)           | `[`, `]`        | run_auto_align + barriered PacketRing walk → L0/L1/L2 | right side only | yes (decode only, no filter/convert) |
+
+For the auto-align algorithm and the barriered PacketRing walk it runs, see [auto-align.md](auto-align.md).
 

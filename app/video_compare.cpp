@@ -2055,7 +2055,11 @@ void VideoCompare::compare() {
             decision_kind = "seek";
           }
           if (log_auto_align) {
-            std::cerr << "[auto-align] mode=" << mode_label << " ring=" << ring_candidate_pts.size() << " decoded=" << decoded_added << " decode_ms=" << decode_ms << " walk=" << (walk_attempted ? (walk_skip_reason ? "skipped" : "done") : "none") << " candidates=" << candidates.size() << " scored=" << valid_scored << " best_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(best_pts - left_current_pts) / 1000.0) << " best_score=" << string_sprintf("%.4f", best_score) << " current_score=" << string_sprintf("%.4f", current_score) << " shift_frames=" << shift_applied << " decision=" << decision_kind << " window=[" << string_sprintf("%.3f", static_cast<double>(window_start_rel_sec)) << "," << string_sprintf("%.3f", static_cast<double>(window_end_rel_sec)) << "]s" << std::endl;
+            // When no candidate got scored, best_score/current_score are still
+            // the -max float sentinel; print "n/a" instead of a 40-digit number.
+            const std::string best_score_s = (valid_scored == 0) ? std::string{"n/a"} : string_sprintf("%.4f", best_score);
+            const std::string current_score_s = (current_scored) ? string_sprintf("%.4f", current_score) : std::string{"n/a"};
+            std::cerr << "[auto-align] mode=" << mode_label << " ring=" << ring_candidate_pts.size() << " decoded=" << decoded_added << " decode_ms=" << decode_ms << " walk=" << (walk_attempted ? (walk_skip_reason ? "skipped" : "done") : "none") << " candidates=" << candidates.size() << " scored=" << valid_scored << " best_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(best_pts - left_current_pts) / 1000.0) << " best_score=" << best_score_s << " current_score=" << current_score_s << " shift_frames=" << shift_applied << " decision=" << decision_kind << " window=[" << string_sprintf("%.3f", static_cast<double>(window_start_rel_sec)) << "," << string_sprintf("%.3f", static_cast<double>(window_end_rel_sec)) << "]s" << std::endl;
           }
         }
       }
@@ -2892,6 +2896,108 @@ void VideoCompare::compare() {
         }  // end of full-seek branch
       after_seek_block:;
         log_seek();
+
+        // --- Post-seek auto-align verification ---
+        // If the seek we just completed was driven by the auto-align block
+        // earlier this iteration, rescore the pair against the same left-probe
+        // fingerprints using the right ring's newly-landed current frame. We
+        // only report — no retry, no rollback — matching the user's chosen
+        // "warn only, leave as-is" policy for seek-imprecision surfacing.
+        if (pending_auto_align_verification_.active) {
+          auto& v = pending_auto_align_verification_;
+          const bool log_auto_align = env_flag_enabled("VIDEO_COMPARE_LOG_AUTO_ALIGN");
+
+          // Fresh SwsContext lookup + fingerprint helpers — duplicated from the
+          // auto-align block so this code path is self-contained. Low cost: at
+          // most a handful of ring frames need a 64x64 sws pass (~30 µs each).
+          const auto get_or_build_sws = [this](AVPixelFormat fmt, int w, int h) -> SwsContext* {
+            const AutoAlignSwsKey key{fmt, w, h};
+            const auto it = auto_align_sws_cache_.find(key);
+            if (it != auto_align_sws_cache_.end()) {
+              return it->second.get();
+            }
+            SwsContext* raw = sws_getContext(w, h, fmt, MetricsCalculator::kFingerprintSize, MetricsCalculator::kFingerprintSize, AV_PIX_FMT_GRAY8, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (raw == nullptr) {
+              return nullptr;
+            }
+            const auto ins = auto_align_sws_cache_.emplace(key, SwsContextUniquePtr(raw));
+            return ins.first->second.get();
+          };
+          const auto fingerprint_ring_frame = [&](const AVFrame* frame, std::vector<float>& out) -> bool {
+            if (frame == nullptr || frame->width <= 0 || frame->height <= 0) {
+              return false;
+            }
+            SwsContext* const ctx = get_or_build_sws(static_cast<AVPixelFormat>(frame->format), frame->width, frame->height);
+            if (ctx == nullptr) {
+              return false;
+            }
+            MetricsCalculator::compute_structural_fingerprint(frame->data, frame->linesize, frame->height, ctx, out);
+            return !out.empty();
+          };
+          const auto find_nearest_in_ring = [](const FrameRing& ring, int64_t target_pts, int64_t tolerance_pts) -> const AVFrame* {
+            const int min_off = -ring.history_size();
+            const int max_off = ring.prefetch_size();
+            const AVFrame* best = nullptr;
+            int64_t best_dist = std::numeric_limits<int64_t>::max();
+            for (int off = min_off; off <= max_off; ++off) {
+              const AVFrame* const f = ring.at(off);
+              if (f == nullptr) {
+                continue;
+              }
+              const int64_t dist = std::abs(f->pts - target_pts);
+              if (dist < best_dist) {
+                best_dist = dist;
+                best = f;
+              }
+            }
+            if (best == nullptr || best_dist > tolerance_pts) {
+              return nullptr;
+            }
+            return best;
+          };
+
+          const FrameRing& right_ring_after = right_ptr->ring;
+          const AVFrame* const right_current_after = right_ring_after.current_frame();
+          const int64_t right_tolerance = v.probe_step_pts / 2;
+
+          // Rescore the same 5-probe window against the post-seek right ring.
+          // For each stored left probe fingerprint, find the right frame nearest
+          // to (left_probe_pts + delta_t_pts), fingerprint it fresh, correlate.
+          float sum = 0.0f;
+          int n_valid = 0;
+          for (const auto& pair : v.left_probe_fingerprints) {
+            const int64_t l_pts = pair.first;
+            const std::vector<float>& l_fp = pair.second;
+            const int64_t r_target = l_pts + v.delta_t_pts;
+            const AVFrame* const r_frame = find_nearest_in_ring(right_ring_after, r_target, right_tolerance);
+            if (r_frame == nullptr) {
+              continue;
+            }
+            std::vector<float> r_fp;
+            if (!fingerprint_ring_frame(r_frame, r_fp)) {
+              continue;
+            }
+            sum += MetricsCalculator::structural_correlation(l_fp, r_fp);
+            ++n_valid;
+          }
+
+          const float landed_score = (n_valid >= 3) ? (sum / static_cast<float>(n_valid)) : -std::numeric_limits<float>::max();
+          constexpr float kAutoAlignVerificationSlack = 0.01f;
+          const bool ok = (n_valid >= 3) && (landed_score >= v.expected_score - kAutoAlignVerificationSlack);
+          const int64_t landed_pts_delta = (right_current_after != nullptr) ? (right_current_after->pts - v.left_current_pts) : 0;
+
+          if (!ok && n_valid >= 3) {
+            display_->set_pending_message(string_sprintf("Auto-align: landed score %.3f (expected %.3f) — seek imprecision", landed_score, v.expected_score));
+          }
+          // When ok, the main-pass "shift %+d (score %.3f)" message set earlier
+          // stays on screen — no need to overwrite it with a near-identical one.
+
+          if (log_auto_align) {
+            std::cerr << "[auto-align] landed_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(landed_pts_delta) / 1000.0) << " landed_score=" << string_sprintf("%.4f", landed_score) << " expected_score=" << string_sprintf("%.4f", v.expected_score) << " ok=" << (ok ? "true" : "false") << " probes=" << n_valid << std::endl;
+          }
+
+          v = {};  // clear for next press
+        }
       }
 
       bool store_frames = false;
