@@ -2,7 +2,7 @@
 
 [![GitHub release](https://img.shields.io/github/release/pixop/video-compare)](https://github.com/pixop/video-compare/releases)
 
-Split-screen video comparison tool written in C++14, utilizing FFmpeg libraries and SDL2. It provides
+Split-screen video comparison tool written in C++20, utilizing FFmpeg libraries and SDL2. It provides
 interactive navigation and playback controls, along with various analysis tools and customizable display options.
 
 `video-compare` can be used to visually compare the impact of codecs, resizing algorithms, and other modifications
@@ -276,7 +276,7 @@ Left-click the mouse to perform a time seek based on the horizontal position of 
 Hold `Ctrl` or `Shift` for smaller relative seek, playback-speed, and zoom adjustments where available.
 Availability may depend on conflicts with application shortcuts or operating system bindings.
 
-## Build
+## Building
 
 ### Requirements
 
@@ -300,7 +300,7 @@ dnf install make gcc-c++ ffmpeg-devel SDL2-devel SDL2_ttf-devel
 On macOS the required libraries can be installed via Homebrew:
 
 ```sh
-brew install sdl3 sdl2_ttf ffmpeg-full
+brew install sdl3 sdl2_ttf ffmpeg-full nlohmann-json
 ```
 
 ### Instructions
@@ -319,48 +319,13 @@ make install
 
 Note that root privileges are required to perform this operation in most environments (hint: use e.g. `sudo`).
 
-## Notes
+## Limitations
 
-1. Audio playback is not supported.
-2. Keep time-shifts below a few seconds for the best experience.
-3. Seeks require re-synchronization on the keyframe (i.e., I-frame) preceding the target timestamp.
+- Audio playback is not currently on the roadmap.
 
-## Practical tips
+## Tips
 
-### Send To Integration in Windows File Explorer
-
-You can launch `video-compare` directly from Windows File Explorer when you only need to specify input files. Simply use:
-
-**Right click → Send to → video-compare**
-
-#### How it works
-
-https://user-images.githubusercontent.com/8549626/166630445-c8c511b7-005f-48aa-83bc-0eb9676cfa2a.mp4
-
-For quick access, select two files, right-click either one, then press:
-
-- **N** to focus _Send to_
-- **V** to select _video-compare_
-
-#### Setup
-
-To make _video-compare_ appear in the **Send to** menu:
-
-1. Open the Run dialog (**Windows + R**)
-2. Type `shell:sendto` and press Enter
-3. Create a shortcut to `video-compare.exe` in this folder
-
-Thanks to [couleurm](https://github.com/couleurm) for sharing this tip and providing the screen recording.
-
-### More frontend options for Windows users
-
-For Windows users, the community has shared several frontend options to complement the command-line functionality:
-
-1. **Beyond Compare** integration: Launch `video-compare` directly from the interface.
-2. **Total Commander** integration: Add a toolbar button to open selected videos.
-3. **[VideoCompareGUI](https://github.com/TetzkatLipHoka/VideoCompareGUI)**: A standalone graphical utility that simplifies launching `video-compare`.
-
-For details, check out the [open GitHub issue thread](https://github.com/pixop/video-compare/issues/81).
+Tips for Windows users can be found in [docs/user/Windows.md](docs/user/Windows.md).
 
 ## Contributing
 

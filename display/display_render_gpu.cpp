@@ -285,28 +285,28 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         // mirrored at ~33% across so the pair visually balances the FPS
         // readout on the right.
         //
-        // Priority: SEEK > loop modes > play/pause. SEEK surfaces during any
-        // period where the two sides' PTS have diverged (post-seek drain,
-        // sync-adjust catch-up, playing-seek keyframe→target ramp-up) so the
-        // user has a visible cue that the pipeline is transiently catching up.
-        std::string state_str;
+        // The state itself is derived by Display::get_play_state() so that
+        // external introspection (e.g. the debug input socket) and the HUD
+        // can't drift. The HUD adds the bracket decoration and picks a color.
+        const PlayState play_state = get_play_state();
+        const std::string state_str = std::string("[") + play_state_label(play_state) + "]";
         SDL_Color state_color = TEXT_COLOR;
-        const Loop loop_mode = playback_.loop_mode();
-        if (!playback_in_sync_) {
-          state_str = "[SEEK]";
-          state_color = ZOOM_COLOR;
-        } else if (loop_mode == Loop::ForwardOnly) {
-          state_str = "[LOOP >]";
-          state_color = LOOP_FW_LABEL_COLOR;
-        } else if (loop_mode == Loop::PingPong) {
-          state_str = "[LOOP <>]";
-          state_color = LOOP_PP_LABEL_COLOR;
-        } else if (playback_.play()) {
-          state_str = "[PLAY]";
-          state_color = POSITION_COLOR;
-        } else {
-          state_str = "[PAUSE]";
-          state_color = TEXT_COLOR;
+        switch (play_state) {
+          case PlayState::Seek:
+            state_color = ZOOM_COLOR;
+            break;
+          case PlayState::LoopForward:
+            state_color = LOOP_FW_LABEL_COLOR;
+            break;
+          case PlayState::LoopPingPong:
+            state_color = LOOP_PP_LABEL_COLOR;
+            break;
+          case PlayState::Play:
+            state_color = POSITION_COLOR;
+            break;
+          case PlayState::Pause:
+            state_color = TEXT_COLOR;
+            break;
         }
 
         const std::string buf_str = string_sprintf("[<- %d | %d ->]", frame_buffer_before_, frame_buffer_after_);

@@ -1,5 +1,8 @@
 # Input Testing
 
+> [!TIP]  
+> There is also a UNIX domain socket-based input API for external control documented in [design/input-socket.md](input-socket.md).
+
 A small scripted-keystroke harness lets a test (or an AI agent, or anyone automating) drive video-compare without holding focus on the window or relying on OS-level keystroke injection. Commands in a text file are played back by a detached thread that pushes synthesized SDL events into the main loop's event queue, so every code path that a real keypress would trigger (seek dispatch, crop, loop mode, etc.) is exercised end-to-end.
 
 Implementation: [app/debug_input_script.h](../../app/debug_input_script.h) / [debug_input_script.cpp](../../app/debug_input_script.cpp). Spawned from [app/video_compare.cpp](../../app/video_compare.cpp) in `VideoCompare::operator()()` right after the worker threads are launched.
