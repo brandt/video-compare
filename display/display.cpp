@@ -551,6 +551,12 @@ AutoAlignMode Display::get_auto_align_mode() const {
   return playback_.auto_align_mode();
 }
 
+// True when the user's pending seek should move only the right video(s).
+// Currently set by shift-click on the timeline.
+bool Display::get_right_only_seek() const {
+  return playback_.right_only_seek();
+}
+
 // Public wrapper around MetricsCalculator::compute_frame_ssim for alignment consumers in video_compare.cpp.
 float Display::compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame) {
   return MetricsCalculator::compute_frame_ssim(left_frame, right_frame, requires_10_bpc());

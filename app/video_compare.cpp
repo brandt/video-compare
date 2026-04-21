@@ -2150,6 +2150,12 @@ void VideoCompare::compare() {
         // that the sticky disable above guarantees single-decoder mode is off here, so
         // there is no boundary-crossing risk.
         const bool pure_right_frame_shift = (seek_relative == 0.0F) && (shift_right_frames != 0) && !force_seek_current_position;
+        // Right-only scoping applies when the user explicitly opted in via
+        // shift-click (`display_->get_right_only_seek()`), or when this is a
+        // pure `+`/`-` frame shift (which has always been right-only). Forces
+        // the full-seek barrier and demuxer work to touch only the right
+        // side(s); left keeps playing.
+        const bool right_only_seek = pure_right_frame_shift || (display_->get_right_only_seek() && !force_seek_current_position);
 
         // Fast path: pivot the FrameRing cursor instead of seeking.
         //
@@ -2252,7 +2258,7 @@ void VideoCompare::compare() {
           skip_update = true;
         } else {
           // Predicate: does this side participate in this seek?
-          const auto should_seek = [pure_right_frame_shift](const Side& s) -> bool { return !pure_right_frame_shift || s.is_right(); };
+          const auto should_seek = [right_only_seek](const Side& s) -> bool { return !right_only_seek || s.is_right(); };
 
           // =====================================================================
           // L1 re-decode fast path.
@@ -2800,8 +2806,16 @@ void VideoCompare::compare() {
               next_right_position = std::max(next_right_position, min_right_position);
 
               // Add the static and dynamic time shifts to the next right position.
-              next_right_position += time_shifter_.static_shift() * AV_TIME_TO_SEC;
-              next_right_position += static_cast<float>(time_shifter_.dynamic_shift(static_cast<int64_t>((next_right_position - right_state.start_time_) / AV_TIME_TO_SEC), false)) * AV_TIME_TO_SEC;
+              // Exception: shift-click (right_only_seek with seek_from_start) should
+              // land right at the clicked timeline position in its own absolute
+              // axis, ignoring the existing left↔right offset. The TimeShifter
+              // update below makes sync treat left.pts_ as the new reference so
+              // playback doesn't drag left forward to chase right's new position.
+              const bool skip_shift_for_shift_click = right_only_seek && seek_from_start;
+              if (!skip_shift_for_shift_click) {
+                next_right_position += time_shifter_.static_shift() * AV_TIME_TO_SEC;
+                next_right_position += static_cast<float>(time_shifter_.dynamic_shift(static_cast<int64_t>((next_right_position - right_state.start_time_) / AV_TIME_TO_SEC), false)) * AV_TIME_TO_SEC;
+              }
 
               right_seek_positions[side] = next_right_position;
 
@@ -2954,6 +2968,18 @@ void VideoCompare::compare() {
           if (should_seek(LEFT)) {
             left.ring.clear();
             pop_and_reset(left, next_left_position, drain_to_target);
+          }
+
+          // Shift-click (right-only seek from start): left didn't move, but right
+          // jumped to an absolute timeline position in its own axis. Update
+          // TimeShifter so the post-seek right.pts_ aligns with left.pts_ —
+          // otherwise sync_frame_queue would drag left forward to chase right.
+          if (right_only_seek && seek_from_start && right_delta > 0) {
+            const float nrp = right_seek_positions[right_ptr->side_];
+            const int64_t expected_right_raw_us = static_cast<int64_t>(static_cast<double>(nrp - right_ptr->start_time_) * AV_TIME_BASE);
+            const int64_t new_static_shift_us = expected_right_raw_us - left.pts_;
+            total_right_time_shifted = static_cast<int>((new_static_shift_us - time_shifter_.offset_av_time()) / right_delta);
+            time_shifter_.set_frame_shift_accumulator(total_right_time_shifted, right_delta);
           }
 
           // Nudge near-zero residual shifts away from zero so the right demuxer lands

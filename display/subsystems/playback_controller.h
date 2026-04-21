@@ -54,6 +54,12 @@ class PlaybackController {
     auto_align_mode_ = mode;
   }
 
+  // True when the pending seek request should move only the right video(s),
+  // leaving left untouched. Set by shift-click on the timeline; consumed by
+  // the main loop's seek dispatch.
+  bool right_only_seek() const { return right_only_seek_; }
+  void set_right_only_seek(bool value) { right_only_seek_ = value; }
+
   // --- Playback speed ---
   float playback_speed_factor() const { return playback_speed_factor_; }
   float playback_speed_level() const { return playback_speed_level_; }
@@ -74,6 +80,7 @@ class PlaybackController {
   int shift_right_frames_{0};
   bool auto_align_requested_{false};
   AutoAlignMode auto_align_mode_{AutoAlignMode::Symmetric};
+  bool right_only_seek_{false};
   bool seek_from_start_{false};
   float playback_speed_level_{0.0F};
   float playback_speed_factor_{1.0F};

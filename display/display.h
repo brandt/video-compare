@@ -454,6 +454,7 @@ class Display {
   int get_shift_right_frames() const;
   bool get_auto_align_requested() const;
   AutoAlignMode get_auto_align_mode() const;
+  bool get_right_only_seek() const;
   float compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame);
   float get_playback_speed_factor() const;
   bool get_tick_playback() const;

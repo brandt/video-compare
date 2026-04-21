@@ -170,8 +170,14 @@ void Display::handle_mouse_button_event(const SDL_Event& event) {
       const Vector2D start_pos = view_transform_.window_to_video_position(mouse_x_, mouse_y_, view_transform_.compute_zoom_rect());
       selection_.begin_selection(start_pos, mode_, video_width_, video_height_);
     } else if (event.button.button != SDL_BUTTON_RIGHT) {
+      // Shift-click scopes the seek to the right video only; the left playhead
+      // stays put. Useful for nudging a non-aligned pair into sync without
+      // disturbing the reference side.
+      const SDL_Keymod mod = SDL_GetModState();
+      const bool shift_down = (mod & SDL_KMOD_SHIFT) != 0;
       playback_.set_seek_relative(static_cast<float>(mouse_x_) / static_cast<float>(window_width_));
       playback_.set_seek_from_start(true);
+      playback_.set_right_only_seek(shift_down);
     }
   } else {  // SDL_EVENT_MOUSE_BUTTON_UP
     if (event.button.button == SDL_BUTTON_LEFT && selection_.state() == SelectionState::Started) {

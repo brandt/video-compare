@@ -35,6 +35,7 @@ void PlaybackController::clear_transient_state() {
   frame_navigation_delta_ = 0;
   shift_right_frames_ = 0;
   auto_align_requested_ = false;
+  right_only_seek_ = false;
   tick_playback_ = false;
   possibly_tick_playback_ = false;
 }
