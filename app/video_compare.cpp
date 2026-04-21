@@ -2187,9 +2187,20 @@ void VideoCompare::compare() {
         // Right-only scoping applies when the user explicitly opted in via
         // shift-click (`display_->get_right_only_seek()`), or when this is a
         // pure `+`/`-` frame shift (which has always been right-only). Forces
-        // the full-seek barrier and demuxer work to touch only the right
-        // side(s); left keeps playing.
+        // the full-seek barrier and demuxer work to touch only one side's
+        // pipeline; the other side keeps playing.
         const bool right_only_seek = pure_right_frame_shift || (display_->get_right_only_seek() && !force_seek_current_position);
+        // Which side actually participates in this right-only seek. Normally
+        // RIGHT; becomes LEFT when the user shift-clicked while `swap_left_right_`
+        // was active — shift-click follows the visual position of the "right"
+        // side, not the underlying pipeline identity. Pure `+`/`-` shifts
+        // always target RIGHT (their sign already flipped at the input layer
+        // to preserve the swap illusion; see Phase 1).
+        const Side follower_side =
+            (display_->get_right_only_seek() && !pure_right_frame_shift)
+                ? display_->get_right_only_seek_follower()
+                : RIGHT;
+        const Side master_side = follower_side.is_left() ? RIGHT : LEFT;
 
         // Fast path: pivot the FrameRing cursor instead of seeking.
         //
@@ -2291,8 +2302,16 @@ void VideoCompare::compare() {
           // Don't sync until the next iteration (consistent with the full-seek path).
           skip_update = true;
         } else {
-          // Predicate: does this side participate in this seek?
-          const auto should_seek = [right_only_seek](const Side& s) -> bool { return !right_only_seek || s.is_right(); };
+          // Predicate: does this side participate in this seek? When
+          // `right_only_seek` is true, only the follower side (RIGHT without
+          // swap, LEFT under swap-aware shift-click) seeks. Otherwise all
+          // sides participate (standard full seek).
+          const auto should_seek = [right_only_seek, follower_side](const Side& s) -> bool {
+            if (!right_only_seek) {
+              return true;
+            }
+            return follower_side.is_left() ? s.is_left() : s.is_right();
+          };
 
           // =====================================================================
           // L1 re-decode fast path.
@@ -2815,7 +2834,10 @@ void VideoCompare::compare() {
           for (auto& pair : side_states) {
             const Side& side = pair.first;
 
-            if (side.is_right()) {
+            // Skip non-right sides, and under swap-aware shift-click also skip
+            // rights that aren't the follower (in that case should_seek only
+            // passes LEFT through, which is handled by its own block below).
+            if (side.is_right() && should_seek(side)) {
               SideState& right_state = pair.second;
 
               float next_right_position;
@@ -3004,14 +3026,29 @@ void VideoCompare::compare() {
             pop_and_reset(left, next_left_position, drain_to_target);
           }
 
-          // Shift-click (right-only seek from start): left didn't move, but right
-          // jumped to an absolute timeline position in its own axis. Update
-          // TimeShifter so the post-seek right.pts_ aligns with left.pts_ —
-          // otherwise sync_frame_queue would drag left forward to chase right.
+          // Shift-click (right-only seek from start): one side didn't move,
+          // the other jumped to an absolute timeline position in its own
+          // axis. Update TimeShifter so the post-seek pts_ values align —
+          // otherwise sync_frame_queue would drag the stationary side
+          // forward to chase the moved side.
+          //
+          // TimeShifter's static_shift continues to mean "right-relative-to-
+          // left" regardless of which side moved. Under swap the follower
+          // is LEFT; the sign of the update flips accordingly so the
+          // invariant holds.
           if (right_only_seek && seek_from_start && right_delta > 0) {
-            const float nrp = right_seek_positions[right_ptr->side_];
-            const int64_t expected_right_raw_us = static_cast<int64_t>(static_cast<double>(nrp - right_ptr->start_time_) * AV_TIME_BASE);
-            const int64_t new_static_shift_us = expected_right_raw_us - left.pts_;
+            int64_t new_static_shift_us = 0;
+            if (follower_side.is_right()) {
+              // No swap: right moved, left stayed.
+              const float nrp = right_seek_positions[right_ptr->side_];
+              const int64_t expected_right_raw_us = static_cast<int64_t>(static_cast<double>(nrp - right_ptr->start_time_) * AV_TIME_BASE);
+              new_static_shift_us = expected_right_raw_us - left.pts_;
+            } else {
+              // Under swap: left moved, right stayed. new_static_shift =
+              // right.pts_ - expected_left_raw (sign flipped vs above).
+              const int64_t expected_left_raw_us = static_cast<int64_t>(static_cast<double>(next_left_position - left.start_time_) * AV_TIME_BASE);
+              new_static_shift_us = right_ptr->pts_ - expected_left_raw_us;
+            }
             total_right_time_shifted = static_cast<int>((new_static_shift_us - time_shifter_.offset_av_time()) / right_delta);
             time_shifter_.set_frame_shift_accumulator(total_right_time_shifted, right_delta);
           }

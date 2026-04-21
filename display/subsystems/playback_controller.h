@@ -1,5 +1,6 @@
 #pragma once
 #include "../display_types.h"
+#include "core/core_types.h"
 
 // Per-session playback state: play/pause, loop mode, seek requests, frame
 // navigation offsets, playback speed. Most fields are transient — set by
@@ -54,11 +55,25 @@ class PlaybackController {
     auto_align_mode_ = mode;
   }
 
-  // True when the pending seek request should move only the right video(s),
-  // leaving left untouched. Set by shift-click on the timeline; consumed by
-  // the main loop's seek dispatch.
+  // True when the pending seek request should move only one side of the
+  // comparison (the follower side), leaving the other untouched. Set by
+  // shift-click on the timeline; consumed by the main loop's seek dispatch.
   bool right_only_seek() const { return right_only_seek_; }
-  void set_right_only_seek(bool value) { right_only_seek_ = value; }
+
+  // Side that should actually move during a pending right-only seek. Only
+  // meaningful when right_only_seek() is true; defaults to RIGHT.
+  Side right_only_seek_follower() const { return right_only_seek_follower_; }
+
+  // Arm (or disarm) a right-only seek. When arming, `follower` names which
+  // side participates — RIGHT normally, LEFT under swap-aware shift-click.
+  // A disarm call (value=false) leaves the follower field alone since
+  // nothing will consume it until the next arm.
+  void set_right_only_seek(bool value, Side follower = Side{SideType::Right}) {
+    right_only_seek_ = value;
+    if (value) {
+      right_only_seek_follower_ = follower;
+    }
+  }
 
   // --- Playback speed ---
   float playback_speed_factor() const { return playback_speed_factor_; }
@@ -81,6 +96,7 @@ class PlaybackController {
   bool auto_align_requested_{false};
   AutoAlignMode auto_align_mode_{AutoAlignMode::Symmetric};
   bool right_only_seek_{false};
+  Side right_only_seek_follower_{SideType::Right};
   bool seek_from_start_{false};
   float playback_speed_level_{0.0F};
   float playback_speed_factor_{1.0F};

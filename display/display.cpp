@@ -554,16 +554,10 @@ bool Display::get_swap_left_right() const {
   return swap_left_right_;
 }
 
-/**
- * Underlying pipeline side that maps to the user's "right video" intent.
- *
- * The follower side is the one whose offset gets adjusted by `+`/`-`,
- * shift-click, and the auto-align keys. Normally that's the underlying
- * RIGHT pipeline; when swap is active the visually-right side is
- * underlying LEFT, so the follower flips accordingly. Used by every
- * swap-aware input path; defined here so the translation lives in one
- * place.
- */
+// Underlying pipeline side that maps to the user's "right video" intent.
+// Normally RIGHT; flips to LEFT when swap is active because the visually-
+// right side is then rendered by the underlying LEFT pipeline. Used by
+// every swap-aware input path so the translation lives in one place.
 Side Display::follower_side_for_input() const {
   return swap_left_right_ ? LEFT : RIGHT;
 }
@@ -607,6 +601,12 @@ AutoAlignMode Display::get_auto_align_mode() const {
 // Currently set by shift-click on the timeline.
 bool Display::get_right_only_seek() const {
   return playback_.right_only_seek();
+}
+
+// Which side actually moves during a pending right-only seek. Meaningful
+// only when get_right_only_seek() is true. Forwards PlaybackController.
+Side Display::get_right_only_seek_follower() const {
+  return playback_.right_only_seek_follower();
 }
 
 // Public wrapper around MetricsCalculator::compute_frame_ssim for alignment consumers in video_compare.cpp.

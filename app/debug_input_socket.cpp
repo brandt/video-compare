@@ -218,6 +218,14 @@ json handle_mouse(const json& req, const Session& session) {
   SDL_Window* const window = session.display != nullptr ? session.display->get_main_window() : nullptr;
   const SDL_WindowID window_id = window != nullptr ? SDL_GetWindowID(window) : 0;
 
+  // Same published-mod-state treatment as handle_key: callers that read
+  // SDL_GetModState() (e.g. the shift-click scope in display_input) see the
+  // requested modifiers at click time. Omitting `mods` leaves state alone.
+  if (req.contains("mods")) {
+    const debug_input_common::ModState mods = parse_mods(req);
+    SDL_SetModState(mods.as_keymod());
+  }
+
   if (action == "move") {
     const float x = require_field<double>(req, "x");
     const float y = require_field<double>(req, "y");

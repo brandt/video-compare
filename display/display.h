@@ -461,19 +461,11 @@ class Display {
   bool get_fast_input_alignment() const;
   bool get_swap_left_right() const;
 
-  /**
-   * Resolve the underlying pipeline Side that the user conceptually means
-   * when they press a "right video" input (`+`/`-`, shift-click on the
-   * timeline, auto-align keys).
-   *
-   * When `swap_left_right_` is false the follower is the underlying RIGHT
-   * pipeline; when swap is active the follower is the underlying LEFT
-   * pipeline (because LEFT is what's being rendered on the visual right
-   * half of the window).
-   *
-   * This is the one abstraction shared by every swap-aware input path. See
-   * docs/planning/Swap-seek.md for the design rationale.
-   */
+  // Resolve the underlying pipeline Side that the user conceptually means when
+  // they press a "right video" input (`+`/`-`, shift-click on the timeline,
+  // auto-align keys). Under swap the follower is the underlying LEFT pipeline
+  // because LEFT is rendered on the visual right half of the window. Shared by
+  // every swap-aware input path; see docs/planning/Swap-seek.md.
   Side follower_side_for_input() const;
   float get_seek_relative() const;
   bool get_seek_from_start() const;
@@ -483,6 +475,12 @@ class Display {
   bool get_auto_align_requested() const;
   AutoAlignMode get_auto_align_mode() const;
   bool get_right_only_seek() const;
+
+  // Side that actually participates in the pending right-only seek. Meaningful
+  // only when `get_right_only_seek()` is true. Normally RIGHT; becomes LEFT
+  // when the user shift-clicked while `swap_left_right_` was active — shift-
+  // click follows the visual position, not the underlying pipeline identity.
+  Side get_right_only_seek_follower() const;
   float compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame);
   float get_playback_speed_factor() const;
   bool get_tick_playback() const;

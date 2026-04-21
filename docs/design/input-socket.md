@@ -104,6 +104,11 @@ command. See **Commands** below.
   numeric equivalents `1`..`5` as strings).
 - For `button` and `wheel`, `x` and `y` are optional — omit them to let the
   current mouse position stand.
+- `mods` (optional): same modifier array as `key` above. Published to
+  SDL's global mod state via `SDL_SetModState` before the event is
+  delivered, so handlers that read `SDL_GetModState()` — e.g. the
+  shift-click seek-scoping in `display_input` — see the requested state.
+  Omit to leave mod state alone.
 
 **Behind the scenes**: mouse actions call `SDL_WarpMouseInWindow` to update
 SDL's internal cursor tracking before pushing the SDL event. This is

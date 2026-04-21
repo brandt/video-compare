@@ -36,6 +36,8 @@ void PlaybackController::clear_transient_state() {
   shift_right_frames_ = 0;
   auto_align_requested_ = false;
   right_only_seek_ = false;
+  // Follower intentionally not reset — next request will overwrite it, and
+  // keeping the previous value around is harmless since the bool gates use.
   tick_playback_ = false;
   possibly_tick_playback_ = false;
 }
