@@ -1,4 +1,5 @@
 #include "app/video_compare.h"
+#include "analysis/metrics/metrics_calculator.h"
 #include "app/debug_input_script.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -1566,41 +1567,248 @@ void VideoCompare::compare() {
 
       int shift_right_frames = display_->get_shift_right_frames();
 
-      // Auto-align: pick the right-buffer offset whose frame has the highest SSIM
-      // against the current left frame, and fold that offset into the frame-shift.
-      // The existing pure-right-frame-shift pivot path then moves the right cursor
-      // with no re-decode.
+      // Auto-align: find the right-side frame whose content best matches left's
+      // current position, using a windowed multi-probe structural match to reject
+      // motion-aliasing false positives. Folds the resulting frame delta into
+      // shift_right_frames so the standard L0/L1/L2 seek dispatch handles the
+      // actual motion. Post-seek verification (populated into
+      // pending_auto_align_verification_) reruns the score once the seek lands.
+      //
+      // Step 4 cut: candidate pool is ring-resident right frames only. A later
+      // change extends this to ±kAutoAlignSearchWindowSec via PacketRing walk.
       if (display_->get_auto_align_requested()) {
-        const AVFrame* left_current = left.ring.current_frame();
-        const FrameRing& right_ring = right_ptr->ring;
-        if (left_current != nullptr) {
-          const int min_off = -right_ring.history_size();
-          const int max_off = right_ring.prefetch_size();
-          int best_offset = 0;
-          float best_ssim = -std::numeric_limits<float>::max();
-          int evaluated = 0;
-          for (int off = min_off; off <= max_off; ++off) {
-            const AVFrame* rframe = right_ring.at(off);
-            if (rframe == nullptr) {
-              continue;
-            }
-            const float ssim = display_->compute_frame_ssim(left_current, rframe);
-            ++evaluated;
-            if (ssim > best_ssim) {
-              best_ssim = ssim;
-              best_offset = off;
-            }
-          }
-          if (evaluated == 0) {
-            display_->set_pending_message("Auto-align: no right frames available");
-          } else if (best_offset == 0) {
-            display_->set_pending_message(string_sprintf("Auto-align: already aligned (SSIM %.5f)", best_ssim));
-          } else {
-            shift_right_frames += best_offset;
-            display_->set_pending_message(string_sprintf("Auto-align: shift %+d frame%s (SSIM %.5f)", best_offset, std::abs(best_offset) == 1 ? "" : "s", best_ssim));
+        // Tunables. Kept as locals (not CLI flags) until we have field data that
+        // suggests a user would want to adjust them.
+        constexpr float kAutoAlignSearchWindowSec = 1.0f;     // ± window on the right's PTS axis
+        constexpr float kAutoAlignConfidenceFloor = 0.60f;    // below this, don't seek
+        constexpr float kAutoAlignImprovementEps = 0.005f;    // smaller = "already aligned"
+        constexpr float kAutoAlignTieBreakBand = 0.002f;      // scores within this → tie-break on |Δt|
+        constexpr int kAutoAlignProbeRadius = 2;              // probes at k ∈ {-2..+2}
+        const bool log_auto_align = env_flag_enabled("VIDEO_COMPARE_LOG_AUTO_ALIGN");
+
+        const AVFrame* const left_current = left.ring.current_frame();
+        const AVFrame* const right_current = right_ptr->ring.current_frame();
+        const int64_t left_delta_pts = left.delta_pts_;
+        const int64_t right_delta_pts = right_ptr->delta_pts_;
+
+        if (left_current == nullptr || right_current == nullptr || left_delta_pts <= 0 || right_delta_pts <= 0) {
+          display_->set_pending_message("Auto-align: no frames available");
+          if (log_auto_align) {
+            std::cerr << "[auto-align] decision=no_frames" << std::endl;
           }
         } else {
-          display_->set_pending_message("Auto-align: no left frame available");
+          // Look up (or build) the 64x64 GRAY8 SwsContext for the given source
+          // format and dimensions. Contexts are cached for the life of
+          // VideoCompare, keyed by (format, width, height).
+          const auto get_or_build_sws = [this](AVPixelFormat fmt, int w, int h) -> SwsContext* {
+            const AutoAlignSwsKey key{fmt, w, h};
+            const auto it = auto_align_sws_cache_.find(key);
+            if (it != auto_align_sws_cache_.end()) {
+              return it->second.get();
+            }
+            SwsContext* raw = sws_getContext(w, h, fmt, MetricsCalculator::kFingerprintSize, MetricsCalculator::kFingerprintSize, AV_PIX_FMT_GRAY8, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (raw == nullptr) {
+              return nullptr;
+            }
+            const auto ins = auto_align_sws_cache_.emplace(key, SwsContextUniquePtr(raw));
+            return ins.first->second.get();
+          };
+
+          // Fingerprint a ring-resident frame (post-filter + post-converter;
+          // packed RGB24/RGB48LE/similar). The swscale call reads data[0]/
+          // linesize[0] and ignores the chroma plane slots.
+          const auto fingerprint_ring_frame = [&](const AVFrame* frame, std::vector<float>& out) -> bool {
+            if (frame == nullptr || frame->width <= 0 || frame->height <= 0) {
+              return false;
+            }
+            SwsContext* const ctx = get_or_build_sws(static_cast<AVPixelFormat>(frame->format), frame->width, frame->height);
+            if (ctx == nullptr) {
+              return false;
+            }
+            MetricsCalculator::compute_structural_fingerprint(frame->data, frame->linesize, frame->height, ctx, out);
+            return !out.empty();
+          };
+
+          // Find the frame in `ring` whose PTS is closest to target_pts. Returns
+          // nullptr if no frame is within `tolerance_pts`.
+          const auto find_nearest_in_ring = [](const FrameRing& ring, int64_t target_pts, int64_t tolerance_pts) -> const AVFrame* {
+            const int min_off = -ring.history_size();
+            const int max_off = ring.prefetch_size();
+            const AVFrame* best = nullptr;
+            int64_t best_dist = std::numeric_limits<int64_t>::max();
+            for (int off = min_off; off <= max_off; ++off) {
+              const AVFrame* const f = ring.at(off);
+              if (f == nullptr) {
+                continue;
+              }
+              const int64_t dist = std::abs(f->pts - target_pts);
+              if (dist < best_dist) {
+                best_dist = dist;
+                best = f;
+              }
+            }
+            if (best == nullptr || best_dist > tolerance_pts) {
+              return nullptr;
+            }
+            return best;
+          };
+
+          // A candidate: a right-side PTS + its precomputed fingerprint. In step
+          // 4 the pool is sourced entirely from right.ring. A later change adds
+          // PacketRing-decoded entries to cover the full ±kAutoAlignSearchWindowSec.
+          struct Candidate {
+            int64_t pts;
+            std::vector<float> fp;
+          };
+
+          // --- Build the right-side candidate pool (ring-only for now) ---
+          std::vector<Candidate> candidates;
+          {
+            const FrameRing& rring = right_ptr->ring;
+            const int min_off = -rring.history_size();
+            const int max_off = rring.prefetch_size();
+            candidates.reserve(static_cast<size_t>(max_off - min_off + 1));
+            for (int off = min_off; off <= max_off; ++off) {
+              const AVFrame* const f = rring.at(off);
+              if (f == nullptr) {
+                continue;
+              }
+              Candidate c;
+              c.pts = f->pts;
+              if (!fingerprint_ring_frame(f, c.fp)) {
+                continue;
+              }
+              candidates.push_back(std::move(c));
+            }
+          }
+
+          // --- Build the left-probe fingerprint cache ---
+          // Probes sample at k · probe_step_pts around L.current on the left time
+          // axis. probe_step is the coarser of the two delta_pts values so each
+          // probe maps to a distinct frame on both sides.
+          const int64_t probe_step_pts = std::max(left_delta_pts, right_delta_pts);
+          const int64_t probe_tolerance = probe_step_pts / 2;
+          const int64_t left_current_pts = left_current->pts;
+          std::unordered_map<int64_t, std::vector<float>> left_probe_fps;
+          for (int k = -kAutoAlignProbeRadius; k <= kAutoAlignProbeRadius; ++k) {
+            const int64_t t_k = left_current_pts + static_cast<int64_t>(k) * probe_step_pts;
+            const AVFrame* const probe_frame = find_nearest_in_ring(left.ring, t_k, probe_tolerance);
+            if (probe_frame == nullptr) {
+              continue;
+            }
+            if (left_probe_fps.find(probe_frame->pts) != left_probe_fps.end()) {
+              continue;
+            }
+            std::vector<float> fp;
+            if (!fingerprint_ring_frame(probe_frame, fp)) {
+              continue;
+            }
+            left_probe_fps.emplace(probe_frame->pts, std::move(fp));
+          }
+
+          // Find the nearest candidate (by PTS) to a target on the right time
+          // axis. Returns nullptr if no candidate is within tolerance_pts.
+          const auto find_nearest_candidate = [&](int64_t target_pts, int64_t tolerance_pts) -> const Candidate* {
+            const Candidate* best = nullptr;
+            int64_t best_dist = std::numeric_limits<int64_t>::max();
+            for (const auto& c : candidates) {
+              const int64_t dist = std::abs(c.pts - target_pts);
+              if (dist < best_dist) {
+                best_dist = dist;
+                best = &c;
+              }
+            }
+            if (best == nullptr || best_dist > tolerance_pts) {
+              return nullptr;
+            }
+            return best;
+          };
+
+          // --- Score each candidate with windowed multi-probe correlation ---
+          float best_score = -std::numeric_limits<float>::max();
+          int64_t best_pts = right_current->pts;
+          float current_score = -std::numeric_limits<float>::max();
+          bool current_scored = false;
+          int valid_scored = 0;
+
+          for (const auto& cand : candidates) {
+            const int64_t delta_t_hypothesis = cand.pts - left_current_pts;
+            float sum = 0.0f;
+            int n_valid = 0;
+            for (int k = -kAutoAlignProbeRadius; k <= kAutoAlignProbeRadius; ++k) {
+              const int64_t l_target = left_current_pts + static_cast<int64_t>(k) * probe_step_pts;
+              const AVFrame* const l_probe = find_nearest_in_ring(left.ring, l_target, probe_tolerance);
+              if (l_probe == nullptr) {
+                continue;
+              }
+              const auto l_it = left_probe_fps.find(l_probe->pts);
+              if (l_it == left_probe_fps.end()) {
+                continue;
+              }
+              const int64_t r_target = l_target + delta_t_hypothesis;
+              const Candidate* const r_probe = find_nearest_candidate(r_target, probe_tolerance);
+              if (r_probe == nullptr) {
+                continue;
+              }
+              sum += MetricsCalculator::structural_correlation(l_it->second, r_probe->fp);
+              ++n_valid;
+            }
+            if (n_valid < 3) {
+              continue;  // under-supported hypothesis; disregard
+            }
+            const float score = sum / static_cast<float>(n_valid);
+            ++valid_scored;
+            if (cand.pts == right_current->pts) {
+              current_score = score;
+              current_scored = true;
+            }
+            if (log_auto_align) {
+              std::cerr << "[auto-align] pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(cand.pts - left_current_pts) / 1000.0) << " probes=" << n_valid << "/" << (2 * kAutoAlignProbeRadius + 1) << " score=" << string_sprintf("%.4f", score) << std::endl;
+            }
+            // Pick higher score; on near-ties, prefer the offset closer to the
+            // current right position (minimises seek distance when current is
+            // already near-optimal).
+            const bool strictly_better = score > best_score + kAutoAlignTieBreakBand;
+            const bool tied_and_closer = (std::abs(score - best_score) <= kAutoAlignTieBreakBand) && (std::abs(cand.pts - right_current->pts) < std::abs(best_pts - right_current->pts));
+            if (strictly_better || tied_and_closer) {
+              best_score = score;
+              best_pts = cand.pts;
+            }
+          }
+
+          // --- Decide ---
+          std::string decision_kind;
+          int shift_applied = 0;
+          if (valid_scored == 0) {
+            display_->set_pending_message("Auto-align: insufficient probes — no change");
+            decision_kind = "no_frames";
+          } else if (best_score < kAutoAlignConfidenceFloor) {
+            display_->set_pending_message(string_sprintf("Auto-align: low confidence (score %.3f) — no change", best_score));
+            decision_kind = "low_confidence";
+          } else if (best_pts == right_current->pts || (current_scored && (best_score - current_score) < kAutoAlignImprovementEps)) {
+            display_->set_pending_message(string_sprintf("Auto-align: already aligned (score %.3f)", best_score));
+            decision_kind = "already";
+          } else {
+            const int64_t shift_pts = best_pts - right_current->pts;
+            shift_applied = static_cast<int>(std::llround(static_cast<double>(shift_pts) / static_cast<double>(right_delta_pts)));
+            shift_right_frames += shift_applied;
+            // Stash everything the post-seek verification step needs. Left
+            // probes don't move during the right-only seek, so their PTS keys
+            // remain valid references into left.ring.
+            pending_auto_align_verification_ = {};
+            pending_auto_align_verification_.active = true;
+            pending_auto_align_verification_.expected_score = best_score;
+            pending_auto_align_verification_.expected_shift_frames = shift_applied;
+            pending_auto_align_verification_.left_current_pts = left_current_pts;
+            pending_auto_align_verification_.probe_step_pts = probe_step_pts;
+            pending_auto_align_verification_.delta_t_pts = best_pts - left_current_pts;
+            pending_auto_align_verification_.left_probe_fingerprints = std::move(left_probe_fps);
+            display_->set_pending_message(string_sprintf("Auto-align: shift %+d frame%s (score %.3f)", shift_applied, std::abs(shift_applied) == 1 ? "" : "s", best_score));
+            decision_kind = "seek";
+          }
+          if (log_auto_align) {
+            std::cerr << "[auto-align] candidates=" << candidates.size() << " scored=" << valid_scored << " best_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(best_pts - left_current_pts) / 1000.0) << " best_score=" << string_sprintf("%.4f", best_score) << " current_score=" << string_sprintf("%.4f", current_score) << " shift_frames=" << shift_applied << " decision=" << decision_kind << " search_window_sec=" << kAutoAlignSearchWindowSec << std::endl;
+          }
         }
       }
 
@@ -2160,51 +2368,10 @@ void VideoCompare::compare() {
             goto after_seek_block;
           }
 
-          ready_to_seek_.reset_all();
-          // Mark per-side seeking for the sides that will participate. Left workers
-          // see their own flag stay false during a pure right frame shift and keep
-          // running normally.
-          for (auto& pair : seeking_per_side_) {
-            pair.second.store(should_seek(pair.first), std::memory_order_relaxed);
-          }
-
-          // drain packet and frame queues on seeking side
-          for (auto& pair : packet_queues_) {
-            if (!should_seek(pair.first)) {
-              continue;
-            }
-            pair.second->stop();
-            pair.second->empty();
-          }
-
-          auto empty_frame_queues = [&]() {
-            for (auto& pair : decoded_frame_queues_) {
-              if (should_seek(pair.first)) {
-                pair.second->empty();
-              }
-            }
-            for (auto& pair : filtered_frame_queues_) {
-              if (should_seek(pair.first)) {
-                pair.second->empty();
-              }
-            }
-            for (auto& pair : converted_frame_queues_) {
-              if (should_seek(pair.first)) {
-                pair.second->empty();
-              }
-            }
-          };
-
-          while (!ready_to_seek_.all_are_idle_where(should_seek)) {
-            empty_frame_queues();
-            sleep_for_ms(SLEEP_PERIOD_MS);
-#ifdef _DEBUG
-            dump_debug_info(frame_number, right_ptr->effective_time_shift_, refresh_time_deque.average());
-#endif
-          }
-
-          // empty the frame queues one last time
-          empty_frame_queues();
+          // Barrier (shared with L1 re-decode and loop-mode materialize). During a
+          // pure right frame shift, should_seek returns false for LEFT, keeping the
+          // left pipeline alive.
+          enter_seek_barrier(should_seek);
 
           // consume filter changes on seeking side. Others keep their pending changes
           // so they get applied on the next full seek.

@@ -45,6 +45,7 @@ SDL_Keycode name_to_keycode(const std::string& raw) {
       case ';': return SDLK_SEMICOLON;
       case '[': return SDLK_LEFTBRACKET;
       case ']': return SDLK_RIGHTBRACKET;
+      case '`': return SDLK_GRAVE;
       case ' ': return SDLK_SPACE;
       default: break;
     }
@@ -71,6 +72,7 @@ SDL_Keycode name_to_keycode(const std::string& raw) {
   if (name == "end")                             return SDLK_END;
   if (name == "delete" || name == "del")         return SDLK_DELETE;
   if (name == "insert" || name == "ins")         return SDLK_INSERT;
+  if (name == "grave" || name == "backtick" || name == "backquote") return SDLK_GRAVE;
 
   // F1..F12.
   if (name.size() >= 2 && name[0] == 'f') {

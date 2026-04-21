@@ -46,11 +46,11 @@ The script is parsed once at startup and executed top-to-bottom in a detached th
 
 Case-insensitive. Either a single character or a named key:
 
-- **Single char**: `a`–`z`, `0`–`9`, `-`, `=`, `+`, `.`, `,`, `/`, `\`, `;`, `[`, `]`.
+- **Single char**: `a`–`z`, `0`–`9`, `-`, `=`, `+`, `.`, `,`, `/`, `\`, `;`, `[`, `]`, `` ` ``.
 - **Whitespace/control**: `space` (`spc`), `escape` (`esc`), `return` (`enter`), `tab`, `backspace` (`bsp`), `delete` (`del`), `insert` (`ins`).
 - **Navigation**: `up`, `down`, `left`, `right`, `pageup` (`pgup`), `pagedown` (`pgdn`), `home`, `end`.
 - **Function keys**: `f1` through `f12`.
-- **Named equivalents**: `minus`, `plus`/`equals`, `period`/`dot`, `comma`.
+- **Named equivalents**: `minus`, `plus`/`equals`, `period`/`dot`, `comma`, `grave`/`backtick`/`backquote`.
 
 To press `+` in video-compare (which maps `+`/`=`/`KP_PLUS` to the same "shift right by 1 frame" action), use any of `+`, `=`, `plus`, `equals`. Don't wrap the key in quotes.
 

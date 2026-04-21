@@ -1,6 +1,7 @@
 # TODO
 
 - FEATURE: Shift-click only moves the right video playhead.
+- BUG: Fix "Window exceeds display area (use -W flag to resize)" warning firing when the screen actually is big enough.
 
 ## WIP
 
