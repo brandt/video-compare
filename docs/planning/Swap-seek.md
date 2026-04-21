@@ -96,6 +96,8 @@ Option A keeps TimeShifter easier to reason about and is what I'd pick — but w
 
 Three-phase rollout following Path A (TimeShifter stays "right-relative-to-left"; sign flips happen at input translation). Each phase is independently reviewable, testable, and shippable. Total ~200-250 lines across the three phases. The order is deliberately smallest → largest so the shared abstraction is validated early.
 
+All three phases are fully scriptable end-to-end: Phase 1 via the legacy input-script harness or the socket API, Phase 2 via the socket API's mouse-button injection + modifier support, Phase 3 via the legacy harness plus socket queries for state assertion. See [input-testing.md](../design/input-testing.md) and [input-socket.md](../design/input-socket.md).
+
 ## Shared plumbing (added in Phase 1, reused by 2 and 3)
 
 One accessor on Display:
@@ -132,29 +134,55 @@ Scope: pressing `+` / `-` (or Ctrl/Alt variants) under swap shifts the offset in
 
   Or factor both cases to a local lambda.
 
-**Verification (scriptable, so headless):**
+**Verification:**
+
+Two paths, both scriptable:
+
+*Legacy-script flavor* — uses [input-testing.md](../design/input-testing.md)'s one-shot harness and greps logs:
 
 ```
 # tmp/swap_plus.txt
 sleep 3.0
 keypress space
 sleep 0.5
-# Baseline +3 frames.
-keypress = 3 0.1
+keypress = 3 0.1        # baseline: 3× +1 under no swap
 sleep 0.5
-# Swap.
-keypress s
+keypress s              # swap
 sleep 0.5
-# Under swap, + should now shift in the opposite code-direction.
-keypress = 3 0.1
+keypress = 3 0.1        # under swap: 3× should translate to -1 each
 sleep 0.5
-# Un-swap; verify that subsequent +/- behaves consistently.
-keypress s
+keypress s              # un-swap
 sleep 0.5
 quit
 ```
 
-Run with `VIDEO_COMPARE_LOG_SEEK_TIMING=1`, inspect the `shift_right_frames` values in the `[seek-timing]` lines. Expected: first burst shows `shift_right_frames=+1` per press, second burst (under swap) shows `shift_right_frames=-1` per press.
+Run with `VIDEO_COMPARE_LOG_SEEK_TIMING=1`. Expected: the first three `[seek-timing]` lines show `shift_right_frames=+1`; the next three show `shift_right_frames=-1`.
+
+*Socket flavor* — uses [input-socket.md](../design/input-socket.md) for precise state assertions:
+
+```python
+call({"cmd": "key", "action": "press", "key": "space"})
+call({"cmd": "sleep", "seconds": 0.3})
+baseline_shift = call({"cmd": "get", "field": "effective_time_shift"})["value"]
+
+# Three +'s, no swap. Expect effective_time_shift to increase by 3 × right_delta.
+for _ in range(3):
+    call({"cmd": "key", "action": "press", "key": "="})
+call({"cmd": "sleep", "seconds": 0.3})
+shift_after_plus = call({"cmd": "get", "field": "effective_time_shift"})["value"]
+assert shift_after_plus > baseline_shift
+
+# Swap, three +'s again. Under swap, sign flips at input; expect shift to DECREASE.
+call({"cmd": "key", "action": "press", "key": "s"})
+call({"cmd": "sleep", "seconds": 0.3})
+for _ in range(3):
+    call({"cmd": "key", "action": "press", "key": "="})
+call({"cmd": "sleep", "seconds": 0.3})
+shift_after_swap_plus = call({"cmd": "get", "field": "effective_time_shift"})["value"]
+assert shift_after_swap_plus < shift_after_plus
+# Net: six conceptually-forward presses cancel out if the sign flip is correct.
+assert abs(shift_after_swap_plus - baseline_shift) < 0.01
+```
 
 No pipeline regression: the L0 pivot path is unaffected; `shift_right_frames` feeds into the same dispatch it always did.
 
@@ -245,16 +273,70 @@ Scope: shift-click's right-only seek scopes to the visual-right side, regardless
 
 **Verification:**
 
-Cannot be scripted (harness has no mouse events — documented limitation in [input-testing.md](../design/input-testing.md)). Manual test matrix:
+Fully scriptable via the socket control surface ([input-socket.md](../design/input-socket.md)), which supports mouse button events with modifiers plus `get`/`status` queries for `left_pts`, `right_pts`, `effective_time_shift`, and `swap`.
 
-| Pair state          | Press                | Expected                                                          |
-| ------------------- | -------------------- | ----------------------------------------------------------------- |
-| No swap, aligned    | Shift-click at 50%   | Right (visual-right) seeks to timeline 50%. Left stays. `ok=true`.|
-| Under swap, aligned | S; Shift-click at 50%| Visual-right (= underlying LEFT) seeks. Visual-left stays.        |
-| No swap, offset +2s | Shift-click at 50%   | Right seeks to 50% absolute; offset becomes raw_right − left.pts. |
-| Under swap, offset  | S; Shift-click at 50%| LEFT seeks to 50% absolute; offset sign-flips correctly.          |
+Test driver outline (Python pseudocode):
 
-After each manual pass, press `+` a few times and visually confirm the direction — this also exercises the Phase 1 interaction.
+```python
+# Start video-compare with -t 2.0 for a known initial offset.
+# VIDEO_COMPARE_INPUT_SOCK=tmp/vc.sock ./video-compare -t 2.0 ...
+
+def call(msg): ...  # JSON-Lines round trip
+
+call({"cmd": "sleep", "seconds": 2.5})
+call({"cmd": "key", "action": "press", "key": "space"})  # pause
+call({"cmd": "sleep", "seconds": 0.3})
+
+baseline_left  = call({"cmd": "get", "field": "left_pts"})["value"]
+baseline_right = call({"cmd": "get", "field": "right_pts"})["value"]
+baseline_shift = call({"cmd": "get", "field": "effective_time_shift"})["value"]
+w = call({"cmd": "get", "field": "window_size"})["value"]["w"]
+
+# Case A — no swap, shift-click at 50%. Expect right seeks, left unchanged.
+call({"cmd": "mouse", "action": "button", "button": "left",
+      "down": True, "x": w * 0.5, "y": 30, "mods": ["shift"]})
+call({"cmd": "mouse", "action": "button", "button": "left",
+      "down": False, "x": w * 0.5, "y": 30, "mods": ["shift"]})
+call({"cmd": "sleep", "seconds": 1.5})  # seek + verification settle
+
+# Poll until SEEK badge clears, then sample.
+while call({"cmd": "get", "field": "play_state"})["value"] == "SEEK":
+    call({"cmd": "sleep", "seconds": 0.1})
+
+after_left  = call({"cmd": "get", "field": "left_pts"})["value"]
+after_right = call({"cmd": "get", "field": "right_pts"})["value"]
+assert abs(after_left - baseline_left) < 0.05, "left must not move on shift-click"
+assert abs(after_right - baseline_right) > 0.5, "right must seek meaningfully"
+
+# Case B — swap, then shift-click at 50%. Expect LEFT seeks, RIGHT unchanged.
+call({"cmd": "key", "action": "press", "key": "s"})
+call({"cmd": "sleep", "seconds": 0.3})
+assert call({"cmd": "get", "field": "swap"})["value"] is True
+
+pre_swap_left  = call({"cmd": "get", "field": "left_pts"})["value"]
+pre_swap_right = call({"cmd": "get", "field": "right_pts"})["value"]
+
+call({"cmd": "mouse", "action": "button", "button": "left",
+      "down": True, "x": w * 0.25, "y": 30, "mods": ["shift"]})
+call({"cmd": "mouse", "action": "button", "button": "left",
+      "down": False, "x": w * 0.25, "y": 30, "mods": ["shift"]})
+call({"cmd": "sleep", "seconds": 1.5})
+while call({"cmd": "get", "field": "play_state"})["value"] == "SEEK":
+    call({"cmd": "sleep", "seconds": 0.1})
+
+post_swap_left  = call({"cmd": "get", "field": "left_pts"})["value"]
+post_swap_right = call({"cmd": "get", "field": "right_pts"})["value"]
+assert abs(post_swap_right - pre_swap_right) < 0.05, "right must not move under swap shift-click"
+assert abs(post_swap_left - pre_swap_left) > 0.5, "left must seek under swap"
+
+# Sign check on effective_time_shift: the TimeShifter update should reflect
+# the new content offset. Magnitude should be consistent with the click
+# landing point.
+shift_after = call({"cmd": "get", "field": "effective_time_shift"})["value"]
+# Exact value depends on click position and video duration, so just sanity-check sign.
+```
+
+Manual spot-check afterwards: visually confirm the HUD labels swap correctly and that `+`/`-` behavior (Phase 1) is consistent — press `+` a few times, confirm the visually-right video advances regardless of swap state.
 
 ## Phase 3 — auto-align swap-aware (~100-150 lines)
 
@@ -318,7 +400,7 @@ Scope: ` , [ , ] under swap align the visual-right side to the visual-left side,
 
 - **Post-seek verification** (`pending_auto_align_verification_`): the probe-fingerprint lookups and the `right_ring_after` reference need to be follower-relative. Rename and parameterize: `follower_ring_after = side_states.at(pending_auto_align_verification_.follower_side).ring`. Store `follower_side` in the pending-verification struct.
 
-**Verification (scriptable):**
+**Verification:**
 
 Reuse the `tmp/autoalign_ts.txt` fixture from step 10 of the earlier auto-align work, layered with an initial `keypress s` to enter swap mode before the backtick press:
 
@@ -353,6 +435,8 @@ Expected log evidence:
 - `[seek-timing] tier=L2 ...` (not L0forward — because under swap, the L0 pivot isn't available to the follower=LEFT case yet).
 
 Repeat without swap (no `keypress s`) to confirm the existing result still reproduces exactly (should still land tier=L0forward with shift_right_frames=5).
+
+For richer state assertions (landed PTS precision, TimeShifter sign correctness), pair the log grep with socket-based queries ([input-socket.md](../design/input-socket.md)) on `left_pts`, `right_pts`, and `effective_time_shift` before and after the backtick press. The socket path is preferred when asserting "follower is LEFT" — `swap == true` + `right_pts` didn't move + `left_pts` did move = the scoping reached the correct side.
 
 ## Integration points across phases
 
