@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -7,6 +8,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
 #include <vector>
 #include "app/config.h"
 #include "core/core_types.h"
@@ -25,6 +28,8 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 }
+
+struct SwsContext;
 
 class ScopeWindow;
 
@@ -130,6 +135,36 @@ struct RightVideoInfo {
   VideoMetadata metadata;
 };
 
+// Custom deleter for SwsContext so it can live inside a std::unique_ptr.
+// Forward-declaration-friendly: the operator() body is defined in the .cpp
+// where sws_freeContext is available.
+struct SwsContextDeleter {
+  void operator()(SwsContext* ctx) const noexcept;
+};
+
+// Owning pointer for a cached SwsContext used by the auto-align fingerprinter.
+using SwsContextUniquePtr = std::unique_ptr<SwsContext, SwsContextDeleter>;
+
+// Key identifying a cached fingerprint SwsContext. The tuple captures the
+// source format and dimensions; the destination is always GRAY8 at
+// kFingerprintSize x kFingerprintSize, so it's not part of the key.
+using AutoAlignSwsKey = std::tuple<AVPixelFormat, int, int>;
+
+// State handed from the auto-align scoring pass to the post-seek verification
+// step. Populated when a seek is about to be dispatched; consumed (and cleared)
+// after the right ring's new current frame is in place.
+struct PendingAutoAlignVerification {
+  bool active{false};
+  float expected_score{0.0f};
+  int expected_shift_frames{0};
+  int64_t left_current_pts{0};
+  int64_t probe_step_pts{0};
+  int64_t delta_t_pts{0};
+  // Fingerprints of the participating left probe frames, keyed by the left
+  // frame's PTS. Left hasn't moved during the seek, so these stay valid.
+  std::unordered_map<int64_t, std::vector<float>> left_probe_fingerprints;
+};
+
 enum class MediaFrameCardinality { Unknown, SingleFrame, MultiFrame };
 
 struct MediaFrameDetectionState {
@@ -162,6 +197,18 @@ class VideoCompare {
 
   bool keep_running() const;
   void quit_all_queues();
+
+  // Enter the pipeline barrier for main-thread-driven per-side operations
+  // (L1 re-decode, loop-mode materialize, auto-align candidate build).
+  //
+  // For each side where should_walk returns true: sets the seeking flag, stops
+  // that side's packet queue, drains its downstream queues, and spin-waits
+  // until every processor thread for that side has parked at its ReadyToSeek
+  // flag. Once idle, the seeking flag is cleared so the main thread can drive
+  // the codec without the decode worker's flush/is_seeking race; the queues
+  // stay stopped. The corresponding restore (decoder flush, filterer reinit,
+  // demuxer reseek, queue restart) varies by caller and is done inline.
+  void enter_seek_barrier(const std::function<bool(const Side&)>& should_walk);
 
   void note_decoded_frame(const Side& side, const int64_t pts);
 
@@ -280,4 +327,12 @@ class VideoCompare {
 
   SingleDecoderMode single_decoder_mode_;
   ReadyToSeek ready_to_seek_;
+
+  // Auto-align: SwsContext cache used to downscale frames to fingerprint size.
+  // Keyed by source (format, width, height); output is always GRAY8 at
+  // MetricsCalculator::kFingerprintSize. Created lazily on first press.
+  std::map<AutoAlignSwsKey, SwsContextUniquePtr> auto_align_sws_cache_;
+
+  // Auto-align: verification state carried across the seek dispatch.
+  PendingAutoAlignVerification pending_auto_align_verification_;
 };

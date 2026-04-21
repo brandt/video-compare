@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
 }
 
 namespace MetricsCalculator {
@@ -36,5 +38,23 @@ std::string compute_psnr(const float* left_plane, const float* right_plane, int 
 // Convenience: convert two RGB frames to grayscale and compute SSIM as float.
 // Returns -max on invalid input; +max on identical frames.
 float compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame, bool is_10bpc);
+
+// ---- Structural fingerprints (used by auto-align) ----
+
+// Side length of the square fingerprint; total element count is kFingerprintSize * kFingerprintSize.
+constexpr int kFingerprintSize = 64;
+
+// Downscale src to kFingerprintSize x kFingerprintSize GRAY8 via cached_ctx, then
+// normalize to zero mean / unit stddev. src_data/src_linesize follow the AVFrame
+// convention; cached_ctx must be configured for the actual src format and dims
+// and emit AV_PIX_FMT_GRAY8 at kFingerprintSize x kFingerprintSize.
+//
+// Flat (zero-variance) sources yield an all-zeros output, which correlates to 0
+// against anything — the natural "uninformative frame" behavior.
+void compute_structural_fingerprint(const uint8_t* const src_data[4], const int src_linesize[4], int src_slice_height, SwsContext* cached_ctx, std::vector<float>& out);
+
+// Pearson correlation of two normalized fingerprints. Range [-1, +1]; returns 0
+// on size mismatch or empty inputs.
+float structural_correlation(const std::vector<float>& a, const std::vector<float>& b);
 
 }  // namespace MetricsCalculator

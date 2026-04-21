@@ -21,6 +21,16 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/time.h>
+#include <libswscale/swscale.h>
+}
+
+// Free a cached SwsContext owned by a SwsContextUniquePtr. Defined here rather
+// than in the header so the header can forward-declare SwsContext and avoid
+// pulling in libswscale.
+void SwsContextDeleter::operator()(SwsContext* ctx) const noexcept {
+  if (ctx != nullptr) {
+    sws_freeContext(ctx);
+  }
 }
 
 // Inter-stage queue depth between demuxer → decoder → filter → converter.
@@ -828,6 +838,61 @@ void VideoCompare::quit_all_queues() {
   }
 }
 
+// Shared pipeline-barrier entry for main-thread-driven per-side operations
+// (L1 re-decode, loop-mode materialize, auto-align candidate build).
+//
+// Raises the per-side seeking flag for each participating side, stops that
+// side's packet queue, drains the downstream (decoded/filtered/converted)
+// queues, and spin-waits until every processor thread for that side has parked
+// at its ReadyToSeek flag. Once idle, clears the seeking flag so the main
+// thread can drive the decoder without the decode worker's 10ms
+// flush-while-seeking race. Queues remain stopped; the caller is responsible
+// for the restore (decoder flush, filterer reinit, demuxer seek, queue
+// restart) once its synchronous work is done.
+void VideoCompare::enter_seek_barrier(const std::function<bool(const Side&)>& should_walk) {
+  ready_to_seek_.reset_all();
+  for (auto& pair : seeking_per_side_) {
+    pair.second.store(should_walk(pair.first), std::memory_order_relaxed);
+  }
+  for (auto& pair : packet_queues_) {
+    if (!should_walk(pair.first)) {
+      continue;
+    }
+    pair.second->stop();
+    pair.second->empty();
+  }
+  const auto drain_downstream = [&]() {
+    for (auto& p : decoded_frame_queues_) {
+      if (should_walk(p.first)) {
+        p.second->empty();
+      }
+    }
+    for (auto& p : filtered_frame_queues_) {
+      if (should_walk(p.first)) {
+        p.second->empty();
+      }
+    }
+    for (auto& p : converted_frame_queues_) {
+      if (should_walk(p.first)) {
+        p.second->empty();
+      }
+    }
+  };
+  while (!ready_to_seek_.all_are_idle_where(should_walk)) {
+    drain_downstream();
+    sleep_for_ms(SLEEP_PERIOD_MS);
+  }
+  drain_downstream();
+  // Clear seeking flags now that workers are parked. Leaving is_seeking true
+  // while queues stay stopped would let the decode worker race main-thread
+  // codec access via its 10ms flush loop.
+  for (auto& pair : seeking_per_side_) {
+    if (should_walk(pair.first)) {
+      pair.second.store(false, std::memory_order_relaxed);
+    }
+  }
+}
+
 void VideoCompare::note_decoded_frame(const Side& side, const int64_t pts) {
   auto& detection_state = media_frame_detection_states_.at(side);
   auto& last_pts = detection_state.last_counted_pts;
@@ -1292,26 +1357,8 @@ void VideoCompare::compare() {
             display_->set_pending_message("Loop: decoding buffered range…");
             const auto loop_t_start = std::chrono::steady_clock::now();
 
-            // --- Barrier (same pattern as L1) ---
-            const auto all_sides = [](const Side&) { return true; };
-            ready_to_seek_.reset_all();
-            for (auto& p : seeking_per_side_) p.second.store(true, std::memory_order_relaxed);
-            for (auto& p : packet_queues_) {
-              p.second->stop();
-              p.second->empty();
-            }
-            auto loop_empty_queues = [&]() {
-              for (auto& p : decoded_frame_queues_) p.second->empty();
-              for (auto& p : filtered_frame_queues_) p.second->empty();
-              for (auto& p : converted_frame_queues_) p.second->empty();
-            };
-            while (!ready_to_seek_.all_are_idle_where(all_sides)) {
-              loop_empty_queues();
-              sleep_for_ms(SLEEP_PERIOD_MS);
-            }
-            loop_empty_queues();
-            // Stop worker dec.flush race (same fix as in L1).
-            for (auto& p : seeking_per_side_) p.second.store(false, std::memory_order_relaxed);
+            // --- Barrier (shared with L1 and auto-align) ---
+            enter_seek_barrier([](const Side&) { return true; });
 
             // --- Reinit filterers (close_src was called during barrier) ---
             for (auto& p : video_filterers_) {
@@ -1822,42 +1869,8 @@ void VideoCompare::compare() {
               break;
             }
             if (log_l1_stages) std::cerr << "[l1-stage] enter" << std::endl;
-            ready_to_seek_.reset_all();
-            for (auto& pair : seeking_per_side_) {
-              pair.second.store(should_seek(pair.first), std::memory_order_relaxed);
-            }
-            for (auto& pair : packet_queues_) {
-              if (!should_seek(pair.first)) continue;
-              pair.second->stop();
-              pair.second->empty();
-            }
-            auto l1_empty_frame_queues = [&]() {
-              for (auto& p : decoded_frame_queues_)
-                if (should_seek(p.first)) p.second->empty();
-              for (auto& p : filtered_frame_queues_)
-                if (should_seek(p.first)) p.second->empty();
-              for (auto& p : converted_frame_queues_)
-                if (should_seek(p.first)) p.second->empty();
-            };
-            while (!ready_to_seek_.all_are_idle_where(should_seek)) {
-              l1_empty_frame_queues();
-              sleep_for_ms(SLEEP_PERIOD_MS);
-            }
-            l1_empty_frame_queues();
+            enter_seek_barrier(should_seek);
             if (log_l1_stages) std::cerr << "[l1-stage] barrier-idle" << std::endl;
-
-            // CRITICAL: clear seeking flags now that the barrier has idled.
-            // While is_seeking is true, the decode_video worker calls
-            // video_decoders_[side]->flush() every 10 ms in its sleep loop
-            // (app/video_compare.cpp:574). That races with the main-thread
-            // avcodec_send_packet below and crashes the decoder.
-            //
-            // Clearing the flags while all queues remain stopped keeps the
-            // workers sleeping passively (is_stopped && !is_seeking → just
-            // sleep_for_ms, no codec access).
-            for (auto& pair : seeking_per_side_) {
-              if (should_seek(pair.first)) pair.second.store(false, std::memory_order_relaxed);
-            }
 
             // Per-seeking-side: flush decoder, reinit filter graph, feed packets
             // from keyframe, capture the frame whose PTS >= target, seed
