@@ -487,7 +487,17 @@ bool Display::handle_playback_keys(const SDL_Keycode keycode, const float relati
       else                   playback_.adjust_shift_right_frames(-1);
       return true;
     case SDLK_GRAVE:
-      playback_.request_auto_align();
+      // Symmetric window around left's current position (typically served
+      // entirely from the ring; no decode).
+      playback_.request_auto_align(AutoAlignMode::Symmetric);
+      return true;
+    case SDLK_LEFTBRACKET:
+      // Biased backward: search the 1s range before left's current position.
+      playback_.request_auto_align(AutoAlignMode::Backward);
+      return true;
+    case SDLK_RIGHTBRACKET:
+      // Biased forward: search the 1s range after left's current position.
+      playback_.request_auto_align(AutoAlignMode::Forward);
       return true;
     default:
       return false;

@@ -546,6 +546,11 @@ bool Display::get_auto_align_requested() const {
   return playback_.auto_align_requested();
 }
 
+// Direction / extent of the auto-align search window the user asked for.
+AutoAlignMode Display::get_auto_align_mode() const {
+  return playback_.auto_align_mode();
+}
+
 // Public wrapper around MetricsCalculator::compute_frame_ssim for alignment consumers in video_compare.cpp.
 float Display::compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame) {
   return MetricsCalculator::compute_frame_ssim(left_frame, right_frame, requires_10_bpc());

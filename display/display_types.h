@@ -92,3 +92,9 @@ struct PendingCropRequest {
 enum class DisplayDiffMode { LegacyAbs, AbsLinear, AbsSqrt, SignedDiverging };
 enum class SelectionState { None, Started, Completed };
 enum class CropTargetSide { Undefined, Left, Right, Both };
+
+// Auto-align search direction.
+//   Symmetric — `` ` ``: search ±half-window around left's current position.
+//   Backward  — `[`:     search [−full-window, 0] relative to left's current.
+//   Forward   — `]`:     search [0, +full-window] relative to left's current.
+enum class AutoAlignMode { Symmetric, Backward, Forward };

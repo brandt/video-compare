@@ -48,7 +48,11 @@ class PlaybackController {
   void adjust_shift_right_frames(int delta) { shift_right_frames_ += delta; }
 
   bool auto_align_requested() const { return auto_align_requested_; }
-  void request_auto_align() { auto_align_requested_ = true; }
+  AutoAlignMode auto_align_mode() const { return auto_align_mode_; }
+  void request_auto_align(AutoAlignMode mode = AutoAlignMode::Symmetric) {
+    auto_align_requested_ = true;
+    auto_align_mode_ = mode;
+  }
 
   // --- Playback speed ---
   float playback_speed_factor() const { return playback_speed_factor_; }
@@ -69,6 +73,7 @@ class PlaybackController {
   int frame_navigation_delta_{0};
   int shift_right_frames_{0};
   bool auto_align_requested_{false};
+  AutoAlignMode auto_align_mode_{AutoAlignMode::Symmetric};
   bool seek_from_start_{false};
   float playback_speed_level_{0.0F};
   float playback_speed_factor_{1.0F};

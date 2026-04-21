@@ -1,6 +1,7 @@
 #include "app/video_compare.h"
 #include "analysis/metrics/metrics_calculator.h"
 #include "app/debug_input_script.h"
+#include <unordered_set>
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <chrono>
@@ -1574,17 +1575,39 @@ void VideoCompare::compare() {
       // actual motion. Post-seek verification (populated into
       // pending_auto_align_verification_) reruns the score once the seek lands.
       //
-      // Step 4 cut: candidate pool is ring-resident right frames only. A later
-      // change extends this to ±kAutoAlignSearchWindowSec via PacketRing walk.
+      // Window extents vary by mode:
+      //   Symmetric (` key): ±kAutoAlignSymmetricHalfSec around left.current.
+      //   Backward  ([ key): [-kAutoAlignDirectionalSec, 0] relative to left.current.
+      //   Forward   (] key): [0, +kAutoAlignDirectionalSec] relative to left.current.
+      // If the right ring already spans the window (typical for Symmetric), the
+      // search runs entirely on ring-resident frames with no decode cost. When
+      // the window exceeds the ring (typical for Backward/Forward), a barriered
+      // PacketRing walk decodes the uncovered portion inline and discards the
+      // frames after fingerprinting — the FrameRing is untouched.
       if (display_->get_auto_align_requested()) {
-        // Tunables. Kept as locals (not CLI flags) until we have field data that
-        // suggests a user would want to adjust them.
-        constexpr float kAutoAlignSearchWindowSec = 1.0f;     // ± window on the right's PTS axis
+        // Tunables. Kept as locals (not CLI flags) until field data says otherwise.
+        constexpr float kAutoAlignSymmetricHalfSec = 0.5f;    // ± half-window for SDLK_GRAVE
+        constexpr float kAutoAlignDirectionalSec = 1.0f;      // full one-sided window for SDLK_LEFTBRACKET/SDLK_RIGHTBRACKET
         constexpr float kAutoAlignConfidenceFloor = 0.60f;    // below this, don't seek
         constexpr float kAutoAlignImprovementEps = 0.005f;    // smaller = "already aligned"
         constexpr float kAutoAlignTieBreakBand = 0.002f;      // scores within this → tie-break on |Δt|
         constexpr int kAutoAlignProbeRadius = 2;              // probes at k ∈ {-2..+2}
         const bool log_auto_align = env_flag_enabled("VIDEO_COMPARE_LOG_AUTO_ALIGN");
+
+        // Resolve the mode into signed window endpoints relative to left.current.pts.
+        const AutoAlignMode auto_align_mode = display_->get_auto_align_mode();
+        float window_start_rel_sec = -kAutoAlignSymmetricHalfSec;
+        float window_end_rel_sec = kAutoAlignSymmetricHalfSec;
+        const char* mode_label = "sym";
+        if (auto_align_mode == AutoAlignMode::Backward) {
+          window_start_rel_sec = -kAutoAlignDirectionalSec;
+          window_end_rel_sec = 0.0f;
+          mode_label = "back";
+        } else if (auto_align_mode == AutoAlignMode::Forward) {
+          window_start_rel_sec = 0.0f;
+          window_end_rel_sec = kAutoAlignDirectionalSec;
+          mode_label = "fwd";
+        }
 
         const AVFrame* const left_current = left.ring.current_frame();
         const AVFrame* const right_current = right_ptr->ring.current_frame();
@@ -1682,13 +1705,238 @@ void VideoCompare::compare() {
             }
           }
 
+          // Current left-axis PTS used throughout the rest of this block. The
+          // window endpoints below are on right's axis; mapped by adding the
+          // mode-resolved relative window to the left-axis origin.
+          const int64_t left_current_pts = left_current->pts;
+          const int64_t window_start_pts = left_current_pts + static_cast<int64_t>(static_cast<double>(window_start_rel_sec) * AV_TIME_BASE);
+          const int64_t window_end_pts = left_current_pts + static_cast<int64_t>(static_cast<double>(window_end_rel_sec) * AV_TIME_BASE);
+
+          // Figure out how much of the requested window the FrameRing already
+          // covers. If we have at least one frame at-or-before window_start_pts
+          // AND one at-or-after window_end_pts, the ring spans the window —
+          // skip the barriered PacketRing walk entirely (typical Symmetric press).
+          int64_t ring_min_pts = std::numeric_limits<int64_t>::max();
+          int64_t ring_max_pts = std::numeric_limits<int64_t>::min();
+          std::unordered_set<int64_t> ring_candidate_pts;
+          ring_candidate_pts.reserve(candidates.size());
+          for (const auto& c : candidates) {
+            ring_min_pts = std::min(ring_min_pts, c.pts);
+            ring_max_pts = std::max(ring_max_pts, c.pts);
+            ring_candidate_pts.insert(c.pts);
+          }
+          const bool ring_covers_window = !candidates.empty() && ring_min_pts <= window_start_pts && ring_max_pts >= window_end_pts;
+
+          // --- PacketRing walk (only when ring coverage is insufficient) ---
+          // Mirrors the L1 re-decode pattern: barrier the right pipeline,
+          // flush the decoder, walk PacketRing packets from the keyframe ≤
+          // window_start forward, and fingerprint each decoded frame whose PTS
+          // lands inside the window. Frames already present in the ring are
+          // skipped (same PTS → already fingerprinted).
+          int decoded_added = 0;
+          int decode_ms = 0;
+          bool walk_attempted = false;
+          const char* walk_skip_reason = nullptr;
+          if (!ring_covers_window) {
+            walk_attempted = true;
+            const Side right_side = right_ptr->side_;
+            const auto right_only_pred = [right_side](const Side& s) { return s == right_side; };
+
+            auto packet_ring_it = packet_rings_.find(right_side);
+            auto demuxer_it = demuxers_.find(right_side);
+            if (packet_ring_it == packet_rings_.end() || !packet_ring_it->second || demuxer_it == demuxers_.end() || !demuxer_it->second) {
+              walk_skip_reason = "no-packet-ring";
+            } else if (packet_ring_it->second->l1_disabled()) {
+              walk_skip_reason = "l1-disabled";
+            } else if (single_decoder_mode_.enabled()) {
+              walk_skip_reason = "single-decoder";
+            } else if (media_frame_detection_states_.at(right_side).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame) {
+              walk_skip_reason = "single-frame-media";
+            } else {
+              PacketRing& packet_ring = *packet_ring_it->second;
+              Demuxer& demuxer = *demuxer_it->second;
+              const AVRational stream_tb = demuxer.time_base();
+              const int64_t demuxer_start_us = demuxer.start_time();
+              // Back up a little before window_start to give the decoder room
+              // to produce clean output by the time we cross into the window.
+              // (Decoders can emit garbage for the first fraction of a GOP.)
+              constexpr int64_t kDecoderWarmupUs = 500000;  // 0.5 s
+              const int64_t lookup_start_us = std::max<int64_t>(window_start_pts + demuxer_start_us - kDecoderWarmupUs, int64_t{0});
+              const int64_t lookup_start_raw = av_rescale_q(lookup_start_us, AV_TIME_BASE_Q, stream_tb);
+              auto kf_hit = packet_ring.keyframe_at_or_before(lookup_start_raw);
+              if (!kf_hit.has_value()) {
+                walk_skip_reason = "no-keyframe-hit";
+              } else {
+                const auto walk_t_start = std::chrono::steady_clock::now();
+                VideoDecoder& dec = *video_decoders_.at(right_side);
+
+                // Enter barrier scoped to the right side; left pipeline keeps running.
+                enter_seek_barrier(right_only_pred);
+
+                try {
+                  // Rebuild the filter graph so the post-walk pipeline restart
+                  // can feed it again. The worker called close_src() during
+                  // the barrier.
+                  video_filterers_.at(right_side)->reinit();
+
+                  dec.flush();
+                  dec.reset_pts_state();
+
+                  // Pump one decoded raw frame: HW-transfer if needed,
+                  // convert pts to AV_TIME_BASE μs, fingerprint if inside the
+                  // window and not already ring-resident. Return true to stop
+                  // (past window_end), false to keep going.
+                  const auto handle_decoded = [&](AVFrame* raw) -> bool {
+                    AVFrameUniquePtr sw_frame{nullptr, avframe_deleter};
+                    AVFrame* usable = raw;
+                    if (raw->format == dec.hw_pixel_format()) {
+                      sw_frame = AVFrameUniquePtr{av_frame_alloc(), avframe_deleter};
+                      if (sw_frame == nullptr) {
+                        return false;
+                      }
+                      if (av_hwframe_transfer_data(sw_frame.get(), raw, 0) < 0) {
+                        return false;
+                      }
+                      if (av_frame_copy_props(sw_frame.get(), raw) < 0) {
+                        return false;
+                      }
+                      usable = sw_frame.get();
+                    }
+                    // raw->pts is in stream time_base. Convert to AV_TIME_BASE
+                    // μs since demuxer start_time (the same unit ring frames use).
+                    const int64_t frame_pts_us = av_rescale_q(usable->pts, stream_tb, AV_TIME_BASE_Q) - demuxer_start_us;
+                    if (frame_pts_us > window_end_pts) {
+                      return true;  // past window end; stop
+                    }
+                    if (frame_pts_us < window_start_pts) {
+                      return false;  // before window; keep decoding forward
+                    }
+                    if (ring_candidate_pts.count(frame_pts_us) > 0) {
+                      return false;  // already fingerprinted from the ring
+                    }
+                    Candidate c;
+                    c.pts = frame_pts_us;
+                    SwsContext* const ctx = get_or_build_sws(static_cast<AVPixelFormat>(usable->format), usable->width, usable->height);
+                    if (ctx == nullptr) {
+                      return false;
+                    }
+                    // swscale reads Y from the YUV source and outputs GRAY8.
+                    // For packed formats (rare post-decode) it also works.
+                    MetricsCalculator::compute_structural_fingerprint(usable->data, usable->linesize, usable->height, ctx, c.fp);
+                    if (c.fp.empty()) {
+                      return false;
+                    }
+                    candidates.push_back(std::move(c));
+                    ++decoded_added;
+                    return false;
+                  };
+
+                  // Feed packets from keyframe forward, pumping receive() until EAGAIN.
+                  bool stop = false;
+                  kf_hit->range->iterate_from(kf_hit->absolute_buffer_index, [&](const AVPacket* src_pkt) -> bool {
+                    if (stop) {
+                      return false;
+                    }
+                    AVPacket* cloned = av_packet_clone(src_pkt);
+                    if (cloned == nullptr) {
+                      return false;
+                    }
+                    dec.send(cloned);
+                    av_packet_free(&cloned);
+                    while (!stop) {
+                      AVFrame* raw = av_frame_alloc();
+                      if (raw == nullptr) {
+                        return false;
+                      }
+                      if (!dec.receive(raw, &demuxer)) {
+                        av_frame_free(&raw);
+                        break;
+                      }
+                      if (handle_decoded(raw)) {
+                        stop = true;
+                      }
+                      av_frame_free(&raw);
+                    }
+                    return !stop;
+                  });
+
+                  // Drain decoder's B-frame-reorder buffer.
+                  if (!stop) {
+                    dec.send(nullptr);
+                    while (!stop) {
+                      AVFrame* raw = av_frame_alloc();
+                      if (raw == nullptr) {
+                        break;
+                      }
+                      if (!dec.receive(raw, &demuxer)) {
+                        av_frame_free(&raw);
+                        break;
+                      }
+                      if (handle_decoded(raw)) {
+                        stop = true;
+                      }
+                      av_frame_free(&raw);
+                    }
+                  }
+                } catch (const std::exception& ex) {
+                  walk_skip_reason = "walk-exception";
+                  std::cerr << "[auto-align-walk-exception] " << ex.what() << std::endl;
+                } catch (...) {
+                  walk_skip_reason = "walk-exception";
+                  std::cerr << "[auto-align-walk-exception] unknown" << std::endl;
+                }
+
+                // Post-walk restore: flush decoder state, forward-seek demuxer
+                // back to right.current.pts + 0.001, restart queues so the
+                // workers resume normal operation.
+                dec.flush();
+                dec.reset_pts_state();
+                const float right_start_sec = static_cast<float>(demuxer_start_us) * static_cast<float>(AV_TIME_TO_SEC);
+                const float resume_sec = static_cast<float>(right_current->pts) * static_cast<float>(AV_TIME_TO_SEC) + right_start_sec + 0.001f;
+                const bool fwd_ok = demuxer.seek(resume_sec, false);
+                if (!fwd_ok) {
+                  demuxer.seek(resume_sec, true);
+                }
+                for (auto& p : packet_queues_) {
+                  if (right_only_pred(p.first)) {
+                    p.second->restart();
+                  }
+                }
+                for (auto& p : decoded_frame_queues_) {
+                  if (right_only_pred(p.first)) {
+                    p.second->restart();
+                  }
+                }
+                for (auto& p : filtered_frame_queues_) {
+                  if (right_only_pred(p.first)) {
+                    p.second->restart();
+                  }
+                }
+                for (auto& p : converted_frame_queues_) {
+                  if (right_only_pred(p.first)) {
+                    p.second->restart();
+                  }
+                }
+                // Merge newly-decoded candidates into the dedup set so later
+                // scoring's nearest-candidate lookup uses the combined pool.
+                for (const auto& c : candidates) {
+                  ring_candidate_pts.insert(c.pts);
+                }
+
+                decode_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - walk_t_start).count());
+              }
+            }
+            if (log_auto_align && walk_skip_reason != nullptr) {
+              std::cerr << "[auto-align-walk-skip] reason=" << walk_skip_reason << std::endl;
+            }
+          }
+
           // --- Build the left-probe fingerprint cache ---
           // Probes sample at k · probe_step_pts around L.current on the left time
           // axis. probe_step is the coarser of the two delta_pts values so each
           // probe maps to a distinct frame on both sides.
           const int64_t probe_step_pts = std::max(left_delta_pts, right_delta_pts);
           const int64_t probe_tolerance = probe_step_pts / 2;
-          const int64_t left_current_pts = left_current->pts;
           std::unordered_map<int64_t, std::vector<float>> left_probe_fps;
           for (int k = -kAutoAlignProbeRadius; k <= kAutoAlignProbeRadius; ++k) {
             const int64_t t_k = left_current_pts + static_cast<int64_t>(k) * probe_step_pts;
@@ -1807,7 +2055,7 @@ void VideoCompare::compare() {
             decision_kind = "seek";
           }
           if (log_auto_align) {
-            std::cerr << "[auto-align] candidates=" << candidates.size() << " scored=" << valid_scored << " best_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(best_pts - left_current_pts) / 1000.0) << " best_score=" << string_sprintf("%.4f", best_score) << " current_score=" << string_sprintf("%.4f", current_score) << " shift_frames=" << shift_applied << " decision=" << decision_kind << " search_window_sec=" << kAutoAlignSearchWindowSec << std::endl;
+            std::cerr << "[auto-align] mode=" << mode_label << " ring=" << ring_candidate_pts.size() << " decoded=" << decoded_added << " decode_ms=" << decode_ms << " walk=" << (walk_attempted ? (walk_skip_reason ? "skipped" : "done") : "none") << " candidates=" << candidates.size() << " scored=" << valid_scored << " best_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(best_pts - left_current_pts) / 1000.0) << " best_score=" << string_sprintf("%.4f", best_score) << " current_score=" << string_sprintf("%.4f", current_score) << " shift_frames=" << shift_applied << " decision=" << decision_kind << " window=[" << string_sprintf("%.3f", static_cast<double>(window_start_rel_sec)) << "," << string_sprintf("%.3f", static_cast<double>(window_end_rel_sec)) << "]s" << std::endl;
           }
         }
       }
