@@ -554,6 +554,20 @@ bool Display::get_swap_left_right() const {
   return swap_left_right_;
 }
 
+/**
+ * Underlying pipeline side that maps to the user's "right video" intent.
+ *
+ * The follower side is the one whose offset gets adjusted by `+`/`-`,
+ * shift-click, and the auto-align keys. Normally that's the underlying
+ * RIGHT pipeline; when swap is active the visually-right side is
+ * underlying LEFT, so the follower flips accordingly. Used by every
+ * swap-aware input path; defined here so the translation lives in one
+ * place.
+ */
+Side Display::follower_side_for_input() const {
+  return swap_left_right_ ? LEFT : RIGHT;
+}
+
 // Pending relative-seek offset (seconds), consumed by the main loop.
 float Display::get_seek_relative() const {
   return playback_.seek_relative();

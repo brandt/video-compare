@@ -483,15 +483,18 @@ bool Display::handle_playback_keys(const SDL_Keycode keycode, const float relati
       playback_.set_tick_playback(true);
       return true;
     case SDLK_PLUS: case SDLK_KP_PLUS: case SDLK_EQUALS:
-      if (is_alt_down)       playback_.adjust_shift_right_frames(100);
-      else if (is_ctrl_down) playback_.adjust_shift_right_frames(10);
-      else                   playback_.adjust_shift_right_frames(1);
+    case SDLK_MINUS: case SDLK_KP_MINUS: {
+      // TimeShifter stores the offset as "right-relative-to-left". Pressing
+      // `+` always means "advance the visually-right video"; under swap that
+      // video is the underlying LEFT pipeline, so we flip the sign of the
+      // adjustment. The pipeline stays asymmetric; only the input gets
+      // reinterpreted. See docs/planning/Swap-seek.md, Phase 1.
+      const int direction = (keycode == SDLK_MINUS || keycode == SDLK_KP_MINUS) ? -1 : 1;
+      const int magnitude = is_alt_down ? 100 : (is_ctrl_down ? 10 : 1);
+      const int swap_sign = swap_left_right_ ? -1 : 1;
+      playback_.adjust_shift_right_frames(direction * magnitude * swap_sign);
       return true;
-    case SDLK_MINUS: case SDLK_KP_MINUS:
-      if (is_alt_down)       playback_.adjust_shift_right_frames(-100);
-      else if (is_ctrl_down) playback_.adjust_shift_right_frames(-10);
-      else                   playback_.adjust_shift_right_frames(-1);
-      return true;
+    }
     case SDLK_GRAVE:
       // Symmetric window around left's current position (typically served
       // entirely from the ring; no decode).

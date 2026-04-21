@@ -460,6 +460,21 @@ class Display {
   void toggle_buffer_play_direction();
   bool get_fast_input_alignment() const;
   bool get_swap_left_right() const;
+
+  /**
+   * Resolve the underlying pipeline Side that the user conceptually means
+   * when they press a "right video" input (`+`/`-`, shift-click on the
+   * timeline, auto-align keys).
+   *
+   * When `swap_left_right_` is false the follower is the underlying RIGHT
+   * pipeline; when swap is active the follower is the underlying LEFT
+   * pipeline (because LEFT is what's being rendered on the visual right
+   * half of the window).
+   *
+   * This is the one abstraction shared by every swap-aware input path. See
+   * docs/planning/Swap-seek.md for the design rationale.
+   */
+  Side follower_side_for_input() const;
   float get_seek_relative() const;
   bool get_seek_from_start() const;
   int get_frame_buffer_offset_delta() const;
