@@ -18,11 +18,11 @@ All line numbers referenced in this doc are anchors into the current tree, not s
 
 ## 1. Keybindings and modes
 
-| Key | `AutoAlignMode` | Window (relative to left's current PTS)  | Typical cost     |
-| --- | --------------- | ---------------------------------------- | ---------------- |
-| `` ` ``  | `Symmetric`     | `[-0.5 s, +0.5 s]`                       | Ring-only, no decode (microseconds) |
-| `[`      | `Backward`      | `[-1.0 s,  0.0 s]`                       | Ring + ~15 decoded frames at 30 fps |
-| `]`      | `Forward`       | `[ 0.0 s, +1.0 s]`                       | Ring + ~15 decoded frames at 30 fps |
+| Key     | `AutoAlignMode` | Window (relative to left's current PTS)  | Typical cost
+| ------- | --------------- | ---------------------------------------- | -------------
+| `` ` `` | `Symmetric`     | `[-0.5 s, +0.5 s]`                       | Ring-only, no decode (microseconds)
+| `[`     | `Backward`      | `[-1.0 s,  0.0 s]`                       | Ring + ~15 decoded frames at 30 fps
+| `]`     | `Forward`       | `[ 0.0 s, +1.0 s]`                       | Ring + ~15 decoded frames at 30 fps
 
 The Symmetric window sits entirely inside the default 15/15 FrameRing on typical framerates — a `` ` `` press usually runs with zero decode cost. The directional `[` / `]` windows extend past the ring on one side; the uncovered half is decoded inline via a barriered PacketRing walk (§4 below).
 
@@ -118,12 +118,12 @@ Left probe fingerprints are stored in an `std::unordered_map<int64_t, std::vecto
 
 After scoring, the loop has `best_score`, `best_pts`, `current_score` (the score at `cand_pts == right_current.pts` if that candidate was present), and `valid_scored`. Four decisions, in order:
 
-| Condition                                                             | Decision          | User message                                             |
-| --------------------------------------------------------------------- | ----------------- | -------------------------------------------------------- |
-| `valid_scored == 0`                                                   | `no_frames`       | "Auto-align: insufficient probes — no change"            |
-| `best_score < 0.60` (`kAutoAlignConfidenceFloor`)                     | `low_confidence`  | "Auto-align: low confidence (score …) — no change"       |
-| `best_pts == right_current.pts` or `best - current < 0.005`           | `already`         | "Auto-align: already aligned (score …)"                  |
-| else                                                                  | `seek`            | "Auto-align: shift +N frame(s) (score …)"                |
+| Condition                                                   | Decision          | User message
+| ----------------------------------------------------------- | ----------------- | -------------
+| `valid_scored == 0`                                         | `no_frames`       | "Auto-align: insufficient probes — no change"
+| `best_score < 0.60` (`kAutoAlignConfidenceFloor`)           | `low_confidence`  | "Auto-align: low confidence (score …) — no change"
+| `best_pts == right_current.pts` or `best - current < 0.005` | `already`         | "Auto-align: already aligned (score …)"
+| *else*                                                      | `seek`            | "Auto-align: shift +N frame(s) (score …)"
 
 On `seek`, the code computes `shift_right_frames += round((best_pts - right_current.pts) / right.delta_pts)` and populates `pending_auto_align_verification_` with everything needed to rescore post-seek:
 

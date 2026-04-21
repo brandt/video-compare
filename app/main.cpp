@@ -813,7 +813,13 @@ int main(int argc, char** argv) {
           config.time_shift = time_shift_config;
 
           const double multiplier_value = av_q2d(time_shift_config.multiplier);
-          std::cout << string_sprintf("Timeshift config: multiplier=%d/%d (x%.6f), offset=%ld ms", time_shift_config.multiplier.num, time_shift_config.multiplier.den, multiplier_value, time_shift_config.offset_ms) << std::endl;
+          std::cout << string_sprintf(
+                         "Timeshift config: multiplier=%d/%d (x%.6f), offset=%ld ms",
+                         time_shift_config.multiplier.num,
+                         time_shift_config.multiplier.den,
+                         multiplier_value,
+                         time_shift_config.offset_ms)
+                    << std::endl;
         } catch (const std::logic_error& e) {
           throw std::logic_error{"Cannot parse time shift argument: " + std::string(e.what())};
         }

@@ -224,11 +224,11 @@ const bool drain_to_target = !pure_right_frame_shift && !display_->get_play();
 
 Three cases:
 
-| Seek source | `pure_right_frame_shift` | `display_->get_play()` | Drain? | Why |
-|---|---|---|---|---|
-| Paused timeline click / arrow / Shift+A/D | false | false | **yes** | User sees the next paused frame; it must be the clicked frame, not a keyframe hundreds of ms earlier. |
-| Playing timeline click / arrow | false | true | no | The main-loop "behind schedule, advance fast" mechanism (§4.1) picks up the keyframe and rapidly advances through intermediate frames at decode-bound rate. Draining would block the UI for a whole GOP with stale overlay values visible. |
-| `+` / `-` fall-through to full seek | true | either | no | `+`/`-` keys are held down; blocking each press on a GOP-duration drain is unacceptable. Landing imprecision here matches the pre-drain behavior users already tolerate. |
+| Seek source                               | `pure_right_frame_shift` | `display_->get_play()` | Drain?  | Why
+| ----------------------------------------- | ------------------------ | ---------------------- | ------- | ---
+| Paused timeline click / arrow / Shift+A/D | false                    | false                  | **yes** | User sees the next paused frame; it must be the clicked frame, not a keyframe hundreds of ms earlier.
+| Playing timeline click / arrow            | false                    | true                   | no      | The main-loop "behind schedule, advance fast" mechanism (§4.1) picks up the keyframe and rapidly advances through intermediate frames at decode-bound rate. Draining would block the UI for a whole GOP with stale overlay values visible.
+| `+` / `-` fall-through to full seek       | true                     | either                 | no      | `+`/`-` keys are held down; blocking each press on a GOP-duration drain is unacceptable. Landing imprecision here matches the pre-drain behavior users already tolerate.
 
 `skip_update = true` on the way out of the seek branch (`:1653`) so this iteration does not also try to advance the ring beyond the freshly-set current frame.
 
@@ -298,8 +298,8 @@ Larger `frame_buffer_size_` means:
 
 Rough memory profile on a 4K HDR + 720p SDR comparison, `--packet-buffer-size 256M`:
 
-| defaults                | peak RSS |
-| ----------------------- | -------- |
+| defaults                | peak RSS  |
+| ----------------------- | --------- |
 | Phase 3 (`-f 12`, Q=3)  | ≈1.95 GiB |
 | Legacy (`-f 50`, Q=5)   | ≈4.7 GiB  |
 
@@ -417,7 +417,6 @@ Diagnostic: `VIDEO_COMPARE_LOG_SEEK_TIMING=1` logs `tier=<L0back|L0forward|L1|L1
 | Right-shift ±N (out of FrameRing)  | +/-             | L1 if kf ≤ 0.5 s, else L2    | L2: yes  | yes
 | Clear crop                         | Backspace       | L2 (filter rebuild)          | yes      | yes
 | Auto-align (ring covers window)    | `` ` ``         | run_auto_align → L0 pivot    | —        | —
-| Auto-align (walk needed)           | `[`, `]`        | run_auto_align + barriered PacketRing walk → L0/L1/L2 | right side only | yes (decode only, no filter/convert) |
+| Auto-align (walk needed)           | `[`, `]`        | run_auto_align + barriered PacketRing walk → L0/L1/L2 | right side only | yes (decode only, no filter/convert)
 
 For the auto-align algorithm and the barriered PacketRing walk it runs, see [auto-align.md](auto-align.md).
-

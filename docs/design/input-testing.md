@@ -24,19 +24,19 @@ Set `VIDEO_COMPARE_INPUT_SCRIPT_LOG=1` to echo each command as it fires, with an
 
 One command per line. Whitespace-separated tokens. Blank lines and comment lines (`#…`, `//…`, or `;…`) are ignored.
 
-| Command | Args | Behavior |
-|---|---|---|
-| `sleep` | `<seconds>` | Float seconds. E.g. `sleep 0.25`, `sleep 5`. |
-| `keypress` | `<key>` | Push `KEY_DOWN` then `KEY_UP` with a 5 ms gap. |
-| `keypress` | `<key> <count> [interval]` | Press `<count>` times; sleep `<interval>` s between presses (default 0.03 s). |
-| `hold` | `<key> <seconds>` | `KEY_DOWN`, sleep, `KEY_UP`. Use when repeat-key behavior matters. |
-| `keydown` | `<key>` | Push `KEY_DOWN` only. Caller must match with `keyup`. |
-| `keyup` | `<key>` | Push `KEY_UP` only. |
-| `modshift` | `on|off` | Set/clear the Shift modifier flag for subsequent key events. |
-| `modctrl` | `on|off` | Set/clear the Ctrl modifier. |
-| `modalt` | `on|off` | Set/clear the Alt modifier. |
-| `quit` | | Push `SDL_EVENT_QUIT` so the main loop exits cleanly. |
-| `log` | `<message>` | Print the remainder of the line to stderr as `[input-script] <message>`. |
+| Command   | Args                         | Behavior
+| --------- | ---------------------------- | -------------------------------------------------------------------------
+| `sleep`   | `<seconds>`                  | Float seconds. E.g. `sleep 0.25`, `sleep 5`.
+| `keypress`| `<key>`                      | Push `KEY_DOWN` then `KEY_UP` with a 5 ms gap.
+| `keypress`| `<key> <count> [interval]`   | Press `<count>` times; sleep `<interval>` s between presses (default 0.03 s).
+| `hold`    | `<key> <seconds>`            | `KEY_DOWN`, sleep, `KEY_UP`. Use when repeat-key behavior matters.
+| `keydown` | `<key>`                      | Push `KEY_DOWN` only. Caller must match with `keyup`.
+| `keyup`   | `<key>`                      | Push `KEY_UP` only.
+| `modshift`| `on|off`                     | Set/clear the Shift modifier flag for subsequent key events.
+| `modctrl` | `on|off`                     | Set/clear the Ctrl modifier.
+| `modalt`  | `on|off`                     | Set/clear the Alt modifier.
+| `quit`    |                              | Push `SDL_EVENT_QUIT` so the main loop exits cleanly.
+| `log`     | `<message>`                  | Print the remainder of the line to stderr as `[input-script] <message>`.
 
 The script is parsed once at startup and executed top-to-bottom in a detached thread. There's no branching, looping, or conditionals — if you need logic, generate the script from a higher-level tool.
 

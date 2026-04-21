@@ -1042,26 +1042,43 @@ void VideoCompare::dump_debug_info(const int frame_number, const int64_t effecti
   std::cout << "average_refresh_time=" << average_refresh_time << std::endl;
   std::cout << "active_right_index=" << active_right_index_ << std::endl;
 
+  const auto dump_queue = [](const std::string& side_name, const char* label, const auto& q) {
+    std::cout << side_name << " " << label << ":"
+              << " size=" << q->size()
+              << ", is_stopped=" << q->is_stopped()
+              << ", quit=" << q->is_quit()
+              << std::endl;
+  };
   for (const auto& pair : packet_queues_) {
-    std::cout << pair.first.to_string() << " packet demuxer: size=" << pair.second->size() << ", is_stopped=" << pair.second->is_stopped() << ", quit=" << pair.second->is_quit() << std::endl;
+    dump_queue(pair.first.to_string(), "packet demuxer", pair.second);
   }
   for (const auto& pair : packet_rings_) {
     const auto s = pair.second->stats();
-    std::cout << pair.first.to_string() << " packet ring: bytes=" << s.bytes_used << "/" << s.byte_budget << ", packets=" << s.packet_count << ", ranges=" << s.range_count << ", keyframes=" << s.keyframe_count << ", pts=[" << s.pts_min << "," << s.pts_max << "]"
-              << (s.l1_disabled ? " [L1-disabled]" : "") << std::endl;
+    std::cout << pair.first.to_string() << " packet ring:"
+              << " bytes=" << s.bytes_used << "/" << s.byte_budget
+              << ", packets=" << s.packet_count
+              << ", ranges=" << s.range_count
+              << ", keyframes=" << s.keyframe_count
+              << ", pts=[" << s.pts_min << "," << s.pts_max << "]"
+              << (s.l1_disabled ? " [L1-disabled]" : "")
+              << std::endl;
   }
   for (const auto& pair : decoded_frame_queues_) {
-    std::cout << pair.first.to_string() << " decoder: size=" << pair.second->size() << ", is_stopped=" << pair.second->is_stopped() << ", quit=" << pair.second->is_quit() << std::endl;
+    dump_queue(pair.first.to_string(), "decoder", pair.second);
   }
   for (const auto& pair : filtered_frame_queues_) {
-    std::cout << pair.first.to_string() << " filterer: size=" << pair.second->size() << ", is_stopped=" << pair.second->is_stopped() << ", quit=" << pair.second->is_quit() << std::endl;
+    dump_queue(pair.first.to_string(), "filterer", pair.second);
   }
   for (const auto& pair : converted_frame_queues_) {
-    std::cout << pair.first.to_string() << " format converter: size=" << pair.second->size() << ", is_stopped=" << pair.second->is_stopped() << ", quit=" << pair.second->is_quit() << std::endl;
+    dump_queue(pair.first.to_string(), "format converter", pair.second);
   }
   for (const auto& pair : media_frame_detection_states_) {
     const MediaFrameCardinality cardinality = pair.second.cardinality.load(std::memory_order_relaxed);
-    std::cout << pair.first.to_string() << " media frame cardinality: " << (cardinality == MediaFrameCardinality::Unknown ? "Unknown" : (cardinality == MediaFrameCardinality::SingleFrame ? "SingleFrame" : "MultiFrame")) << std::endl;
+    const char* cardinality_name =
+        (cardinality == MediaFrameCardinality::Unknown) ? "Unknown"
+        : (cardinality == MediaFrameCardinality::SingleFrame) ? "SingleFrame"
+        : "MultiFrame";
+    std::cout << pair.first.to_string() << " media frame cardinality: " << cardinality_name << std::endl;
   }
 
   std::cout << "all_are_idle()=" << ready_to_seek_.all_are_idle() << std::endl;
@@ -1203,8 +1220,11 @@ void VideoCompare::compare() {
         }
 
         if (log_event_routing) {
-          std::cerr << "[event] type=" << SDLEventInfo::type_name(event.type) << " (" << event.type << ")"
-                    << " windowID=" << wid << " -> " << (consumed_by_scope ? "scope" : "display") << std::endl;
+          std::cerr << "[event]"
+                    << " type=" << SDLEventInfo::type_name(event.type) << " (" << event.type << ")"
+                    << " windowID=" << wid
+                    << " -> " << (consumed_by_scope ? "scope" : "display")
+                    << std::endl;
         }
       }
 
@@ -1327,8 +1347,14 @@ void VideoCompare::compare() {
       if (show_packet_ring && (frame_number % 60) == 0) {
         for (const auto& pair : packet_rings_) {
           const auto s = pair.second->stats();
-          std::cerr << "[packet-ring " << pair.first.to_string() << "] bytes=" << s.bytes_used << "/" << s.byte_budget << " packets=" << s.packet_count << " ranges=" << s.range_count << " keyframes=" << s.keyframe_count << " pts=[" << s.pts_min << "," << s.pts_max << "]"
-                    << (s.l1_disabled ? " L1-DISABLED" : "") << std::endl;
+          std::cerr << "[packet-ring " << pair.first.to_string() << "]"
+                    << " bytes=" << s.bytes_used << "/" << s.byte_budget
+                    << " packets=" << s.packet_count
+                    << " ranges=" << s.range_count
+                    << " keyframes=" << s.keyframe_count
+                    << " pts=[" << s.pts_min << "," << s.pts_max << "]"
+                    << (s.l1_disabled ? " L1-DISABLED" : "")
+                    << std::endl;
         }
       }
 
@@ -1545,7 +1571,11 @@ void VideoCompare::compare() {
             const int left_span = left.ring.history_plus_current_size();
             const int right_span = right_ptr->ring.history_plus_current_size();
             display_->set_pending_message(string_sprintf("Loop: %.1fs buffered (%d/%d frames, %lldms)", loop_cap_sec, left_span, right_span, static_cast<long long>(loop_elapsed)));
-            if (log_seek_timing) std::cerr << "[loop] materialize done in " << loop_elapsed << "ms, left=" << left_span << " right=" << right_span << " frames" << std::endl;
+            if (log_seek_timing) {
+              std::cerr << "[loop] materialize done in " << loop_elapsed << "ms"
+                        << ", left=" << left_span << " right=" << right_span << " frames"
+                        << std::endl;
+            }
             frame_offset = 0;
           }
         } else if (previous_loop_mode != Display::Loop::Off && current_loop_mode == Display::Loop::Off) {
@@ -2011,7 +2041,11 @@ void VideoCompare::compare() {
               current_scored = true;
             }
             if (log_auto_align) {
-              std::cerr << "[auto-align] pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(cand.pts - left_current_pts) / 1000.0) << " probes=" << n_valid << "/" << (2 * kAutoAlignProbeRadius + 1) << " score=" << string_sprintf("%.4f", score) << std::endl;
+              std::cerr << "[auto-align]"
+                        << " pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(cand.pts - left_current_pts) / 1000.0)
+                        << " probes=" << n_valid << "/" << (2 * kAutoAlignProbeRadius + 1)
+                        << " score=" << string_sprintf("%.4f", score)
+                        << std::endl;
             }
             // Pick higher score; on near-ties, prefer the offset closer to the
             // current right position (minimises seek distance when current is
@@ -2058,8 +2092,23 @@ void VideoCompare::compare() {
             // When no candidate got scored, best_score/current_score are still
             // the -max float sentinel; print "n/a" instead of a 40-digit number.
             const std::string best_score_s = (valid_scored == 0) ? std::string{"n/a"} : string_sprintf("%.4f", best_score);
-            const std::string current_score_s = (current_scored) ? string_sprintf("%.4f", current_score) : std::string{"n/a"};
-            std::cerr << "[auto-align] mode=" << mode_label << " ring=" << ring_candidate_pts.size() << " decoded=" << decoded_added << " decode_ms=" << decode_ms << " walk=" << (walk_attempted ? (walk_skip_reason ? "skipped" : "done") : "none") << " candidates=" << candidates.size() << " scored=" << valid_scored << " best_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(best_pts - left_current_pts) / 1000.0) << " best_score=" << best_score_s << " current_score=" << current_score_s << " shift_frames=" << shift_applied << " decision=" << decision_kind << " window=[" << string_sprintf("%.3f", static_cast<double>(window_start_rel_sec)) << "," << string_sprintf("%.3f", static_cast<double>(window_end_rel_sec)) << "]s" << std::endl;
+            const std::string current_score_s = current_scored ? string_sprintf("%.4f", current_score) : std::string{"n/a"};
+            const char* walk_state = walk_attempted ? (walk_skip_reason ? "skipped" : "done") : "none";
+            std::cerr << "[auto-align]"
+                      << " mode=" << mode_label
+                      << " ring=" << ring_candidate_pts.size()
+                      << " decoded=" << decoded_added
+                      << " decode_ms=" << decode_ms
+                      << " walk=" << walk_state
+                      << " candidates=" << candidates.size()
+                      << " scored=" << valid_scored
+                      << " best_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(best_pts - left_current_pts) / 1000.0)
+                      << " best_score=" << best_score_s
+                      << " current_score=" << current_score_s
+                      << " shift_frames=" << shift_applied
+                      << " decision=" << decision_kind
+                      << " window=[" << string_sprintf("%.3f", static_cast<double>(window_start_rel_sec)) << "," << string_sprintf("%.3f", static_cast<double>(window_end_rel_sec)) << "]s"
+                      << std::endl;
           }
         }
       }
@@ -2070,9 +2119,17 @@ void VideoCompare::compare() {
         const char* seek_tier = "L2";  // default; pivot / L1 paths override below
         int64_t seek_target_pts_log = AV_NOPTS_VALUE;  // populated by L1 when known
         auto log_seek = [&](const char* override_tier = nullptr) {
-          if (!log_seek_timing) return;
+          if (!log_seek_timing) {
+            return;
+          }
           const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - seek_t_start).count();
-          std::cerr << "[seek-timing] tier=" << (override_tier ? override_tier : seek_tier) << " shift_right_frames=" << shift_right_frames << " seek_relative=" << seek_relative << " target_pts=" << seek_target_pts_log << " elapsed_us=" << elapsed_us << std::endl;
+          std::cerr << "[seek-timing]"
+                    << " tier=" << (override_tier ? override_tier : seek_tier)
+                    << " shift_right_frames=" << shift_right_frames
+                    << " seek_relative=" << seek_relative
+                    << " target_pts=" << seek_target_pts_log
+                    << " elapsed_us=" << elapsed_us
+                    << std::endl;
         };
         // Any activity entering the seek block permanently disables sticky single-
         // decoder mode: once the right side has diverged from the left (in PTS, crop,
@@ -2287,7 +2344,13 @@ void VideoCompare::compare() {
                 l1_skip_reason = "target-not-covered";
                 if (log_seek_timing) {
                   const auto s = ring_it->second->stats();
-                  std::cerr << "[l1-skip] side=" << side.to_string() << " target_pts=" << target_raw_pts << " ring_pts=[" << s.pts_min << "," << s.pts_max << "] bytes=" << s.bytes_used << " tb=" << stream_tb.num << "/" << stream_tb.den << std::endl;
+                  std::cerr << "[l1-skip]"
+                            << " side=" << side.to_string()
+                            << " target_pts=" << target_raw_pts
+                            << " ring_pts=[" << s.pts_min << "," << s.pts_max << "]"
+                            << " bytes=" << s.bytes_used
+                            << " tb=" << stream_tb.num << "/" << stream_tb.den
+                            << std::endl;
                 }
                 break;
               }
@@ -2305,7 +2368,11 @@ void VideoCompare::compare() {
                 l1_eligible = false;
                 l1_skip_reason = "gop-too-long";
                 if (log_seek_timing) {
-                  std::cerr << "[l1-skip] side=" << side.to_string() << " kf_distance=" << kf_distance_sec << "s > " << l1_max_kf_distance_sec << "s" << std::endl;
+                  std::cerr << "[l1-skip]"
+                            << " side=" << side.to_string()
+                            << " kf_distance=" << kf_distance_sec << "s"
+                            << " > " << l1_max_kf_distance_sec << "s"
+                            << std::endl;
                 }
                 break;
               }
@@ -2368,10 +2435,20 @@ void VideoCompare::compare() {
               VideoFilterer& flt = *video_filterers_[side];
               FormatConverter& cvt = *format_converters_[side];
 
-              if (log_l1_stages) std::cerr << "[l1-stage] side=" << side.to_string() << " before dec.flush" << std::endl;
+              if (log_l1_stages) {
+                std::cerr << "[l1-stage] side=" << side.to_string() << " before dec.flush" << std::endl;
+              }
               dec.flush();
               dec.reset_pts_state();
-              if (log_l1_stages) std::cerr << "[l1-stage] side=" << side.to_string() << " after dec.flush, kf_pts=" << hit->kf_pts << " target_pts=" << target_pts << " kf_idx=" << hit->absolute_buffer_index << std::endl;
+              if (log_l1_stages) {
+                std::cerr << "[l1-stage]"
+                          << " side=" << side.to_string()
+                          << " after dec.flush"
+                          << ", kf_pts=" << hit->kf_pts
+                          << " target_pts=" << target_pts
+                          << " kf_idx=" << hit->absolute_buffer_index
+                          << std::endl;
+              }
 
               AVFrameUniquePtr captured{nullptr, avframe_and_data_deleter};
               // Pre-target frames we decode on the way to target_frame_pts.
@@ -2729,7 +2806,11 @@ void VideoCompare::compare() {
               right_seek_positions[side] = next_right_position;
 
 #ifdef _DEBUG
-              std::cout << "SEEK: next_right_position=" << (int)(next_right_position * 1000) << " (side=" << side.to_string() << "), backward=" << backward << std::endl;
+              std::cout << "SEEK:"
+                        << " next_right_position=" << (int)(next_right_position * 1000)
+                        << " (side=" << side.to_string() << ")"
+                        << ", backward=" << backward
+                        << std::endl;
 #endif
               const bool right_seek_result = demuxers_[side]->seek(next_right_position, backward);
               if (!right_seek_result && !backward) {
@@ -2993,7 +3074,13 @@ void VideoCompare::compare() {
           // stays on screen — no need to overwrite it with a near-identical one.
 
           if (log_auto_align) {
-            std::cerr << "[auto-align] landed_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(landed_pts_delta) / 1000.0) << " landed_score=" << string_sprintf("%.4f", landed_score) << " expected_score=" << string_sprintf("%.4f", v.expected_score) << " ok=" << (ok ? "true" : "false") << " probes=" << n_valid << std::endl;
+            std::cerr << "[auto-align]"
+                      << " landed_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(landed_pts_delta) / 1000.0)
+                      << " landed_score=" << string_sprintf("%.4f", landed_score)
+                      << " expected_score=" << string_sprintf("%.4f", v.expected_score)
+                      << " ok=" << (ok ? "true" : "false")
+                      << " probes=" << n_valid
+                      << std::endl;
           }
 
           v = {};  // clear for next press

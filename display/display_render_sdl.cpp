@@ -174,8 +174,14 @@ void Display::sdl_run_cpu_work(const RenderContext& ctx,
         const std::string roi_str =
             (crop_width < video_width_ || crop_height < video_height_) ? string_sprintf("  (%d,%d)-(%d,%d)", effective_roi_left.x, effective_roi_left.y, effective_roi_left.x + crop_width - 1, effective_roi_left.y + crop_height - 1) : "";
 
-        std::cout << string_sprintf("Metrics: [%s|%s] PSNR(%s), SSIM(%s), VMAF(%s)%s", format_position(ffmpeg::pts_in_secs(left_frame), false).c_str(), format_position(ffmpeg::pts_in_secs(right_frame), false).c_str(), psnr.c_str(),
-                                    ssim.c_str(), vmaf.c_str(), roi_str.c_str())
+        std::cout << string_sprintf(
+                         "Metrics: [%s|%s] PSNR(%s), SSIM(%s), VMAF(%s)%s",
+                         format_position(ffmpeg::pts_in_secs(left_frame), false).c_str(),
+                         format_position(ffmpeg::pts_in_secs(right_frame), false).c_str(),
+                         psnr.c_str(),
+                         ssim.c_str(),
+                         vmaf.c_str(),
+                         roi_str.c_str())
                   << std::endl;
 
         delete[] left_gray;

@@ -729,11 +729,16 @@ bool Display::gpu_run_cpu_work(const RenderContext& ctx) {
         const auto od_left = original_dims(left_frame);
         const auto od_right = original_dims(right_frame);
 
-        std::cout << "Left:  " << string_sprintf("[%4d,%4d]", pixel_video_x * od_left.first / video_width_, pixel_video_y * od_left.second / video_height_);
-        std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(rgb_cache_.left()->data[0], rgb_cache_.left()->linesize[0], rgb_cache_.left(), pixel_video_x, pixel_video_y, requires_10_bpc());
+        const bool is_10bpc = requires_10_bpc();
+        const auto print_side = [&](const char* label, const AVFrame* frame, const std::pair<int, int>& od) {
+          std::cout << label << " "
+                    << string_sprintf("[%4d,%4d]", pixel_video_x * od.first / video_width_, pixel_video_y * od.second / video_height_)
+                    << ", "
+                    << MetricsCalculator::get_and_format_rgb_yuv_pixel(frame->data[0], frame->linesize[0], frame, pixel_video_x, pixel_video_y, is_10bpc);
+        };
+        print_side("Left: ", rgb_cache_.left(), od_left);
         std::cout << " - ";
-        std::cout << "Right: " << string_sprintf("[%4d,%4d]", pixel_video_x * od_right.first / video_width_, pixel_video_y * od_right.second / video_height_);
-        std::cout << ", " << MetricsCalculator::get_and_format_rgb_yuv_pixel(rgb_cache_.right()->data[0], rgb_cache_.right()->linesize[0], rgb_cache_.right(), pixel_video_x, pixel_video_y, requires_10_bpc());
+        print_side("Right:", rgb_cache_.right(), od_right);
         std::cout << std::endl;
       }
       print_mouse_position_and_color_ = false;
