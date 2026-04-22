@@ -1349,10 +1349,21 @@ void VideoCompare::compare() {
       auto intake_prefetch = [&]() {
         for (auto& pair : side_states) {
           SideState& ss = pair.second;
+          const AVFrame* const current_frame = ss.ring.current_frame();
+          const int64_t min_acceptable_pts = (current_frame != nullptr) ? current_frame->pts : INT64_MIN;
           while (!ss.ring.prefetch_full()) {
             AVFrameUniquePtr frame{nullptr, avframe_deleter};
             if (!converted_frame_queues_[ss.side_]->try_pop(frame) || frame == nullptr) {
               break;
+            }
+            // Drop frames whose pts is at or before the ring's current frame.
+            // This filter lets L1 / auto-align post-seek use a backward demuxer
+            // seek (decoder-safe GOP boundary) without the worker's re-emitted
+            // pre-target frames corrupting the ring prefetch's forward ordering
+            // — a subsequent `+`/pivot_forward would otherwise land on a frame
+            // visually behind the current cursor.
+            if (frame->pts <= min_acceptable_pts) {
+              continue;
             }
             if (!ss.ring.push_prefetch(std::move(frame))) {
               break;
@@ -1837,8 +1848,29 @@ void VideoCompare::compare() {
           // endpoints below live on the follower's axis; we derive them by
           // adding the mode-resolved relative window to the master-axis origin.
           const int64_t master_current_pts = master_current->pts;
-          const int64_t window_start_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_start_rel_sec) * AV_TIME_BASE);
-          const int64_t window_end_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_end_rel_sec) * AV_TIME_BASE);
+          int64_t window_start_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_start_rel_sec) * AV_TIME_BASE);
+          int64_t window_end_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_end_rel_sec) * AV_TIME_BASE);
+
+          // Extend the scoring window to cover the ring's full extent around
+          // follower_current plus the probe radius. Without this, a candidate
+          // at the ring's forward edge (typical after a prior seek has pushed
+          // follower near the true alignment) can't muster enough valid
+          // probes to score — probe targets fall outside the pool — and the
+          // algorithm picks a worse ring-interior candidate instead. The
+          // extension uses the coarser side's delta_pts as a probe-step
+          // estimate (the exact probe_step_pts is computed later, but this
+          // approximation is tight enough for the bound).
+          const int64_t approx_probe_step_pts = std::max(master_delta_pts, follower_delta_pts);
+          const int64_t probe_edge_slack_pts = static_cast<int64_t>(kAutoAlignProbeRadius + 1) * approx_probe_step_pts;
+          const int64_t follower_current_pts = follower_current->pts;
+          const int64_t ring_forward_slack_pts = static_cast<int64_t>(follower_state.ring.prefetch_size()) * follower_delta_pts;
+          const int64_t ring_backward_slack_pts = static_cast<int64_t>(follower_state.ring.history_size()) * follower_delta_pts;
+          if (auto_align_mode == AutoAlignMode::Forward || auto_align_mode == AutoAlignMode::Symmetric) {
+            window_end_pts = std::max(window_end_pts, follower_current_pts + ring_forward_slack_pts + probe_edge_slack_pts);
+          }
+          if (auto_align_mode == AutoAlignMode::Backward || auto_align_mode == AutoAlignMode::Symmetric) {
+            window_start_pts = std::min(window_start_pts, follower_current_pts - ring_backward_slack_pts - probe_edge_slack_pts);
+          }
 
           // Figure out how much of the requested window the candidate pool
           // already covers. If at least one candidate is at-or-before
@@ -2071,17 +2103,19 @@ void VideoCompare::compare() {
                   std::cerr << "[auto-align-walk-exception] unknown" << std::endl;
                 }
 
-                // Post-walk restore: flush decoder state, forward-seek demuxer
-                // back to follower.current.pts + 0.001, restart queues so the
-                // workers resume normal operation.
+                // Post-walk restore: flush decoder state, seek demuxer back to
+                // the keyframe at or before follower.current so the worker
+                // produces contiguous frames starting at (or just before) the
+                // current ring position. Using the forward-first flag lands on
+                // the NEXT keyframe (potentially seconds ahead for sparse-key
+                // encodes), which then pollutes the ring prefetch with
+                // far-forward frames and turns a subsequent L0-pivot into a
+                // wild jump. Seek backward-first; drop the forward fallback.
                 dec.flush();
                 dec.reset_pts_state();
                 const float follower_start_sec = static_cast<float>(demuxer_start_us) * static_cast<float>(AV_TIME_TO_SEC);
                 const float resume_sec = static_cast<float>(follower_current->pts) * static_cast<float>(AV_TIME_TO_SEC) + follower_start_sec + 0.001f;
-                const bool fwd_ok = demuxer.seek(resume_sec, false);
-                if (!fwd_ok) {
-                  demuxer.seek(resume_sec, true);
-                }
+                demuxer.seek(resume_sec, true);
                 for (auto& p : packet_queues_) {
                   if (follower_only_pred(p.first)) {
                     p.second->restart();
@@ -2906,26 +2940,20 @@ void VideoCompare::compare() {
                 p.second->reinit();
               }
 
-              // Reposition each demuxer so the pipeline resumes with frames
-              // strictly AFTER target. Seeking backward to a keyframe ≤ target
-              // would make the pipeline re-emit the pre-target frames we
-              // already seeded into history, corrupting prefetch ordering
-              // (first `+` would visually jump backward).
-              //
-              // Strategy: seek forward — `backward=false` makes av_seek_frame
-              // land on the next keyframe at-or-after the requested time.
-              // If that fails (sparse-keyframe input with no subsequent
-              // keyframe), fall back to the backward seek and accept the minor
-              // prefetch-ordering artifact; sync_frame_queue self-corrects it
-              // within a frame or two.
+              // Reposition each demuxer to the keyframe AT OR BEFORE target so
+              // the pipeline resumes from a decoder-safe point. The worker's
+              // packet stream from that keyframe includes packets whose frames
+              // would re-cover the history we just seeded — intake_prefetch
+              // drops any frame with pts ≤ current.pts (see the drop filter
+              // there), so the ring's prefetch fills with frames strictly
+              // AFTER target and the first `+` after an L1 seek advances
+              // correctly instead of landing on a far-forward keyframe that
+              // a post-target seek would otherwise have skipped to.
               for (auto& p : demuxers_) {
                 const Side& side = p.first;
                 if (!should_seek(side)) continue;
                 const float target_sec = l1_target_sec[side];
-                const bool fwd_ok = p.second->seek(target_sec + 0.001F, false);
-                if (!fwd_ok) {
-                  p.second->seek(target_sec + 0.001F, true);
-                }
+                p.second->seek(target_sec, true);
               }
 
               for (auto& p : packet_queues_)
@@ -3388,6 +3416,21 @@ void VideoCompare::compare() {
 
           if (!ok && n_valid >= 3) {
             display_->set_pending_message(string_sprintf("Auto-align: landed score %.3f (expected %.3f) — seek imprecision", landed_score, v.expected_score));
+          }
+          // When the seek landed ok and the follower is RIGHT (standard, non-
+          // swap case), override TimeShifter::static_shift to the EXACT raw
+          // right-vs-left delta. Without this override, static_shift is
+          // `total_frames × avg_delta` and drifts by a few ms under variable
+          // frame durations (e.g., 59.98 fps VP9 with 16/17 ms alternating
+          // deltas truncated to an integer average). Auto-align knows the
+          // landed frame exactly, so we can close the gap cleanly.
+          if (ok && v.follower_side.is_right() && follower_current_after != nullptr) {
+            const AVFrame* const left_current = left.ring.current_frame();
+            if (left_current != nullptr) {
+              time_shifter_.set_static_shift_us(follower_current_after->pts - left_current->pts);
+              right_ptr->effective_time_shift_ = time_shifter_.effective_shift(follower_current_after->pts);
+              right_ptr->pts_ = follower_current_after->pts - right_ptr->effective_time_shift_;
+            }
           }
           // When ok, the main-pass "shift %+d (score %.3f)" message set earlier
           // stays on screen — no need to overwrite it with a near-identical one.

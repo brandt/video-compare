@@ -41,6 +41,12 @@ class TimeShifter {
     static_shift_ = offset_av_time_ + static_cast<int64_t>(total_frames_shifted) * right_delta;
   }
 
+  // Override static_shift to an exact microsecond value, used when the caller
+  // knows the true right-vs-left pts delta (e.g. auto-align, which has the
+  // exact target pts) and wants to avoid the `total_frames × avg_delta`
+  // rounding drift that accumulates under variable-duration frames.
+  void set_static_shift_us(int64_t static_shift_us) { static_shift_ = static_shift_us; }
+
   // --- Getters ---
   int64_t static_shift() const { return static_shift_; }
   int total_frames_shifted() const { return total_frames_shifted_; }
