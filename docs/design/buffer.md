@@ -420,3 +420,5 @@ Diagnostic: `VIDEO_COMPARE_LOG_SEEK_TIMING=1` logs `tier=<L0back|L0forward|L1|L1
 | Auto-align (walk needed)           | `[`, `]`        | run_auto_align + barriered PacketRing walk → L0/L1/L2 | right side only | yes (decode only, no filter/convert)
 
 For the auto-align algorithm and the barriered PacketRing walk it runs, see [auto-align.md](auto-align.md).
+
+Swap (`S`) flips which underlying pipeline the cheat-sheet's "right side"-style rows actually target. `+` / `-`, shift-click on the timeline, and the auto-align keys all route through `Display::follower_side_for_input()` so the user's "right video" intent tracks the visual position rather than the pipeline identity. The pipeline architecture (master = LEFT, follower = RIGHT, TimeShifter tracks right-relative-to-left) is unchanged; the translation happens at the input layer. See [docs/planning/Swap-seek.md](../planning/Swap-seek.md).

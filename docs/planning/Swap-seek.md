@@ -1,5 +1,7 @@
 # Swap seek
 
+**Status: implemented.** Phases 1–3 shipped. All user inputs that refer to "the right video" (`+`/`-`, shift-click, the auto-align keys `` ` `` / `[` / `]`) now follow the visual position regardless of swap state. See the phase-by-phase plan below for the architecture and the test harness that verifies each piece.
+
 ## Problem
 
 Pressing `S` flips a display-only bit (`swap_left_right_` in [display/display.h:147](../../display/display.h#L147)) that swaps which underlying pipeline is rendered on which half of the window. The pipelines themselves — `LEFT` and `RIGHT` in the code — never actually swap roles. `LEFT` stays the master; `RIGHT` stays the follower with its `TimeShifter`-tracked offset, regardless of visual position.

@@ -207,9 +207,40 @@ See [testdata/alignment/README.md](../../testdata/alignment/README.md) for the f
 
 Auto-align doesn't introduce a new seek tier. It reuses existing infrastructure:
 
-- The **`enter_seek_barrier` helper** ([buffer.md §5.3](buffer.md)) parks the right-side workers while the PacketRing walk runs.
+- The **`enter_seek_barrier` helper** ([buffer.md §5.3](buffer.md)) parks the follower-side workers while the PacketRing walk runs.
 - The **VideoDecoder send/receive/flush API** (same one L1 and loop-materialize use) drives the inline decode.
 - The **PacketRing** ([buffer.md §10](buffer.md)) supplies the packets that would otherwise require a round-trip to disk.
-- The **`shift_right_frames` input to the seek branch** carries the chosen offset into the standard L0/L1/L2 dispatch — auto-align never seeks directly.
+- The **`shift_right_frames` input to the seek branch** carries the chosen offset into the standard L0/L1/L2 dispatch when the follower is RIGHT; under swap (follower=LEFT) the seek dispatches via the absolute-seek path (`seek_relative` + `seek_from_start` + `display_->set_right_only_seek(true, LEFT)`), which ends up as an L2 seek scoped to LEFT.
 
 What's distinct to auto-align is the fingerprint primitive, the windowed multi-probe scoring, and the post-seek verification; everything else is infrastructure shared with the rest of the pipeline.
+
+---
+
+## 11. Swap awareness
+
+Auto-align — like `+`/`-` and shift-click — honours the visual swap. The algorithm is written in terms of a **follower** side (the one the user means when they press a "right video" key) and a **master** side (the stationary reference), resolved from [`Display::follower_side_for_input()`](../../display/display.h):
+
+- No swap: follower = RIGHT, master = LEFT. Candidates drawn from the right FrameRing; probes from left.
+- Swap active: follower = LEFT, master = RIGHT. Candidates drawn from the left FrameRing; probes from right.
+
+Everything downstream — candidate-pool build, PacketRing walk barrier, scoring, post-seek verification — goes through `follower_state` / `master_state` aliases, so one algorithm body handles both orientations.
+
+**Seek dispatch** splits on follower side because `shift_right_frames` and the L0 pivot fast path are specifically RIGHT-side mechanisms:
+
+- Follower = RIGHT (common case): fold `best_pts − follower.current.pts` into `shift_right_frames`. Standard L0/L1/L2 dispatch follows; L0 pivot handles the common case with no re-decode.
+- Follower = LEFT (under swap): dispatch via the absolute-seek path shared with shift-click (Phase 2 of [docs/planning/Swap-seek.md](../planning/Swap-seek.md)). Compute the target as a fractional timeline position, set `seek_relative` + `seek_from_start`, call `display_->set_right_only_seek(true, LEFT)`. The main loop's `should_seek` predicate scopes the seek to LEFT only; the TimeShifter update recovers the stationary side's static_shift with a flipped sign.
+
+The L0 pivot is not symmetric. Under swap, even small LEFT shifts fall through to L2 (~half a second on typical hardware). Making the pivot symmetric is a potential future optimisation but outside the scope of the swap-aware rollout.
+
+**Verification** (`PendingAutoAlignVerification`) carries `follower_side` so the post-seek rescore looks up the landed frame in the correct ring. Probe fingerprints are stored against master PTS keys (master doesn't move during the seek). See [`app/video_compare.h`](../../app/video_compare.h) for the struct.
+
+**Diagnostic logging** gained a `follower=LEFT|RIGHT` field in the `[auto-align] mode=…` summary line. Example:
+
+```
+[auto-align] mode=fwd follower=LEFT ring=25 decoded=0 decode_ms=725 walk=done \
+             candidates=25 scored=25 best_pts_delta_ms=-2052.056 \
+             best_score=0.9657 current_score=0.9657 shift_frames=0 \
+             decision=already window=[0.000,1.000]s
+```
+
+**Verification harness**: [tmp/swap_autoalign_test.py](../../tmp/swap_autoalign_test.py) drives the socket API to run an auto-align key press both with and without swap and asserts that the `follower=` field in the log follows the swap state. Reproducible in CI without a display.

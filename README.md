@@ -213,7 +213,7 @@ see all supported options.
 - `D`: Move to the next frame in the buffer
 - `E`: Re-center view around mouse position
 - `R`: Global re-center and reset zoom to 100% (x1)
-- `S`: Swap left and right video
+- `S`: Swap left and right video. After swap, user inputs that refer to "the right video" (`+`/`-`, shift-click on the timeline, auto-align keys) continue to target the visually-right side.
 - `Tab`: Cycle through right videos
 - `1`: Toggle hide/show left video
 - `2`: Toggle hide/show right video
@@ -233,7 +233,9 @@ see all supported options.
 - `P`: Print mouse position and pixel value under cursor to console
 - `M`: Print image similarity metrics to console
 - `Q`: Toggle on-screen quality metrics overlay (PSNR/SSIM live, VMAF on pause)
-- `\``: Auto-align right video: shift to buffered right frame best matching current left frame (by SSIM)
+- `\``: Auto-align right video: search ±0.5s around current left position for the best structural match
+- `[`: Auto-align backward: search the 1s range before current left position
+- `]`: Auto-align forward: search the 1s range after current left position
 - `F`: Save both frames and the on-screen content as JPEG-XL images
 - `I`: Toggle fast/high-quality resizing for input alignment
 - `T`: Toggle nearest-neighbor/bilinear video texture filtering
@@ -270,6 +272,8 @@ Move the mouse horizontally to adjust the movable slider position.
 Use the mouse wheel to zoom in/out on the pixel under the cursor. Pan the view by moving the mouse while holding down the right button.
 
 Left-click the mouse to perform a time seek based on the horizontal position of the mouse cursor relative to the window width (the target position is shown in the lower right corner).
+
+Hold Shift while left-clicking to move only the right video to the clicked position, leaving the left video's playhead in place. Useful for nudging a misaligned pair into sync without disturbing the reference side.
 
 ### Other
 
