@@ -60,6 +60,7 @@ Display::Display(const int display_number,
                  const float wheel_sensitivity,
                  const bool start_in_subtraction_mode,
                  const bool start_in_fullscreen,
+                 const bool start_paused,
                  const std::string& left_file_name,
                  const std::string& right_file_name)
     : display_number_{display_number},
@@ -82,6 +83,12 @@ Display::Display(const int display_number,
       wheel_sensitivity_{wheel_sensitivity} {
   view_transform_.set_on_change([this]() { refresh_selection_end_from_mouse(); });
   image_saver_.set_notifier([this](const std::string& msg) { notify_user(msg); });
+  // Honour --start-paused. Can't flip playback_ to paused right away because
+  // the ring is still empty and the main loop only advances the ring when
+  // play_ is true (or a forward-nav is pending); flipping early would leave
+  // the display without a current frame to render. Instead, defer the pause
+  // until after possibly_refresh actually rendered the first frame.
+  pending_startup_pause_ = start_paused;
   const int auto_width = mode == Mode::HStack ? width * 2 : width;
   const int auto_height = mode == Mode::VStack ? height * 2 : height;
 
@@ -424,6 +431,13 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   previous_right_frame_pts_ = right_frame->pts;
   previous_left_frame_key_ = left_frame_key;
   previous_right_frame_key_ = right_frame_key;
+  // First-frame-rendered hook for --start-paused: the ring now has a current
+  // frame on both sides, so flipping to paused here is safe — subsequent
+  // iterations will keep displaying this frame without further ring advances.
+  if (pending_startup_pause_) {
+    playback_.set_play(false);
+    pending_startup_pause_ = false;
+  }
   return true;
 }
 // Queue a transient center-screen message for display on the next frame.

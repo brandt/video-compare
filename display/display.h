@@ -151,6 +151,10 @@ class Display {
   bool show_hud_{true};
   bool start_in_fullscreen_{false};
   bool is_fullscreen_{false};
+  // When true, Display will pause playback as soon as possibly_refresh
+  // has rendered the first frame. Cleared at that point so the pause is
+  // only applied once.
+  bool pending_startup_pause_{false};
   bool pending_verbose_print_{false};
   bool print_mouse_position_and_color_{false};
   bool print_image_similarity_metrics_{false};
@@ -411,6 +415,7 @@ class Display {
           const float wheel_sensitivity,
           const bool start_in_subtraction_mode,
           const bool start_in_fullscreen,
+          const bool start_paused,
           const std::string& left_file_name,
           const std::string& right_file_name);
   ~Display();

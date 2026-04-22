@@ -557,6 +557,7 @@ int main(int argc, char** argv) {
          {"fast-alignment", {"-F", "--fast-alignment"}, "toggle fast bilinear scaling for aligning input source resolutions, replacing high-quality bicubic and chroma-accurate interpolation", 0},
          {"bilinear-texture", {"-I", "--bilinear-texture"}, "toggle bilinear video texture interpolation, replacing nearest-neighbor filtering", 0},
          {"subtraction-mode", {"-S", "--subtraction-mode"}, "start in subtraction (difference) view", 0},
+         {"start-paused", {"--start-paused"}, "start in a paused state (equivalent to pressing space immediately after launch)", 0},
          {"display-number", {"-n", "--display-number"}, "open main window on specific display (e.g. 0, 1 or 2), default is 0", 1},
          {"display-mode", {"-m", "--mode"}, "display mode (layout), 'split' for split screen (default), 'vstack' for vertical stack, 'hstack' for horizontal stack", 1},
          {"window-size", {"-w", "--window-size"}, "override window size, specified as [width]x[height] (e.g. 800x600, 1280x or x480)", 1},
@@ -678,6 +679,7 @@ int main(int argc, char** argv) {
       config.disable_auto_filters = args["disable-auto-filters"];
       config.start_in_subtraction_mode = args["subtraction-mode"];
       config.start_in_fullscreen = args["fullscreen"];
+      config.start_paused = args["start-paused"];
 
       if (args["display-number"]) {
         const std::string display_number_arg = args["display-number"];

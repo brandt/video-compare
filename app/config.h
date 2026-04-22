@@ -60,6 +60,7 @@ struct VideoCompareConfig {
   bool disable_auto_filters{false};
   bool start_in_subtraction_mode{false};
   bool start_in_fullscreen{false};
+  bool start_paused{false};
   DisplayAspectLockMode aspect_lock_mode{DisplayAspectLockMode::Content};
   DisplayAspectViewMode aspect_view_mode{DisplayAspectViewMode::Stretch};
 

@@ -410,7 +410,7 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
 
   display_ = std::make_unique<Display>(config_.display_number, config_.display_mode, config_.verbose, config_.fit_window_to_usable_bounds, config_.high_dpi_allowed, config_.aspect_lock_mode, config_.aspect_view_mode, config_.use_10_bpc,
                                        use_fast_input_alignment(config_), config_.bilinear_texture_filtering, config_.window_size, max_width_, max_height_, shortest_duration_, config_.wheel_sensitivity, config_.start_in_subtraction_mode,
-                                       config_.start_in_fullscreen, config_.left.file_name, right_file_name);
+                                       config_.start_in_fullscreen, config_.start_paused, config_.left.file_name, right_file_name);
   if (hdr_passthrough_active_) {
     // Set content headroom from peak luminance (max across all sides)
     unsigned max_peak_nits = 0;
@@ -1890,10 +1890,7 @@ void VideoCompare::compare() {
               constexpr int64_t kDecoderWarmupUs = 500000;  // 0.5 s
               const int64_t lookup_start_us = std::max<int64_t>(window_start_pts + demuxer_start_us - kDecoderWarmupUs, int64_t{0});
               const int64_t lookup_start_raw = av_rescale_q(lookup_start_us, AV_TIME_BASE_Q, stream_tb);
-              auto kf_hit = packet_ring.keyframe_at_or_before(lookup_start_raw);
-              if (!kf_hit.has_value()) {
-                walk_skip_reason = "no-keyframe-hit";
-              } else {
+              {
                 const auto walk_t_start = std::chrono::steady_clock::now();
                 VideoDecoder& dec = *video_decoders_.at(follower_side);
 
@@ -1901,6 +1898,64 @@ void VideoCompare::compare() {
                 enter_seek_barrier(follower_only_pred);
 
                 try {
+                  // Pre-fill: when the packet ring doesn't yet span the walk
+                  // window (typical under --start-paused, where the pipeline
+                  // never streamed past its ~queue-depth of initial packets;
+                  // also happens after a previous walk's post-seek restart
+                  // fragmented the ring into overlapping ranges), clear the
+                  // ring and refill it from a backward seek. The result is
+                  // one contiguous range spanning [kf-before-window_start,
+                  // window_end+], which the walk can iterate in one pass.
+                  // Dropping the prior ranges is safe here: candidates we
+                  // had already fingerprinted from them live in the retry
+                  // cache (or the auto-align candidates vector for retry=0),
+                  // and future L1 work will refill the ring as playback
+                  // resumes via the post-walk restore.
+                  const int64_t window_end_raw = av_rescale_q(window_end_pts + demuxer_start_us, AV_TIME_BASE_Q, stream_tb);
+                  const auto ring_stats_pre = packet_ring.stats();
+                  const bool need_prefill = ring_stats_pre.pts_max == INT64_MIN || ring_stats_pre.pts_max < window_end_raw || ring_stats_pre.range_count > 1;
+                  if (need_prefill) {
+                    packet_ring.clear();
+                    const double seek_target_sec = static_cast<double>(lookup_start_raw) * av_q2d(stream_tb);
+                    demuxer.seek(static_cast<float>(seek_target_sec), true);
+
+                    int fill_appended = 0;
+                    while (true) {
+                      AVPacketUniquePtr packet{new AVPacket, avpacket_deleter};
+                      av_init_packet(packet.get());
+                      packet->data = nullptr;
+                      if (!demuxer(*packet)) {
+                        break;  // EOF
+                      }
+                      if (packet->stream_index != demuxer.video_stream_index()) {
+                        continue;
+                      }
+                      const int64_t pkt_pts = packet->pts;
+                      if (AVPacket* cloned = av_packet_clone(packet.get())) {
+                        packet_ring.append(PacketRing::PacketPtr(cloned, avpacket_free_deleter));
+                        ++fill_appended;
+                      }
+                      if (pkt_pts != AV_NOPTS_VALUE && pkt_pts > window_end_raw) {
+                        break;
+                      }
+                    }
+                    if (log_auto_align) {
+                      const auto ring_stats_post = packet_ring.stats();
+                      std::cerr << "[auto-align-prefill]"
+                                << " pre_ranges=" << ring_stats_pre.range_count
+                                << " pre_pts_max=" << ring_stats_pre.pts_max
+                                << " appended=" << fill_appended
+                                << " post_pts_max=" << ring_stats_post.pts_max
+                                << std::endl;
+                    }
+                  }
+
+                  // Find the walk's starting keyframe now (after pre-fill, which
+                  // may have added new keyframes).
+                  auto kf_hit = packet_ring.keyframe_at_or_before(lookup_start_raw);
+                  if (!kf_hit.has_value()) {
+                    walk_skip_reason = "no-keyframe-hit";
+                  }
                   // Rebuild the filter graph so the post-walk pipeline restart
                   // can feed it again. The worker called close_src() during
                   // the barrier.
@@ -1959,7 +2014,9 @@ void VideoCompare::compare() {
                   };
 
                   // Feed packets from keyframe forward, pumping receive() until EAGAIN.
-                  bool stop = false;
+                  // Skipped if pre-fill couldn't produce a usable starting keyframe.
+                  bool stop = !kf_hit.has_value();
+                  if (kf_hit.has_value()) {
                   kf_hit->range->iterate_from(kf_hit->absolute_buffer_index, [&](const AVPacket* src_pkt) -> bool {
                     if (stop) {
                       return false;
@@ -1986,6 +2043,7 @@ void VideoCompare::compare() {
                     }
                     return !stop;
                   });
+                  }  // end if (kf_hit.has_value())
 
                   // Drain decoder's B-frame-reorder buffer.
                   if (!stop) {
