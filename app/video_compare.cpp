@@ -1658,7 +1658,7 @@ void VideoCompare::compare() {
         constexpr int kAutoAlignProbeRadius = 2;              // probes at k ∈ {-2..+2}
         const bool log_auto_align = env_flag_enabled("VIDEO_COMPARE_LOG_AUTO_ALIGN");
 
-        // Resolve the mode into signed window endpoints relative to left.current.pts.
+        // Resolve the mode into signed window endpoints relative to master.current.pts.
         const AutoAlignMode auto_align_mode = display_->get_auto_align_mode();
         float window_start_rel_sec = -kAutoAlignSymmetricHalfSec;
         float window_end_rel_sec = kAutoAlignSymmetricHalfSec;
@@ -1673,12 +1673,22 @@ void VideoCompare::compare() {
           mode_label = "fwd";
         }
 
-        const AVFrame* const left_current = left.ring.current_frame();
-        const AVFrame* const right_current = right_ptr->ring.current_frame();
-        const int64_t left_delta_pts = left.delta_pts_;
-        const int64_t right_delta_pts = right_ptr->delta_pts_;
+        // Follower is the side the user means when they press a "right video"
+        // input; under swap that's underlying LEFT, otherwise underlying RIGHT.
+        // Master is the opposite side — the stationary reference whose frames
+        // supply probes. Every ring/decoder/delta-pts reference below goes
+        // through these aliases so the algorithm is side-agnostic.
+        const Side auto_align_follower_side = display_->follower_side_for_input();
+        SideState& master_state = auto_align_follower_side.is_right() ? left : *right_ptr;
+        SideState& follower_state = auto_align_follower_side.is_right() ? *right_ptr : left;
+        const Side master_side = master_state.side_;
 
-        if (left_current == nullptr || right_current == nullptr || left_delta_pts <= 0 || right_delta_pts <= 0) {
+        const AVFrame* const master_current = master_state.ring.current_frame();
+        const AVFrame* const follower_current = follower_state.ring.current_frame();
+        const int64_t master_delta_pts = master_state.delta_pts_;
+        const int64_t follower_delta_pts = follower_state.delta_pts_;
+
+        if (master_current == nullptr || follower_current == nullptr || master_delta_pts <= 0 || follower_delta_pts <= 0) {
           display_->set_pending_message("Auto-align: no frames available");
           if (log_auto_align) {
             std::cerr << "[auto-align] decision=no_frames" << std::endl;
@@ -1740,23 +1750,23 @@ void VideoCompare::compare() {
             return best;
           };
 
-          // A candidate: a right-side PTS + its precomputed fingerprint. In step
-          // 4 the pool is sourced entirely from right.ring. A later change adds
-          // PacketRing-decoded entries to cover the full ±kAutoAlignSearchWindowSec.
+          // A candidate: a follower-side PTS + its precomputed fingerprint.
+          // Seeded from follower.ring, then extended via a barriered PacketRing
+          // walk on the follower side when the ring doesn't span the window.
           struct Candidate {
             int64_t pts;
             std::vector<float> fp;
           };
 
-          // --- Build the right-side candidate pool (ring-only for now) ---
+          // --- Build the follower-side candidate pool from its FrameRing ---
           std::vector<Candidate> candidates;
           {
-            const FrameRing& rring = right_ptr->ring;
-            const int min_off = -rring.history_size();
-            const int max_off = rring.prefetch_size();
+            const FrameRing& fring = follower_state.ring;
+            const int min_off = -fring.history_size();
+            const int max_off = fring.prefetch_size();
             candidates.reserve(static_cast<size_t>(max_off - min_off + 1));
             for (int off = min_off; off <= max_off; ++off) {
-              const AVFrame* const f = rring.at(off);
+              const AVFrame* const f = fring.at(off);
               if (f == nullptr) {
                 continue;
               }
@@ -1769,12 +1779,12 @@ void VideoCompare::compare() {
             }
           }
 
-          // Current left-axis PTS used throughout the rest of this block. The
-          // window endpoints below are on right's axis; mapped by adding the
-          // mode-resolved relative window to the left-axis origin.
-          const int64_t left_current_pts = left_current->pts;
-          const int64_t window_start_pts = left_current_pts + static_cast<int64_t>(static_cast<double>(window_start_rel_sec) * AV_TIME_BASE);
-          const int64_t window_end_pts = left_current_pts + static_cast<int64_t>(static_cast<double>(window_end_rel_sec) * AV_TIME_BASE);
+          // Master-axis PTS used throughout the rest of this block. The window
+          // endpoints below live on the follower's axis; we derive them by
+          // adding the mode-resolved relative window to the master-axis origin.
+          const int64_t master_current_pts = master_current->pts;
+          const int64_t window_start_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_start_rel_sec) * AV_TIME_BASE);
+          const int64_t window_end_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_end_rel_sec) * AV_TIME_BASE);
 
           // Figure out how much of the requested window the FrameRing already
           // covers. If we have at least one frame at-or-before window_start_pts
@@ -1792,7 +1802,7 @@ void VideoCompare::compare() {
           const bool ring_covers_window = !candidates.empty() && ring_min_pts <= window_start_pts && ring_max_pts >= window_end_pts;
 
           // --- PacketRing walk (only when ring coverage is insufficient) ---
-          // Mirrors the L1 re-decode pattern: barrier the right pipeline,
+          // Mirrors the L1 re-decode pattern: barrier the follower pipeline,
           // flush the decoder, walk PacketRing packets from the keyframe ≤
           // window_start forward, and fingerprint each decoded frame whose PTS
           // lands inside the window. Frames already present in the ring are
@@ -1803,18 +1813,18 @@ void VideoCompare::compare() {
           const char* walk_skip_reason = nullptr;
           if (!ring_covers_window) {
             walk_attempted = true;
-            const Side right_side = right_ptr->side_;
-            const auto right_only_pred = [right_side](const Side& s) { return s == right_side; };
+            const Side follower_side = follower_state.side_;
+            const auto follower_only_pred = [follower_side](const Side& s) { return s == follower_side; };
 
-            auto packet_ring_it = packet_rings_.find(right_side);
-            auto demuxer_it = demuxers_.find(right_side);
+            auto packet_ring_it = packet_rings_.find(follower_side);
+            auto demuxer_it = demuxers_.find(follower_side);
             if (packet_ring_it == packet_rings_.end() || !packet_ring_it->second || demuxer_it == demuxers_.end() || !demuxer_it->second) {
               walk_skip_reason = "no-packet-ring";
             } else if (packet_ring_it->second->l1_disabled()) {
               walk_skip_reason = "l1-disabled";
             } else if (single_decoder_mode_.enabled()) {
               walk_skip_reason = "single-decoder";
-            } else if (media_frame_detection_states_.at(right_side).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame) {
+            } else if (media_frame_detection_states_.at(follower_side).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame) {
               walk_skip_reason = "single-frame-media";
             } else {
               PacketRing& packet_ring = *packet_ring_it->second;
@@ -1832,16 +1842,16 @@ void VideoCompare::compare() {
                 walk_skip_reason = "no-keyframe-hit";
               } else {
                 const auto walk_t_start = std::chrono::steady_clock::now();
-                VideoDecoder& dec = *video_decoders_.at(right_side);
+                VideoDecoder& dec = *video_decoders_.at(follower_side);
 
-                // Enter barrier scoped to the right side; left pipeline keeps running.
-                enter_seek_barrier(right_only_pred);
+                // Enter barrier scoped to the follower side; master pipeline keeps running.
+                enter_seek_barrier(follower_only_pred);
 
                 try {
                   // Rebuild the filter graph so the post-walk pipeline restart
                   // can feed it again. The worker called close_src() during
                   // the barrier.
-                  video_filterers_.at(right_side)->reinit();
+                  video_filterers_.at(follower_side)->reinit();
 
                   dec.flush();
                   dec.reset_pts_state();
@@ -1951,33 +1961,33 @@ void VideoCompare::compare() {
                 }
 
                 // Post-walk restore: flush decoder state, forward-seek demuxer
-                // back to right.current.pts + 0.001, restart queues so the
+                // back to follower.current.pts + 0.001, restart queues so the
                 // workers resume normal operation.
                 dec.flush();
                 dec.reset_pts_state();
-                const float right_start_sec = static_cast<float>(demuxer_start_us) * static_cast<float>(AV_TIME_TO_SEC);
-                const float resume_sec = static_cast<float>(right_current->pts) * static_cast<float>(AV_TIME_TO_SEC) + right_start_sec + 0.001f;
+                const float follower_start_sec = static_cast<float>(demuxer_start_us) * static_cast<float>(AV_TIME_TO_SEC);
+                const float resume_sec = static_cast<float>(follower_current->pts) * static_cast<float>(AV_TIME_TO_SEC) + follower_start_sec + 0.001f;
                 const bool fwd_ok = demuxer.seek(resume_sec, false);
                 if (!fwd_ok) {
                   demuxer.seek(resume_sec, true);
                 }
                 for (auto& p : packet_queues_) {
-                  if (right_only_pred(p.first)) {
+                  if (follower_only_pred(p.first)) {
                     p.second->restart();
                   }
                 }
                 for (auto& p : decoded_frame_queues_) {
-                  if (right_only_pred(p.first)) {
+                  if (follower_only_pred(p.first)) {
                     p.second->restart();
                   }
                 }
                 for (auto& p : filtered_frame_queues_) {
-                  if (right_only_pred(p.first)) {
+                  if (follower_only_pred(p.first)) {
                     p.second->restart();
                   }
                 }
                 for (auto& p : converted_frame_queues_) {
-                  if (right_only_pred(p.first)) {
+                  if (follower_only_pred(p.first)) {
                     p.second->restart();
                   }
                 }
@@ -1995,31 +2005,31 @@ void VideoCompare::compare() {
             }
           }
 
-          // --- Build the left-probe fingerprint cache ---
-          // Probes sample at k · probe_step_pts around L.current on the left time
-          // axis. probe_step is the coarser of the two delta_pts values so each
-          // probe maps to a distinct frame on both sides.
-          const int64_t probe_step_pts = std::max(left_delta_pts, right_delta_pts);
+          // --- Build the master-probe fingerprint cache ---
+          // Probes sample at k · probe_step_pts around master.current on its
+          // own axis. probe_step is the coarser of the two sides' delta_pts
+          // values so each probe maps to a distinct frame on both sides.
+          const int64_t probe_step_pts = std::max(master_delta_pts, follower_delta_pts);
           const int64_t probe_tolerance = probe_step_pts / 2;
-          std::unordered_map<int64_t, std::vector<float>> left_probe_fps;
+          std::unordered_map<int64_t, std::vector<float>> master_probe_fps;
           for (int k = -kAutoAlignProbeRadius; k <= kAutoAlignProbeRadius; ++k) {
-            const int64_t t_k = left_current_pts + static_cast<int64_t>(k) * probe_step_pts;
-            const AVFrame* const probe_frame = find_nearest_in_ring(left.ring, t_k, probe_tolerance);
+            const int64_t t_k = master_current_pts + static_cast<int64_t>(k) * probe_step_pts;
+            const AVFrame* const probe_frame = find_nearest_in_ring(master_state.ring, t_k, probe_tolerance);
             if (probe_frame == nullptr) {
               continue;
             }
-            if (left_probe_fps.find(probe_frame->pts) != left_probe_fps.end()) {
+            if (master_probe_fps.find(probe_frame->pts) != master_probe_fps.end()) {
               continue;
             }
             std::vector<float> fp;
             if (!fingerprint_ring_frame(probe_frame, fp)) {
               continue;
             }
-            left_probe_fps.emplace(probe_frame->pts, std::move(fp));
+            master_probe_fps.emplace(probe_frame->pts, std::move(fp));
           }
 
-          // Find the nearest candidate (by PTS) to a target on the right time
-          // axis. Returns nullptr if no candidate is within tolerance_pts.
+          // Find the nearest candidate (by PTS) to a target on the follower
+          // time axis. Returns nullptr if no candidate is within tolerance_pts.
           const auto find_nearest_candidate = [&](int64_t target_pts, int64_t tolerance_pts) -> const Candidate* {
             const Candidate* best = nullptr;
             int64_t best_dist = std::numeric_limits<int64_t>::max();
@@ -2038,31 +2048,31 @@ void VideoCompare::compare() {
 
           // --- Score each candidate with windowed multi-probe correlation ---
           float best_score = -std::numeric_limits<float>::max();
-          int64_t best_pts = right_current->pts;
+          int64_t best_pts = follower_current->pts;
           float current_score = -std::numeric_limits<float>::max();
           bool current_scored = false;
           int valid_scored = 0;
 
           for (const auto& cand : candidates) {
-            const int64_t delta_t_hypothesis = cand.pts - left_current_pts;
+            const int64_t delta_t_hypothesis = cand.pts - master_current_pts;
             float sum = 0.0f;
             int n_valid = 0;
             for (int k = -kAutoAlignProbeRadius; k <= kAutoAlignProbeRadius; ++k) {
-              const int64_t l_target = left_current_pts + static_cast<int64_t>(k) * probe_step_pts;
-              const AVFrame* const l_probe = find_nearest_in_ring(left.ring, l_target, probe_tolerance);
-              if (l_probe == nullptr) {
+              const int64_t m_target = master_current_pts + static_cast<int64_t>(k) * probe_step_pts;
+              const AVFrame* const m_probe = find_nearest_in_ring(master_state.ring, m_target, probe_tolerance);
+              if (m_probe == nullptr) {
                 continue;
               }
-              const auto l_it = left_probe_fps.find(l_probe->pts);
-              if (l_it == left_probe_fps.end()) {
+              const auto m_it = master_probe_fps.find(m_probe->pts);
+              if (m_it == master_probe_fps.end()) {
                 continue;
               }
-              const int64_t r_target = l_target + delta_t_hypothesis;
-              const Candidate* const r_probe = find_nearest_candidate(r_target, probe_tolerance);
-              if (r_probe == nullptr) {
+              const int64_t f_target = m_target + delta_t_hypothesis;
+              const Candidate* const f_probe = find_nearest_candidate(f_target, probe_tolerance);
+              if (f_probe == nullptr) {
                 continue;
               }
-              sum += MetricsCalculator::structural_correlation(l_it->second, r_probe->fp);
+              sum += MetricsCalculator::structural_correlation(m_it->second, f_probe->fp);
               ++n_valid;
             }
             if (n_valid < 3) {
@@ -2070,22 +2080,22 @@ void VideoCompare::compare() {
             }
             const float score = sum / static_cast<float>(n_valid);
             ++valid_scored;
-            if (cand.pts == right_current->pts) {
+            if (cand.pts == follower_current->pts) {
               current_score = score;
               current_scored = true;
             }
             if (log_auto_align) {
               std::cerr << "[auto-align]"
-                        << " pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(cand.pts - left_current_pts) / 1000.0)
+                        << " pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(cand.pts - master_current_pts) / 1000.0)
                         << " probes=" << n_valid << "/" << (2 * kAutoAlignProbeRadius + 1)
                         << " score=" << string_sprintf("%.4f", score)
                         << std::endl;
             }
             // Pick higher score; on near-ties, prefer the offset closer to the
-            // current right position (minimises seek distance when current is
-            // already near-optimal).
+            // current follower position (minimises seek distance when current
+            // is already near-optimal).
             const bool strictly_better = score > best_score + kAutoAlignTieBreakBand;
-            const bool tied_and_closer = (std::abs(score - best_score) <= kAutoAlignTieBreakBand) && (std::abs(cand.pts - right_current->pts) < std::abs(best_pts - right_current->pts));
+            const bool tied_and_closer = (std::abs(score - best_score) <= kAutoAlignTieBreakBand) && (std::abs(cand.pts - follower_current->pts) < std::abs(best_pts - follower_current->pts));
             if (strictly_better || tied_and_closer) {
               best_score = score;
               best_pts = cand.pts;
@@ -2101,24 +2111,47 @@ void VideoCompare::compare() {
           } else if (best_score < kAutoAlignConfidenceFloor) {
             display_->set_pending_message(string_sprintf("Auto-align: low confidence (score %.3f) — no change", best_score));
             decision_kind = "low_confidence";
-          } else if (best_pts == right_current->pts || (current_scored && (best_score - current_score) < kAutoAlignImprovementEps)) {
+          } else if (best_pts == follower_current->pts || (current_scored && (best_score - current_score) < kAutoAlignImprovementEps)) {
             display_->set_pending_message(string_sprintf("Auto-align: already aligned (score %.3f)", best_score));
             decision_kind = "already";
           } else {
-            const int64_t shift_pts = best_pts - right_current->pts;
-            shift_applied = static_cast<int>(std::llround(static_cast<double>(shift_pts) / static_cast<double>(right_delta_pts)));
-            shift_right_frames += shift_applied;
-            // Stash everything the post-seek verification step needs. Left
-            // probes don't move during the right-only seek, so their PTS keys
-            // remain valid references into left.ring.
+            const int64_t shift_pts = best_pts - follower_current->pts;
+            shift_applied = static_cast<int>(std::llround(static_cast<double>(shift_pts) / static_cast<double>(follower_delta_pts)));
+
+            // Dispatch splits on follower side. Follower == RIGHT (no swap)
+            // folds into the shift_right_frames pathway so L0 pivot / L1
+            // re-decode can handle the common case with no extra seek work.
+            // Follower == LEFT (swap) can't use that pathway — shift_right_
+            // frames is denominated in RIGHT-side frames and L0 pivot is
+            // right-only — so we hand off to the absolute-seek path via the
+            // same plumbing shift-click uses (Phase 2), which scopes the
+            // seek to LEFT through should_seek(follower_side).
+            if (auto_align_follower_side.is_right()) {
+              shift_right_frames += shift_applied;
+            } else {
+              const double follower_start_sec = static_cast<double>(follower_state.start_time_);
+              const double target_abs_sec = static_cast<double>(best_pts) * static_cast<double>(AV_TIME_TO_SEC) + follower_start_sec;
+              // seek_relative in seek_from_start mode is a normalized [0,1]
+              // fraction of shortest_duration_. Convert our absolute target.
+              const double duration = (shortest_duration_ > 0.0) ? shortest_duration_ : 1.0;
+              const double fractional = (target_abs_sec - follower_start_sec) / duration;
+              seek_relative = static_cast<float>(fractional);
+              seek_from_start = true;
+              display_->set_right_only_seek(true, auto_align_follower_side);
+            }
+
+            // Stash everything the post-seek verification step needs. Master
+            // probes don't move during the seek, so their PTS keys remain
+            // valid references into master_state.ring.
             pending_auto_align_verification_ = {};
             pending_auto_align_verification_.active = true;
             pending_auto_align_verification_.expected_score = best_score;
             pending_auto_align_verification_.expected_shift_frames = shift_applied;
-            pending_auto_align_verification_.left_current_pts = left_current_pts;
+            pending_auto_align_verification_.follower_side = auto_align_follower_side;
+            pending_auto_align_verification_.master_current_pts = master_current_pts;
             pending_auto_align_verification_.probe_step_pts = probe_step_pts;
-            pending_auto_align_verification_.delta_t_pts = best_pts - left_current_pts;
-            pending_auto_align_verification_.left_probe_fingerprints = std::move(left_probe_fps);
+            pending_auto_align_verification_.delta_t_pts = best_pts - master_current_pts;
+            pending_auto_align_verification_.master_probe_fingerprints = std::move(master_probe_fps);
             display_->set_pending_message(string_sprintf("Auto-align: shift %+d frame%s (score %.3f)", shift_applied, std::abs(shift_applied) == 1 ? "" : "s", best_score));
             decision_kind = "seek";
           }
@@ -2130,13 +2163,14 @@ void VideoCompare::compare() {
             const char* walk_state = walk_attempted ? (walk_skip_reason ? "skipped" : "done") : "none";
             std::cerr << "[auto-align]"
                       << " mode=" << mode_label
+                      << " follower=" << auto_align_follower_side.to_string()
                       << " ring=" << ring_candidate_pts.size()
                       << " decoded=" << decoded_added
                       << " decode_ms=" << decode_ms
                       << " walk=" << walk_state
                       << " candidates=" << candidates.size()
                       << " scored=" << valid_scored
-                      << " best_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(best_pts - left_current_pts) / 1000.0)
+                      << " best_pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(best_pts - master_current_pts) / 1000.0)
                       << " best_score=" << best_score_s
                       << " current_score=" << current_score_s
                       << " shift_frames=" << shift_applied
@@ -3037,30 +3071,57 @@ void VideoCompare::compare() {
           // is LEFT; the sign of the update flips accordingly so the
           // invariant holds.
           if (right_only_seek && seek_from_start && right_delta > 0) {
+            // TimeShifter tracks "right raw PTS − left raw PTS". After a
+            // right-only seek we want the stationary side's raw PTS to line
+            // up with the follower's new position in common time. Derivation:
+            //   new_static_shift = right_raw − left_raw
+            //   For follower=RIGHT: right_raw = target (just seeked there),
+            //                       left_raw = left.pts_ (stationary).
+            //   For follower=LEFT : left_raw = target (just seeked there),
+            //                       right_raw = right_ptr->pts_ + old_shift
+            //                                   (stationary; recover raw from
+            //                                    stored common time + old
+            //                                    static_shift).
+            const int64_t old_static_shift_us = time_shifter_.static_shift();
             int64_t new_static_shift_us = 0;
             if (follower_side.is_right()) {
-              // No swap: right moved, left stayed.
               const float nrp = right_seek_positions[right_ptr->side_];
               const int64_t expected_right_raw_us = static_cast<int64_t>(static_cast<double>(nrp - right_ptr->start_time_) * AV_TIME_BASE);
               new_static_shift_us = expected_right_raw_us - left.pts_;
             } else {
-              // Under swap: left moved, right stayed. new_static_shift =
-              // right.pts_ - expected_left_raw (sign flipped vs above).
+              const int64_t right_raw_us = right_ptr->pts_ + old_static_shift_us;
               const int64_t expected_left_raw_us = static_cast<int64_t>(static_cast<double>(next_left_position - left.start_time_) * AV_TIME_BASE);
-              new_static_shift_us = right_ptr->pts_ - expected_left_raw_us;
+              new_static_shift_us = right_raw_us - expected_left_raw_us;
             }
             total_right_time_shifted = static_cast<int>((new_static_shift_us - time_shifter_.offset_av_time()) / right_delta);
             time_shifter_.set_frame_shift_accumulator(total_right_time_shifted, right_delta);
+
+            // The stationary side doesn't go through pop_and_reset, so its
+            // cached `pts_` and `effective_time_shift_` are about to be
+            // stale. Recompute them from the new static_shift; otherwise
+            // sync_frame_queue will see a phantom PTS divergence and drag
+            // the stationary side forward trying to "catch up".
+            if (follower_side.is_left()) {
+              // Right is stationary. Its raw PTS didn't change.
+              const int64_t right_raw_us = right_ptr->pts_ + old_static_shift_us;
+              right_ptr->effective_time_shift_ = time_shifter_.effective_shift(right_raw_us);
+              right_ptr->pts_ = right_raw_us - right_ptr->effective_time_shift_;
+            }
+            // (follower_side == RIGHT case: left is stationary and master;
+            // left.pts_ is already on the common axis so nothing to update.)
           }
 
           // Nudge near-zero residual shifts away from zero so the right demuxer lands
           // on a distinct frame. Exact integer-frame shifts pass through unchanged.
           time_shifter_.nudge_away_from_zero(right_ptr->delta_pts_);
 
-          // Reset all right videos after seek
+          // Reset each right video that participated in this seek. Under the
+          // swap-aware shift-click / auto-align paths the follower may be
+          // LEFT, in which case RIGHT didn't seek at all and its ring must
+          // not be cleared; `should_seek(side)` gates it correctly.
           for (auto& pair : side_states) {
             const Side& side = pair.first;
-            if (side.is_right()) {
+            if (side.is_right() && should_seek(side)) {
               SideState& right_state = pair.second;
 
               right_state.ring.clear();
@@ -3134,35 +3195,39 @@ void VideoCompare::compare() {
             return best;
           };
 
-          const FrameRing& right_ring_after = right_ptr->ring;
-          const AVFrame* const right_current_after = right_ring_after.current_frame();
-          const int64_t right_tolerance = v.probe_step_pts / 2;
+          // The follower side is the one we actually seeked; its FrameRing
+          // holds the landed frame we need to rescore against.
+          const SideState& follower_after = (v.follower_side.is_left()) ? left : *right_ptr;
+          const FrameRing& follower_ring_after = follower_after.ring;
+          const AVFrame* const follower_current_after = follower_ring_after.current_frame();
+          const int64_t follower_tolerance = v.probe_step_pts / 2;
 
-          // Rescore the same 5-probe window against the post-seek right ring.
-          // For each stored left probe fingerprint, find the right frame nearest
-          // to (left_probe_pts + delta_t_pts), fingerprint it fresh, correlate.
+          // Rescore the same 5-probe window against the post-seek follower
+          // ring. For each stored master-probe fingerprint, find the follower
+          // frame nearest to (master_probe_pts + delta_t_pts), fingerprint it
+          // fresh, correlate.
           float sum = 0.0f;
           int n_valid = 0;
-          for (const auto& pair : v.left_probe_fingerprints) {
-            const int64_t l_pts = pair.first;
-            const std::vector<float>& l_fp = pair.second;
-            const int64_t r_target = l_pts + v.delta_t_pts;
-            const AVFrame* const r_frame = find_nearest_in_ring(right_ring_after, r_target, right_tolerance);
-            if (r_frame == nullptr) {
+          for (const auto& pair : v.master_probe_fingerprints) {
+            const int64_t m_pts = pair.first;
+            const std::vector<float>& m_fp = pair.second;
+            const int64_t f_target = m_pts + v.delta_t_pts;
+            const AVFrame* const f_frame = find_nearest_in_ring(follower_ring_after, f_target, follower_tolerance);
+            if (f_frame == nullptr) {
               continue;
             }
-            std::vector<float> r_fp;
-            if (!fingerprint_ring_frame(r_frame, r_fp)) {
+            std::vector<float> f_fp;
+            if (!fingerprint_ring_frame(f_frame, f_fp)) {
               continue;
             }
-            sum += MetricsCalculator::structural_correlation(l_fp, r_fp);
+            sum += MetricsCalculator::structural_correlation(m_fp, f_fp);
             ++n_valid;
           }
 
           const float landed_score = (n_valid >= 3) ? (sum / static_cast<float>(n_valid)) : -std::numeric_limits<float>::max();
           constexpr float kAutoAlignVerificationSlack = 0.01f;
           const bool ok = (n_valid >= 3) && (landed_score >= v.expected_score - kAutoAlignVerificationSlack);
-          const int64_t landed_pts_delta = (right_current_after != nullptr) ? (right_current_after->pts - v.left_current_pts) : 0;
+          const int64_t landed_pts_delta = (follower_current_after != nullptr) ? (follower_current_after->pts - v.master_current_pts) : 0;
 
           if (!ok && n_valid >= 3) {
             display_->set_pending_message(string_sprintf("Auto-align: landed score %.3f (expected %.3f) — seek imprecision", landed_score, v.expected_score));

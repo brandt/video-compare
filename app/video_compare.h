@@ -155,17 +155,22 @@ using AutoAlignSwsKey = std::tuple<AVPixelFormat, int, int>;
 
 // State handed from the auto-align scoring pass to the post-seek verification
 // step. Populated when a seek is about to be dispatched; consumed (and cleared)
-// after the right ring's new current frame is in place.
+// after the follower ring's new current frame is in place.
 struct PendingAutoAlignVerification {
   bool active{false};
   float expected_score{0.0f};
   int expected_shift_frames{0};
-  int64_t left_current_pts{0};
+  // Side that participated in the seek. Normally RIGHT; becomes LEFT when
+  // the auto-align key was pressed while `swap_left_right_` was active.
+  // The rescore looks up the landed frame in this side's FrameRing.
+  Side follower_side{SideType::Right};
+  int64_t master_current_pts{0};
   int64_t probe_step_pts{0};
   int64_t delta_t_pts{0};
-  // Fingerprints of the participating left probe frames, keyed by the left
-  // frame's PTS. Left hasn't moved during the seek, so these stay valid.
-  std::unordered_map<int64_t, std::vector<float>> left_probe_fingerprints;
+  // Fingerprints of the participating master-side probe frames, keyed by
+  // the master frame's PTS. Master didn't move during the seek, so these
+  // stay valid.
+  std::unordered_map<int64_t, std::vector<float>> master_probe_fingerprints;
 };
 
 enum class MediaFrameCardinality { Unknown, SingleFrame, MultiFrame };

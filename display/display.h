@@ -481,6 +481,11 @@ class Display {
   // when the user shift-clicked while `swap_left_right_` was active — shift-
   // click follows the visual position, not the underlying pipeline identity.
   Side get_right_only_seek_follower() const;
+
+  // Set the right-only seek flag and its follower side. Used by the main
+  // loop to forward an auto-align-initiated right-only seek under swap into
+  // the same dispatch plumbing shift-click uses.
+  void set_right_only_seek(bool value, Side follower);
   float compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame);
   float get_playback_speed_factor() const;
   bool get_tick_playback() const;

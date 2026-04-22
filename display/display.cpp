@@ -609,6 +609,14 @@ Side Display::get_right_only_seek_follower() const {
   return playback_.right_only_seek_follower();
 }
 
+// Forward-setter used by the auto-align block when the follower is LEFT
+// (swap) and it needs to dispatch via the absolute-seek path rather than
+// shift_right_frames. Same plumbing the mouse-button handler uses for
+// shift-click.
+void Display::set_right_only_seek(bool value, Side follower) {
+  playback_.set_right_only_seek(value, follower);
+}
+
 // Public wrapper around MetricsCalculator::compute_frame_ssim for alignment consumers in video_compare.cpp.
 float Display::compute_frame_ssim(const AVFrame* left_frame, const AVFrame* right_frame) {
   return MetricsCalculator::compute_frame_ssim(left_frame, right_frame, requires_10_bpc());
