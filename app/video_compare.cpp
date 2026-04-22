@@ -1750,24 +1750,76 @@ void VideoCompare::compare() {
             return best;
           };
 
-          // A candidate: a follower-side PTS + its precomputed fingerprint.
-          // Seeded from follower.ring, then extended via a barriered PacketRing
-          // walk on the follower side when the ring doesn't span the window.
-          struct Candidate {
-            int64_t pts;
-            std::vector<float> fp;
-          };
+          using Candidate = AutoAlignCandidate;
 
-          // --- Build the follower-side candidate pool from its FrameRing ---
+          // Decide whether the previous press's cached candidates/probes are
+          // still valid for this press. The cache is populated only on a
+          // low-confidence outcome (see end of this block) and is invalidated
+          // the moment anything implies different intent:
+          //   - different mode key (sym vs back vs fwd)
+          //   - master or follower position moved between presses
+          //   - user swapped sides
+          //   - packet-ring coverage already exhausted last time
+          AutoAlignRetryCache& retry = auto_align_retry_cache_;
+          const bool retry_context_matches = retry.valid &&
+                                             retry.mode == auto_align_mode &&
+                                             retry.follower_side == auto_align_follower_side &&
+                                             retry.master_pts_at_cache == master_current->pts &&
+                                             retry.follower_pts_at_cache == follower_current->pts;
+          const bool packet_ring_already_exhausted = retry_context_matches && retry.packet_ring_exhausted;
+          const bool can_reuse_cache = retry_context_matches && !retry.packet_ring_exhausted;
+
+          // If the previous press already bailed on packet-ring exhaustion,
+          // don't even try to expand: we'd compute a wider window that also
+          // can't be covered. Warn and short-circuit.
+          if (packet_ring_already_exhausted) {
+            display_->set_pending_message("Auto-align: reached end of packet buffer");
+            if (log_auto_align) {
+              std::cerr << "[auto-align] decision=packet_ring_exhausted" << std::endl;
+            }
+            // Leave the cache in place so further repeats keep short-circuiting;
+            // any other input will reset it via the mismatch check above.
+          } else {
+            const int retry_count_this_press = can_reuse_cache ? retry.retry_count + 1 : 0;
+
+            // Expand the window by (retry_count + 1) × the mode's base width.
+            // Symmetric grows both bounds; directional grows the single open bound.
+            if (auto_align_mode == AutoAlignMode::Symmetric) {
+              const float half = kAutoAlignSymmetricHalfSec * static_cast<float>(retry_count_this_press + 1);
+              window_start_rel_sec = -half;
+              window_end_rel_sec = half;
+            } else if (auto_align_mode == AutoAlignMode::Backward) {
+              window_start_rel_sec = -kAutoAlignDirectionalSec * static_cast<float>(retry_count_this_press + 1);
+              window_end_rel_sec = 0.0f;
+            } else if (auto_align_mode == AutoAlignMode::Forward) {
+              window_start_rel_sec = 0.0f;
+              window_end_rel_sec = kAutoAlignDirectionalSec * static_cast<float>(retry_count_this_press + 1);
+            }
+
+          // --- Build the follower-side candidate pool ---
+          // Seed from cache (if reusing), then top up from the current ring.
+          // The ring contribution is deduped against whatever cache provided,
+          // so ring frames already fingerprinted last press are skipped.
           std::vector<Candidate> candidates;
+          std::unordered_set<int64_t> already_fingerprinted_pts;
+          int ring_contributed = 0;
+          if (can_reuse_cache) {
+            candidates = std::move(retry.candidates);
+            for (const auto& c : candidates) {
+              already_fingerprinted_pts.insert(c.pts);
+            }
+          }
           {
             const FrameRing& fring = follower_state.ring;
             const int min_off = -fring.history_size();
             const int max_off = fring.prefetch_size();
-            candidates.reserve(static_cast<size_t>(max_off - min_off + 1));
+            candidates.reserve(candidates.size() + static_cast<size_t>(max_off - min_off + 1));
             for (int off = min_off; off <= max_off; ++off) {
               const AVFrame* const f = fring.at(off);
               if (f == nullptr) {
+                continue;
+              }
+              if (already_fingerprinted_pts.count(f->pts) > 0) {
                 continue;
               }
               Candidate c;
@@ -1775,7 +1827,9 @@ void VideoCompare::compare() {
               if (!fingerprint_ring_frame(f, c.fp)) {
                 continue;
               }
+              already_fingerprinted_pts.insert(c.pts);
               candidates.push_back(std::move(c));
+              ++ring_contributed;
             }
           }
 
@@ -1786,20 +1840,19 @@ void VideoCompare::compare() {
           const int64_t window_start_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_start_rel_sec) * AV_TIME_BASE);
           const int64_t window_end_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_end_rel_sec) * AV_TIME_BASE);
 
-          // Figure out how much of the requested window the FrameRing already
-          // covers. If we have at least one frame at-or-before window_start_pts
-          // AND one at-or-after window_end_pts, the ring spans the window —
-          // skip the barriered PacketRing walk entirely (typical Symmetric press).
-          int64_t ring_min_pts = std::numeric_limits<int64_t>::max();
-          int64_t ring_max_pts = std::numeric_limits<int64_t>::min();
-          std::unordered_set<int64_t> ring_candidate_pts;
-          ring_candidate_pts.reserve(candidates.size());
+          // Figure out how much of the requested window the candidate pool
+          // already covers. If at least one candidate is at-or-before
+          // window_start_pts AND one is at-or-after window_end_pts, the pool
+          // spans the window — skip the barriered PacketRing walk entirely.
+          // Pool here includes both the current ring AND any cache carried
+          // forward from a prior low-confidence press.
+          int64_t pool_min_pts = std::numeric_limits<int64_t>::max();
+          int64_t pool_max_pts = std::numeric_limits<int64_t>::min();
           for (const auto& c : candidates) {
-            ring_min_pts = std::min(ring_min_pts, c.pts);
-            ring_max_pts = std::max(ring_max_pts, c.pts);
-            ring_candidate_pts.insert(c.pts);
+            pool_min_pts = std::min(pool_min_pts, c.pts);
+            pool_max_pts = std::max(pool_max_pts, c.pts);
           }
-          const bool ring_covers_window = !candidates.empty() && ring_min_pts <= window_start_pts && ring_max_pts >= window_end_pts;
+          const bool pool_covers_window = !candidates.empty() && pool_min_pts <= window_start_pts && pool_max_pts >= window_end_pts;
 
           // --- PacketRing walk (only when ring coverage is insufficient) ---
           // Mirrors the L1 re-decode pattern: barrier the follower pipeline,
@@ -1811,7 +1864,7 @@ void VideoCompare::compare() {
           int decode_ms = 0;
           bool walk_attempted = false;
           const char* walk_skip_reason = nullptr;
-          if (!ring_covers_window) {
+          if (!pool_covers_window) {
             walk_attempted = true;
             const Side follower_side = follower_state.side_;
             const auto follower_only_pred = [follower_side](const Side& s) { return s == follower_side; };
@@ -1885,8 +1938,8 @@ void VideoCompare::compare() {
                     if (frame_pts_us < window_start_pts) {
                       return false;  // before window; keep decoding forward
                     }
-                    if (ring_candidate_pts.count(frame_pts_us) > 0) {
-                      return false;  // already fingerprinted from the ring
+                    if (already_fingerprinted_pts.count(frame_pts_us) > 0) {
+                      return false;  // already fingerprinted from ring or cache
                     }
                     Candidate c;
                     c.pts = frame_pts_us;
@@ -1991,12 +2044,6 @@ void VideoCompare::compare() {
                     p.second->restart();
                   }
                 }
-                // Merge newly-decoded candidates into the dedup set so later
-                // scoring's nearest-candidate lookup uses the combined pool.
-                for (const auto& c : candidates) {
-                  ring_candidate_pts.insert(c.pts);
-                }
-
                 decode_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - walk_t_start).count());
               }
             }
@@ -2012,20 +2059,28 @@ void VideoCompare::compare() {
           const int64_t probe_step_pts = std::max(master_delta_pts, follower_delta_pts);
           const int64_t probe_tolerance = probe_step_pts / 2;
           std::unordered_map<int64_t, std::vector<float>> master_probe_fps;
-          for (int k = -kAutoAlignProbeRadius; k <= kAutoAlignProbeRadius; ++k) {
-            const int64_t t_k = master_current_pts + static_cast<int64_t>(k) * probe_step_pts;
-            const AVFrame* const probe_frame = find_nearest_in_ring(master_state.ring, t_k, probe_tolerance);
-            if (probe_frame == nullptr) {
-              continue;
+          // Reuse probe fingerprints from the previous press when the cache is
+          // valid: master hasn't moved, so the probe frames and their PTS keys
+          // are identical. Probe radius is constant, so no new probes appear
+          // under retry.
+          if (can_reuse_cache) {
+            master_probe_fps = std::move(retry.master_probe_fingerprints);
+          } else {
+            for (int k = -kAutoAlignProbeRadius; k <= kAutoAlignProbeRadius; ++k) {
+              const int64_t t_k = master_current_pts + static_cast<int64_t>(k) * probe_step_pts;
+              const AVFrame* const probe_frame = find_nearest_in_ring(master_state.ring, t_k, probe_tolerance);
+              if (probe_frame == nullptr) {
+                continue;
+              }
+              if (master_probe_fps.find(probe_frame->pts) != master_probe_fps.end()) {
+                continue;
+              }
+              std::vector<float> fp;
+              if (!fingerprint_ring_frame(probe_frame, fp)) {
+                continue;
+              }
+              master_probe_fps.emplace(probe_frame->pts, std::move(fp));
             }
-            if (master_probe_fps.find(probe_frame->pts) != master_probe_fps.end()) {
-              continue;
-            }
-            std::vector<float> fp;
-            if (!fingerprint_ring_frame(probe_frame, fp)) {
-              continue;
-            }
-            master_probe_fps.emplace(probe_frame->pts, std::move(fp));
           }
 
           // Find the nearest candidate (by PTS) to a target on the follower
@@ -2103,13 +2158,32 @@ void VideoCompare::compare() {
           }
 
           // --- Decide ---
+          // A compact human-readable window descriptor for HUD messages.
+          // Symmetric shows "±0.5s", directional shows "+1.0s" / "-1.0s".
+          const auto format_window_span = [&]() -> std::string {
+            if (auto_align_mode == AutoAlignMode::Symmetric) {
+              return string_sprintf("+/-%.1fs", static_cast<double>(window_end_rel_sec));
+            } else if (auto_align_mode == AutoAlignMode::Forward) {
+              return string_sprintf("+%.1fs", static_cast<double>(window_end_rel_sec));
+            } else {
+              return string_sprintf("-%.1fs", static_cast<double>(-window_start_rel_sec));
+            }
+          };
+
           std::string decision_kind;
           int shift_applied = 0;
           if (valid_scored == 0) {
             display_->set_pending_message("Auto-align: insufficient probes — no change");
             decision_kind = "no_frames";
           } else if (best_score < kAutoAlignConfidenceFloor) {
-            display_->set_pending_message(string_sprintf("Auto-align: low confidence (score %.3f) — no change", best_score));
+            // Hint the user that pressing again extends the window on the
+            // first low-confidence press; on subsequent retries, report the
+            // current span so they can see how far the search has walked.
+            if (retry_count_this_press == 0) {
+              display_->set_pending_message(string_sprintf("Auto-align: low confidence (score %.3f) — press again to extend", best_score));
+            } else {
+              display_->set_pending_message(string_sprintf("Auto-align: still low confidence (score %.3f, window %s)", best_score, format_window_span().c_str()));
+            }
             decision_kind = "low_confidence";
           } else if (best_pts == follower_current->pts || (current_scored && (best_score - current_score) < kAutoAlignImprovementEps)) {
             display_->set_pending_message(string_sprintf("Auto-align: already aligned (score %.3f)", best_score));
@@ -2164,7 +2238,8 @@ void VideoCompare::compare() {
             std::cerr << "[auto-align]"
                       << " mode=" << mode_label
                       << " follower=" << auto_align_follower_side.to_string()
-                      << " ring=" << ring_candidate_pts.size()
+                      << " retry=" << retry_count_this_press
+                      << " ring=" << ring_contributed
                       << " decoded=" << decoded_added
                       << " decode_ms=" << decode_ms
                       << " walk=" << walk_state
@@ -2178,6 +2253,30 @@ void VideoCompare::compare() {
                       << " window=[" << string_sprintf("%.3f", static_cast<double>(window_start_rel_sec)) << "," << string_sprintf("%.3f", static_cast<double>(window_end_rel_sec)) << "]s"
                       << std::endl;
           }
+
+          // --- Update retry cache ---
+          // Stash on low_confidence (so the next same-key press can extend
+          // the search window using what we've already fingerprinted).
+          // Clear on any outcome that implies the user got what they wanted
+          // (seek), the algorithm converged (already), or had nothing to
+          // work with (no_frames) — those fresh-start the next press.
+          if (decision_kind == "low_confidence") {
+            retry.valid = true;
+            retry.mode = auto_align_mode;
+            retry.follower_side = auto_align_follower_side;
+            retry.master_pts_at_cache = master_current->pts;
+            retry.follower_pts_at_cache = follower_current->pts;
+            retry.retry_count = retry_count_this_press;
+            // A walk was attempted but bailed → further expansion can't help.
+            // Freeze the cache so the next same-key press short-circuits with
+            // the "reached end of packet buffer" message.
+            retry.packet_ring_exhausted = (walk_attempted && walk_skip_reason != nullptr);
+            retry.candidates = std::move(candidates);
+            retry.master_probe_fingerprints = std::move(master_probe_fps);
+          } else {
+            retry = {};
+          }
+          }  // end of else (packet_ring_already_exhausted check)
         }
       }
 

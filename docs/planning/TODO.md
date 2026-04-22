@@ -6,6 +6,7 @@
 
 ## Done
 
+- FEATURE: Auto-align window extends on repeated low-confidence presses. When `` ` ``/`[`/`]` returns "low confidence", pressing the same key again grows the search window by the mode's base width (Symmetric: ±0.5s → ±1.0s → ±1.5s; Forward/Backward: +1s → +2s → +3s) and carries the previously-fingerprinted candidates and master probes forward so each retry only decodes the newly-exposed strip. Cache is cleared on any outcome that isn't low_confidence, on mode change, on follower-side swap, or when anything moves master/follower's current PTS between presses. Case C (packet-ring can't supply a keyframe at the expanded window start) short-circuits subsequent same-key presses with "Auto-align: reached end of packet buffer". Per-press state lives on `AutoAlignRetryCache` in [app/video_compare.h](../../app/video_compare.h). See [auto-align.md §12](../design/auto-align.md).
 - FEATURE: Add an option to crop out the black bars around videos in GPU mode.
 - FEATURE: Add an option to crop out the black bars around videos in SDL mode.
 - BUG: Seeking while paused is only going to the keyframe and not then playing to the exact frame.

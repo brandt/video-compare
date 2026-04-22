@@ -244,3 +244,22 @@ The L0 pivot is not symmetric. Under swap, even small LEFT shifts fall through t
 ```
 
 **Verification harness**: [tmp/swap_autoalign_test.py](../../tmp/swap_autoalign_test.py) drives the socket API to run an auto-align key press both with and without swap and asserts that the `follower=` field in the log follows the swap state. Reproducible in CI without a display.
+
+---
+
+## 12. Retry-to-extend window
+
+When a press returns `low_confidence`, pressing the same key again extends the search window rather than rescanning the same region. Each retry grows the window by the mode's base width — Symmetric adds ±0.5 s per retry, Backward/Forward each add 1.0 s per retry — so press N covers N × the base window. The candidate pool and master probe fingerprints from the previous press are carried forward, so each retry only decodes and fingerprints the *newly-exposed* strip of the window.
+
+State lives on `VideoCompare::auto_align_retry_cache_` (`AutoAlignRetryCache` in [`app/video_compare.h`](../../app/video_compare.h)). The cache is valid for the next press iff every one of these is still true when that press arrives:
+
+- Same mode as the cached press (mixing `]` and `[` resets).
+- Same follower side (swapping sides mid-retry resets).
+- Master-side and follower-side `current.pts` are unchanged (any intervening seek, `+`/`-` shift, playback advance, or shift-click resets by construction — no explicit reset hooks needed elsewhere).
+- A previous walk didn't already hit Case C (packet-ring coverage exhausted). When that has happened, the next matching press short-circuits with `"Auto-align: reached end of packet buffer"` and an `[auto-align] decision=packet_ring_exhausted` log line; further expansion won't help because the same keyframe lookup would also bail.
+
+On any other outcome (`seek`, `already`, `no_frames`), the cache is cleared so the next press starts fresh.
+
+The `retry=N` field in the `[auto-align] mode=…` summary line counts retries: `retry=0` is the first press (or a fresh press after invalidation), `retry=1` is the first retry, etc. When the cache is reused, `ring=` shows `0` (no new ring contribution — everything was already in the cache) and `decoded=` shows only the newly-decoded frames from the extended strip.
+
+HUD messages differ between the first low_confidence and subsequent retries: the first hints "press again to extend", subsequent retries show the current window span, so the user can tell how far the search has walked.

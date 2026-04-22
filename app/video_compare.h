@@ -153,6 +153,45 @@ using SwsContextUniquePtr = std::unique_ptr<SwsContext, SwsContextDeleter>;
 // kFingerprintSize x kFingerprintSize, so it's not part of the key.
 using AutoAlignSwsKey = std::tuple<AVPixelFormat, int, int>;
 
+// A single auto-align candidate: a follower-side PTS (microseconds, AV_TIME_BASE)
+// and its precomputed structural fingerprint. Lifetime is decoupled from the
+// underlying AVFrame so candidates can survive ring eviction and be reused
+// across retry presses.
+struct AutoAlignCandidate {
+  int64_t pts{0};
+  std::vector<float> fp;
+};
+
+// Cache carried across consecutive auto-align presses when the previous press
+// returned "low confidence". Lets the user extend the search window by pressing
+// the same key again without redoing the fingerprint work for the region that
+// was already covered. Cleared the moment the user does anything that implies
+// a different intent (different mode, master/follower position moved, a
+// successful seek, packet-ring coverage exhausted).
+struct AutoAlignRetryCache {
+  bool valid{false};
+  AutoAlignMode mode{AutoAlignMode::Symmetric};
+  // Guards: positions we saw on both sides when the cache was last populated.
+  // If either has moved when the next press arrives, something else intervened
+  // and the cache is stale.
+  int64_t master_pts_at_cache{0};
+  int64_t follower_pts_at_cache{0};
+  // 0 on the first press that populated the cache; +1 per low-confidence retry.
+  // The window expands as (retry_count + 1) × the mode's base width.
+  int retry_count{0};
+  // Follower side that participated. If the user swaps mid-retry the cache is
+  // effectively invalidated (the swap changes which side is the follower).
+  Side follower_side{SideType::Right};
+  // Set when a packet-ring walk was attempted but bailed (keyframe not in
+  // coverage). Expanding further won't help — short-circuit subsequent presses
+  // with a HUD warning instead of silently freezing.
+  bool packet_ring_exhausted{false};
+  // The candidate pool and master-side probe fingerprints, carried forward so
+  // each retry only decodes+fingerprints the newly-exposed region.
+  std::vector<AutoAlignCandidate> candidates;
+  std::unordered_map<int64_t, std::vector<float>> master_probe_fingerprints;
+};
+
 // State handed from the auto-align scoring pass to the post-seek verification
 // step. Populated when a seek is about to be dispatched; consumed (and cleared)
 // after the follower ring's new current frame is in place.
@@ -382,6 +421,13 @@ class VideoCompare {
 
   // Auto-align: verification state carried across the seek dispatch.
   PendingAutoAlignVerification pending_auto_align_verification_;
+
+  // Auto-align: cache carried across consecutive same-mode presses that
+  // returned "low confidence". Each retry extends the search window by the
+  // mode's base width without redoing fingerprint work for the previous span.
+  // Invalidated the moment anything else happens (see can_reuse check in
+  // compare()).
+  AutoAlignRetryCache auto_align_retry_cache_;
 
   // Thread-safe playback-position snapshot. Written by compare() near the end
   // of each iteration under playback_state_snapshot_mutex_; read by external
