@@ -79,7 +79,7 @@ else
 endif
 
 # Source layout: all first-party C/C++ lives under src/. Tests live under
-# tests/ and are built by the `check` target (see below), never pulled into
+# tests/ and are built by the `test-unit` target (see below), never pulled into
 # the main binary.
 CXXFLAGS += -Isrc
 
@@ -108,7 +108,7 @@ C_INCLUDES = $(filter -I%,$(CXXFLAGS))
 %.o: %.c
 	$(CC) $(CFLAGS) $(C_INCLUDES) -MMD -MP -MF $(@:.o=.d) -c -o $@ $<
 
-test: $(target)
+run: $(target)
 	./$(target) -w 800x screenshot_1.jpg screenshot_2.jpg
 
 # ---------------------------------------------------------------------------
@@ -151,14 +151,25 @@ $(test_target): $(test_obj) $(test_extra_objs)
 
 -include $(test_dep)
 
-.PHONY: check
-check: $(test_target)
+.PHONY: test-unit
+test-unit: $(test_target)
 	./$(test_target)
+
+.PHONY: test-integration
+test-integration: $(target)
+	pytest tests/integration/ 
+
+.PHONY: check
+check: test-unit test-integration
+
+.PHONY: test
+test: check
 
 .PHONY: clean
 clean:
 	$(RM) $(obj) $(target) $(dep) $(test_obj) $(test_dep) $(test_target)
 
+.PHONY: install
 install: $(target)
 	install -s video-compare $(BINDIR)
 
