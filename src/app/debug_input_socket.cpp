@@ -300,6 +300,42 @@ json query_field(const std::string& field, const Session& session) {
     const PlaybackStateSnapshot snap = session.video_compare->get_playback_state_snapshot();
     return snap.effective_time_shift_us / 1'000'000.0;
   }
+  if (field == "left_raw_pts") {
+    // Raw (pre-shift) presentation timestamp in the file's own axis.
+    // For LEFT, left.pts_ IS the raw pts (no shift applied), so this just
+    // exposes it directly. Useful for frame-exact integration test asserts.
+    const PlaybackStateSnapshot snap = session.video_compare->get_playback_state_snapshot();
+    return snap.left_pts_us / 1'000'000.0;
+  }
+  if (field == "right_raw_pts") {
+    // Raw right-side PTS reconstructed from the common-time field. The app
+    // stores right.pts_ = right_raw - effective_shift, so inverting recovers
+    // the encoded file's actual PTS (the quantity tests want to assert on).
+    const PlaybackStateSnapshot snap = session.video_compare->get_playback_state_snapshot();
+    return (snap.right_pts_us + snap.effective_time_shift_us) / 1'000'000.0;
+  }
+  if (field == "frame_number") {
+    // compare() loop iteration at last snapshot publish. Non-zero proves
+    // the main loop produced at least one rendered frame (guards the
+    // --start-paused "black screen at launch" regression).
+    const PlaybackStateSnapshot snap = session.video_compare->get_playback_state_snapshot();
+    return static_cast<int64_t>(snap.frame_number);
+  }
+  if (field == "initialized") {
+    // True once compare() has published real state (frames decoded, pts
+    // known, etc.). False during the startup window before the first
+    // iteration completes.
+    const PlaybackStateSnapshot snap = session.video_compare->get_playback_state_snapshot();
+    return snap.initialized;
+  }
+  if (field == "left_decoded_picture_number") {
+    const PlaybackStateSnapshot snap = session.video_compare->get_playback_state_snapshot();
+    return static_cast<int64_t>(snap.left_decoded_picture_number);
+  }
+  if (field == "right_decoded_picture_number") {
+    const PlaybackStateSnapshot snap = session.video_compare->get_playback_state_snapshot();
+    return static_cast<int64_t>(snap.right_decoded_picture_number);
+  }
   if (field == "left_path") {
     return session.video_compare->get_left_path();
   }
@@ -338,6 +374,8 @@ json handle_get(const json& req, const Session& session) {
 json handle_status(const Session& session) {
   static constexpr const char* kAllFields[] = {
       "play_state",    "left_pts",      "right_pts",    "effective_time_shift",
+      "left_raw_pts",  "right_raw_pts", "frame_number", "initialized",
+      "left_decoded_picture_number", "right_decoded_picture_number",
       "left_path",     "right_path",    "window_size",  "drawable_size",
       "swap",          "uptime",        "script_running",
   };
