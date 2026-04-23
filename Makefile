@@ -78,8 +78,13 @@ else
   LDLIBS += -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lSDL3_ttf -lSDL3
 endif
 
-cpp_src = $(wildcard *.cpp) $(wildcard */*.cpp) $(wildcard */*/*.cpp)
-c_src = $(wildcard *.c) $(wildcard */*.c)
+# Source layout: all first-party C/C++ lives under src/. Tests live under
+# tests/ and are built by the `check` target (see below), never pulled into
+# the main binary.
+CXXFLAGS += -Isrc
+
+cpp_src = $(wildcard src/*.cpp) $(wildcard src/*/*.cpp) $(wildcard src/*/*/*.cpp)
+c_src = $(wildcard src/*.c) $(wildcard src/*/*.c)
 obj = $(cpp_src:.cpp=.o) $(c_src:.c=.o)
 dep = $(obj:.o=.d)
 target = video-compare
@@ -106,9 +111,53 @@ C_INCLUDES = $(filter -I%,$(CXXFLAGS))
 test: $(target)
 	./$(target) -w 800x screenshot_1.jpg screenshot_2.jpg
 
+# ---------------------------------------------------------------------------
+# Unit tests (doctest)
+#
+# One translation unit per test file under tests/unit/. All TUs link against
+# a single `doctest_main.cpp` that provides main(). Each test file picks up
+# whatever subset of src/ it needs by listing its dependencies in a per-file
+# _OBJS variable (see examples below).
+# ---------------------------------------------------------------------------
+test_cpp_src = $(wildcard tests/unit/*.cpp)
+test_obj = $(test_cpp_src:.cpp=.o)
+test_dep = $(test_obj:.o=.d)
+test_target = video-compare-tests
+
+# Per-test extra object files (reused from the main build's compiled src/).
+# Header-only pieces (e.g., TimeShifter) need nothing; tests against .cpp
+# modules should list their deps here.
+time_shifter_test_OBJS =
+structural_correlation_test_OBJS = src/analysis/metrics/structural_fingerprint.o
+fingerprint_test_OBJS = src/analysis/metrics/structural_fingerprint.o
+frame_ring_test_OBJS =
+packet_ring_test_OBJS = src/media/buffering/packet_ring.o
+
+# De-dupe before linking — sort removes duplicates.
+test_extra_objs = $(sort $(time_shifter_test_OBJS) \
+                         $(structural_correlation_test_OBJS) \
+                         $(fingerprint_test_OBJS) \
+                         $(frame_ring_test_OBJS) \
+                         $(packet_ring_test_OBJS))
+
+# libavutil suffices for the arithmetic the TimeShifter/FrameRing tests need;
+# richer tests may override test_LDLIBS at link time. Inherit the same -L
+# flags as the main build so libavutil resolves on Homebrew/keg-only layouts.
+test_LDFLAGS = $(filter -L%,$(LDLIBS))
+test_LDLIBS = $(test_LDFLAGS) -lavutil -lavcodec -lswscale -pthread
+
+$(test_target): $(test_obj) $(test_extra_objs)
+	$(CXX) -o $@ $^ $(test_LDLIBS)
+
+-include $(test_dep)
+
+.PHONY: check
+check: $(test_target)
+	./$(test_target)
+
 .PHONY: clean
 clean:
-	$(RM) $(obj) $(target) $(dep)
+	$(RM) $(obj) $(target) $(dep) $(test_obj) $(test_dep) $(test_target)
 
 install: $(target)
 	install -s video-compare $(BINDIR)
