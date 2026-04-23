@@ -168,6 +168,15 @@ test: check
 .PHONY: clean
 clean:
 	$(RM) $(obj) $(target) $(dep) $(test_obj) $(test_dep) $(test_target)
+	$(RM) -r tests/integration/_artifacts
+
+.PHONY: distclean
+distclean: clean
+
+# Also remove test fixtures cache.
+.PHONY: realclean
+realclean: distclean
+	$(RM) -r tests/fixtures/_cache
 
 .PHONY: install
 install: $(target)
