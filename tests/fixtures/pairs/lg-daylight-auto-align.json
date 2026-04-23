@@ -1,0 +1,22 @@
+{
+  "pair_id": "lg-daylight-auto-align",
+  "description": "LEFT=SDR h264 trimmed to source_frame=124 (no intro). RIGHT=HDR VP9 from source_frame=0 (has 124 frames of intro content before the aligned region). At both sides raw=0, LEFT shows source[124] and RIGHT shows source[0] — misaligned. To align, RIGHT must advance by 124 frames (~2069 ms at 59.94 fps) so both show source[124]. Target effective_time_shift ≈ +2069 ms.",
+
+  "left":  "lg-daylight-sdr-h264-2160p-trim124",
+  "right": "lg-daylight-sdr-vp9-2160p-base",
+
+  "check_points": [
+    {
+      "source_frame": 124,
+      "rationale": "First aligned frame: left raw=0 (left frame 0) matches right raw=2069000us (right frame 124)."
+    },
+    {
+      "source_frame": 300,
+      "rationale": "Mid-content: aligned frame sits in each side's history/prefetch area when the other is at the press point."
+    },
+    {
+      "source_frame": 500,
+      "rationale": "Further into content: tests that alignment holds past the first GOP boundary in both encodings."
+    }
+  ]
+}

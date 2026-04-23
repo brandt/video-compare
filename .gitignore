@@ -32,3 +32,14 @@ video-compare
 vc_script.txt
 *.log
 tmp
+_cache
+__pycache__
+
+# Test binary (doctest)
+video-compare-tests
+
+# Integration-test artifacts (failure logs are gitignored; _cache already matches above)
+tests/integration/_artifacts/
+
+# pytest state
+.pytest_cache/
