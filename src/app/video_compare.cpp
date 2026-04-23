@@ -1665,7 +1665,13 @@ void VideoCompare::compare() {
         constexpr float kAutoAlignDirectionalSec = 1.0f;      // full one-sided window for SDLK_LEFTBRACKET/SDLK_RIGHTBRACKET
         constexpr float kAutoAlignConfidenceFloor = 0.60f;    // below this, don't seek
         constexpr float kAutoAlignImprovementEps = 0.005f;    // smaller = "already aligned"
-        constexpr float kAutoAlignTieBreakBand = 0.002f;      // scores within this → tie-break on |Δt|
+        // Scores within this → tie-break on smaller |Δt|. Kept tight because
+        // for content with a sharp structural peak (our 1.0-scoring true
+        // alignment), a 0.002 band let a neighboring candidate with score
+        // 0.9982 beat the 1.0000 peak by being 2 frames closer to the
+        // current follower position. 0.0005 is still well above the 4-decimal
+        // reporting noise floor but won't override a genuine peak.
+        constexpr float kAutoAlignTieBreakBand = 0.0005f;
         constexpr int kAutoAlignProbeRadius = 2;              // probes at k ∈ {-2..+2}
         const bool log_auto_align = env_flag_enabled("VIDEO_COMPARE_LOG_AUTO_ALIGN");
 
@@ -1863,8 +1869,14 @@ void VideoCompare::compare() {
           const int64_t approx_probe_step_pts = std::max(master_delta_pts, follower_delta_pts);
           const int64_t probe_edge_slack_pts = static_cast<int64_t>(kAutoAlignProbeRadius + 1) * approx_probe_step_pts;
           const int64_t follower_current_pts = follower_current->pts;
-          const int64_t ring_forward_slack_pts = static_cast<int64_t>(follower_state.ring.prefetch_size()) * follower_delta_pts;
-          const int64_t ring_backward_slack_pts = static_cast<int64_t>(follower_state.ring.history_size()) * follower_delta_pts;
+          // Use the ring's CAPACITY (not current count) for slack. After a
+          // fresh L2 seek the ring's prefetch is empty; using prefetch_size()
+          // there makes the extension collapse to just probe_edge_slack,
+          // truncating the walk before it decodes past `follower_current`.
+          // Capacity-based slack guarantees the walk covers what the ring
+          // would hold once intake_prefetch refills it.
+          const int64_t ring_forward_slack_pts = static_cast<int64_t>(follower_state.ring.prefetch_capacity()) * follower_delta_pts;
+          const int64_t ring_backward_slack_pts = static_cast<int64_t>(follower_state.ring.history_capacity()) * follower_delta_pts;
           if (auto_align_mode == AutoAlignMode::Forward || auto_align_mode == AutoAlignMode::Symmetric) {
             window_end_pts = std::max(window_end_pts, follower_current_pts + ring_forward_slack_pts + probe_edge_slack_pts);
           }
@@ -3238,7 +3250,13 @@ void VideoCompare::compare() {
           //   - Paused user-initiated scrubs (timeline click, arrow keys,
           //     timestamp paste): drain so the single paused frame shown after
           //     the click is exactly the clicked frame.
-          const bool drain_to_target = !pure_right_frame_shift && !display_->get_play();
+          //   - Auto-align retries: though the shift goes through
+          //     shift_right_frames (so pure_right_frame_shift is true), the
+          //     user expects a precise landing — there's no key-mashing
+          //     responsiveness concern. Force-drain so the landed frame is
+          //     exactly the best_pts the algorithm chose.
+          const bool drain_to_target =
+              (!pure_right_frame_shift || pending_auto_align_verification_.active) && !display_->get_play();
 
           if (should_seek(LEFT)) {
             left.ring.clear();

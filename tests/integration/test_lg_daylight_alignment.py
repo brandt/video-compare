@@ -35,7 +35,7 @@ def test_three_press_decision_sequence(video_compare_binary, lg_daylight_pair):
 
         for _ in range(3):
             vc.key("]")
-            vc.sleep(2.5)
+            vc.sleep(4.0)  # L2 drain on 2160p can take 1–3 s; give it room.
 
         summaries = vc.auto_align_summaries()
         assert len(summaries) >= 3, (
@@ -90,27 +90,29 @@ def test_press_2_finds_high_structural_match(video_compare_binary, lg_daylight_p
         )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "L2 seek path lands ~20 frames short of target on this fixture pair. "
-        "Separate bug from the L1/walk post-restore fix — same-looking code "
-        "path but different demuxer-seek semantics. Keeping this test as a "
-        "visible TODO; the mechanism tests above already verify press 2 "
-        "found the true-alignment content."
-    ),
-    strict=True,
-)
 def test_three_press_reaches_target_frame_exact(video_compare_binary, lg_daylight_pair):
     """Frame-exact endgame: after three `]` presses, effective_time_shift
     must equal the pair's declared target (right_raw - left_raw for
-    source_frame=124) to within 2 ms."""
+    source_frame=124) to within 2 ms.
+
+    This guards four regressions together:
+      - Probe coverage at ring edges (window extension using prefetch_capacity).
+      - L2-path drain-to-target skipped under pure_right_frame_shift — fixed
+        by exempting auto-align via pending_auto_align_verification_.active.
+      - Tie-break band of 0.002 let a near-peak candidate beat the true 1.000
+        peak when it was closer to current — tightened to 0.0005.
+      - static_shift frame-count drift — set_static_shift_us override in the
+        post-seek verification block.
+    """
     pair = lg_daylight_pair
 
     with VideoCompareSession(pair) as vc:
         vc.sleep(2.5)
         for _ in range(3):
             vc.key("]")
-            vc.sleep(2.5)
+            # L2-path drain-to-target for a 120-frame shift can take 1–3 s at
+            # 4K on 2160p HEVC/VP9; give plenty of room before the next press.
+            vc.sleep(4.0)
 
         expected_us = pair.expected_effective_time_shift_us(source_frame=124)
         expected_s = expected_us / 1_000_000.0
