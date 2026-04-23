@@ -3435,14 +3435,16 @@ void VideoCompare::compare() {
           if (!ok && n_valid >= 3) {
             display_->set_pending_message(string_sprintf("Auto-align: landed score %.3f (expected %.3f) — seek imprecision", landed_score, v.expected_score));
           }
-          // When the seek landed ok and the follower is RIGHT (standard, non-
-          // swap case), override TimeShifter::static_shift to the EXACT raw
-          // right-vs-left delta. Without this override, static_shift is
-          // `total_frames × avg_delta` and drifts by a few ms under variable
-          // frame durations (e.g., 59.98 fps VP9 with 16/17 ms alternating
-          // deltas truncated to an integer average). Auto-align knows the
-          // landed frame exactly, so we can close the gap cleanly.
-          if (ok && v.follower_side.is_right() && follower_current_after != nullptr) {
+          // When the follower is RIGHT (standard, non-swap case), override
+          // TimeShifter::static_shift to the EXACT raw right-vs-left delta.
+          // Without this override, static_shift is `total_frames × avg_delta`
+          // and drifts by a few ms under variable frame durations (e.g.,
+          // 59.98 fps VP9 with 16/17 ms alternating deltas truncated to an
+          // integer average). We use the ACTUAL landed pts regardless of
+          // verification probe count — verification may not find enough
+          // probe matches in a small-capacity ring post-pivot, but the
+          // landed pts is ground truth either way.
+          if (v.follower_side.is_right() && follower_current_after != nullptr) {
             const AVFrame* const left_current = left.ring.current_frame();
             if (left_current != nullptr) {
               time_shifter_.set_static_shift_us(follower_current_after->pts - left_current->pts);
