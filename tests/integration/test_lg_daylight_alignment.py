@@ -29,13 +29,13 @@ def test_three_press_decision_sequence(video_compare_binary, lg_daylight_pair):
     pair = lg_daylight_pair
 
     with VideoCompareSession(pair) as vc:
-        vc.sleep(2.5)
+        vc.seek_wait(timeout=15.0)
         assert vc.get("play_state") == "PAUSE"
         assert vc.get("effective_time_shift") == 0.0
 
         for _ in range(3):
             vc.key("]")
-            vc.sleep(4.0)  # L2 drain on 2160p can take 1–3 s; give it room.
+            vc.seek_wait()
 
         summaries = vc.auto_align_summaries()
         assert len(summaries) >= 3, (
@@ -73,10 +73,10 @@ def test_press_2_finds_high_structural_match(video_compare_binary, lg_daylight_p
     pair = lg_daylight_pair
 
     with VideoCompareSession(pair) as vc:
-        vc.sleep(2.5)
+        vc.seek_wait(timeout=15.0)
         for _ in range(2):
             vc.key("]")
-            vc.sleep(2.5)
+            vc.seek_wait()
 
         summaries = vc.auto_align_summaries()
         assert len(summaries) >= 2
@@ -107,12 +107,13 @@ def test_three_press_reaches_target_frame_exact(video_compare_binary, lg_dayligh
     pair = lg_daylight_pair
 
     with VideoCompareSession(pair) as vc:
-        vc.sleep(2.5)
+        # Initial startup wait — the pipeline needs at least one frame
+        # decoded + rendered before --start-paused flips to PAUSE. Use
+        # seek_wait with a longer timeout to absorb that.
+        vc.seek_wait(timeout=15.0)
         for _ in range(3):
             vc.key("]")
-            # L2-path drain-to-target for a 120-frame shift can take 1–3 s at
-            # 4K on 2160p HEVC/VP9; give plenty of room before the next press.
-            vc.sleep(4.0)
+            vc.seek_wait()
 
         expected_us = pair.expected_effective_time_shift_us(source_frame=124)
         expected_s = expected_us / 1_000_000.0

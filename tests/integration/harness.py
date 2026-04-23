@@ -230,6 +230,37 @@ class VideoCompareSession:
             time.sleep(poll_interval)
         raise TimeoutError(f"predicate didn't become true within {timeout} s")
 
+    def seek_wait(self, timeout: float = 10.0, min_iterations: int = 2) -> None:
+        """Block until the most recently dispatched input has been processed
+        and any resulting seek has landed.
+
+        Mechanism:
+          - record `frame_number` (main-loop iteration counter published with
+            every snapshot);
+          - poll until it has advanced by >= `min_iterations`;
+          - additionally require `play_state == "PAUSE"` so we don't exit
+            while a multi-iteration seek is still in flight.
+
+        Why 2 iterations? SDL key events are consumed one iteration, then
+        the auto-align + seek dispatch block runs the NEXT iteration. Two
+        increments guarantees both have happened. Under a multi-iteration
+        L2 seek (4K/sparse keyframes) the play_state=PAUSE guard blocks
+        further until the sync returns.
+
+        Use this in place of `vc.sleep(N)` whenever N was a fudge tuned to
+        the slowest expected fixture — `seek_wait` is deterministic and
+        hardware-neutral for correctness tests.
+        """
+        start_frame = self.get("frame_number")
+
+        def settled() -> bool:
+            cur_frame = self.get("frame_number")
+            if cur_frame - start_frame < min_iterations:
+                return False
+            return self.get("play_state") == "PAUSE"
+
+        self.wait_for(settled, timeout=timeout, poll_interval=0.02)
+
     # ---- log access ----
     @property
     def log_path(self) -> pathlib.Path:

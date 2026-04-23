@@ -145,6 +145,68 @@ RECIPES: list[Recipe] = [
             "-an",            # drop audio
         ],
     ),
+    # 480p variants — same shape as the 2160p pair above, downscaled for
+    # fast integration-test iteration (L2 drain drops from ~1.3 s to ~100 ms,
+    # fixture download from 75 MB to a few MB). Used by default for logic
+    # tests; the 2160p pair above is reserved for resolution-mismatch and
+    # performance-regression coverage.
+    Recipe(
+        fixture_id="lg-daylight-sdr-h264-480p-trim124",
+        description=(
+            "SDR x264 480p, trimmed to start at source frame 124. 480p downscale of "
+            "lg-daylight-sdr-h264-2160p-trim124 for lightweight logic tests."
+        ),
+        source_id="lg-daylight-sdr-vp9-2160p-59.94",
+        extension="mp4",
+        first_source_frame=124,
+        encoded_codec="h264",
+        encoded_pixel_format="yuv420p",
+        encoded_keyframe_interval_frames=250,
+        duration_seconds=15.0,
+        extra_args=[
+            "-r", "60000/1001",
+            "-vf", "scale=854:480",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-g", "250",
+            "-keyint_min", "250",
+            "-bf", "2",
+            "-sc_threshold", "0",
+            "-video_track_timescale", "1000",
+            "-an",
+        ],
+    ),
+    Recipe(
+        fixture_id="lg-daylight-sdr-vp9-480p-base",
+        description=(
+            "SDR VP9 480p 8-bit, plays source[0..] from raw_pts=0. 480p downscale "
+            "of lg-daylight-sdr-vp9-2160p-base for lightweight logic tests."
+        ),
+        source_id="lg-daylight-sdr-vp9-2160p-59.94",
+        extension="webm",
+        first_source_frame=0,
+        encoded_codec="vp9",
+        encoded_pixel_format="yuv420p",
+        encoded_keyframe_interval_frames=250,
+        duration_seconds=15.0,
+        extra_args=[
+            "-r", "60000/1001",
+            "-vf", "scale=854:480",
+            "-c:v", "libvpx-vp9",
+            "-b:v", "0",
+            "-crf", "30",
+            "-pix_fmt", "yuv420p",
+            "-g", "250",
+            "-keyint_min", "250",
+            "-auto-alt-ref", "0",
+            "-deadline", "good",
+            "-cpu-used", "4",
+            "-video_track_timescale", "1000",
+            "-an",
+        ],
+    ),
     Recipe(
         fixture_id="lg-daylight-sdr-vp9-2160p-base",
         description=(
