@@ -557,6 +557,56 @@ double VideoCompare::get_uptime_seconds() const {
 }
 
 void VideoCompare::operator()() {
+  // Startup seek: with a substantial `-t SEC` offset, the lagging side must
+  // decode from its raw start up to the offset before the compare sync loop
+  // can begin advancing the leading side. A pre-thread-launch demuxer seek
+  // skips ahead to the keyframe at-or-before the target and lets sync drain
+  // the remaining in-GOP frames — bounding the startup cost to one GOP
+  // instead of the full offset span.
+  //
+  //   offset > 0: right side plays `offset` behind left in common time;
+  //               seek the right demuxer(s) forward.
+  //   offset < 0: right side plays `|offset|` ahead of left in common time;
+  //               seek the left demuxer forward.
+  //
+  // Target derivation (offset > 0 case, analogous for the other):
+  //   to_common(right_raw) = 0
+  //     ⇔ right_raw * mult.den/mult.num - offset = 0
+  //     ⇔ right_raw = offset * mult.num/mult.den
+  const int64_t offset_us = time_shifter_.offset_av_time();
+  if (std::abs(offset_us) >= NEAR_ZERO_TIME_SHIFT_THRESHOLD) {
+    const AVRational mult = time_shifter_.multiplier();
+    const int64_t raw_target_us = (offset_us > 0) ? av_rescale(offset_us, mult.num, mult.den) : -offset_us;
+
+    auto seek_lagging = [&](const Side& side) {
+      const auto it = demuxers_.find(side);
+      if (it == demuxers_.end()) {
+        return;
+      }
+      const int64_t duration_us = it->second->duration();
+      if (duration_us > 0 && raw_target_us >= duration_us) {
+        // Target is past EOF; let the usual pipeline surface that (the sync
+        // loop stalls on the other side, same as before this change).
+        return;
+      }
+      const int64_t container_target_us = raw_target_us + it->second->start_time();
+      const float target_sec = static_cast<float>(container_target_us) * AV_TIME_TO_SEC;
+      if (it->second->seek(target_sec, true)) {
+        sa_log_info(side, string_sprintf("Startup seek to %s to skip `-t` catch-up decode", format_position(raw_target_us * AV_TIME_TO_SEC, true).c_str()));
+      }
+    };
+
+    if (offset_us > 0) {
+      for (auto& pair : demuxers_) {
+        if (pair.first.is_right()) {
+          seek_lagging(pair.first);
+        }
+      }
+    } else {
+      seek_lagging(LEFT);
+    }
+  }
+
   // Launch all threads
   for (const auto& pair : demuxers_) {
     const Side& side = pair.first;
@@ -2839,7 +2889,10 @@ void VideoCompare::compare() {
             float eff = seek_relative;
             if (right_is_single_frame && !seek_from_start) eff = ss.delta_pts_ * AV_TIME_TO_SEC;
             float pos = (seek_from_start && !right_is_single_frame) ? (shortest_duration_ * eff + ss.start_time_) : (right_position + eff);
-            const float min_right_position = (ss.first_pts_ > INT64_MIN) ? (ss.first_pts_ * AV_TIME_TO_SEC + ss.start_time_) : ss.start_time_;
+            // Clamp pre-shift: `pos` here is in the common (pre-static/dynamic-shift)
+            // axis; first_pts_ is a raw right-side pts. to_common() projects
+            // first_pts_ onto the common axis so the min is apples-to-apples.
+            const float min_right_position = (ss.first_pts_ > INT64_MIN) ? (time_shifter_.to_common(ss.first_pts_) * AV_TIME_TO_SEC + ss.start_time_) : ss.start_time_;
             pos = std::max(pos, min_right_position);
             pos += time_shifter_.static_shift() * AV_TIME_TO_SEC;
             pos += static_cast<float>(time_shifter_.dynamic_shift(static_cast<int64_t>((pos - ss.start_time_) / AV_TIME_TO_SEC), false)) * AV_TIME_TO_SEC;
@@ -3326,7 +3379,14 @@ void VideoCompare::compare() {
 
               float next_right_position;
 
-              const float min_right_position = (right_state.first_pts_ > INT64_MIN) ? (right_state.first_pts_ * AV_TIME_TO_SEC + right_state.start_time_) : right_state.start_time_;
+              // Clamp pre-shift: `next_right_position` built below is in the
+              // common (pre-static/dynamic-shift) axis; first_pts_ is a raw
+              // right-side pts. to_common() projects first_pts_ onto the
+              // common axis so the clamp is apples-to-apples. Without this
+              // projection, a startup `-t SEC` seek inflates first_pts_ to
+              // ~offset and the clamp then bumps next_right_position ahead
+              // of the actually-requested common-time target.
+              const float min_right_position = (right_state.first_pts_ > INT64_MIN) ? (time_shifter_.to_common(right_state.first_pts_) * AV_TIME_TO_SEC + right_state.start_time_) : right_state.start_time_;
               const float right_position = compute_right_position(right_state);
               const bool right_is_single_frame = media_frame_detection_states_.at(side).cardinality.load(std::memory_order_relaxed) == MediaFrameCardinality::SingleFrame;
 
