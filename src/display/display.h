@@ -183,10 +183,6 @@ class Display {
   // state tracker — true while left/right PTS diverge during post-seek or
   // sync-adjust catch-up. Defaults to true (assume in sync).
   bool playback_in_sync_{true};
-  // Frame-ring occupancy relative to current playback position. Rendered in
-  // the HUD opposite the FPS counters when show_fps_ is on.
-  int frame_buffer_before_{0};
-  int frame_buffer_after_{0};
   int64_t previous_left_frame_pts_;
   int64_t previous_right_frame_pts_;
   std::string previous_left_frame_key_;
@@ -538,13 +534,6 @@ class Display {
   size_t get_num_right_videos() const;
   size_t get_active_right_index() const;
   void set_active_right_index(size_t index);
-
-  // Frame-ring occupancy around the current playback position (for the HUD
-  // counter next to the FPS readout). `before` is history, `after` is prefetch.
-  void set_frame_buffer_counts(int before, int after) {
-    frame_buffer_before_ = before;
-    frame_buffer_after_ = after;
-  }
 
   // Left/right PTS sync state (pushed by VideoCompare). Drives the SEEK badge.
   void set_playback_in_sync(bool in_sync) { playback_in_sync_ = in_sync; }

@@ -281,9 +281,8 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         push_text(vid_str, small_font_, FPS_VIDEO_COLOR, vid_x, fps_y, TextAlign::Left);
         push_text(ui_str, small_font_, FPS_UI_COLOR, ui_x, fps_y, TextAlign::Left);
 
-        // Play state badge (left) + ring-buffer occupancy counter (right),
-        // mirrored at ~33% across so the pair visually balances the FPS
-        // readout on the right.
+        // Play state badge, mirrored at ~33% across so it visually balances
+        // the FPS readout on the right.
         //
         // The state itself is derived by Display::get_play_state() so that
         // external introspection (e.g. the debug input socket) and the HUD
@@ -309,20 +308,14 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
             break;
         }
 
-        const std::string buf_str = string_sprintf("[<- %d | %d ->]", frame_buffer_before_, frame_buffer_after_);
-
-        int state_w = 0, state_h = 0, buf_w = 0, buf_h = 0;
+        int state_w = 0, state_h = 0;
         TTF_GetStringSize(small_font_, state_str.c_str(), 0, &state_w, &state_h);
-        TTF_GetStringSize(small_font_, buf_str.c_str(), 0, &buf_w, &buf_h);
 
-        const int left_pair_w = state_w + double_border_extension_ + gap + buf_w + double_border_extension_;
         const int left_anchor_x = drawable_width_ / 3;  // ~33% across (mirror of 2/3)
-        const int state_x = left_anchor_x - left_pair_w / 2 + border_extension_;
-        const int buf_x = state_x + state_w + double_border_extension_ + gap;
-        const int left_y = drawable_height_ - line1_y_ - std::max(state_h, buf_h);
+        const int state_x = left_anchor_x - state_w / 2 + border_extension_;
+        const int left_y = drawable_height_ - line1_y_ - state_h;
 
         push_text(state_str, small_font_, state_color, state_x, left_y, TextAlign::Left);
-        push_text(buf_str, small_font_, BUFFER_COLOR, buf_x, left_y, TextAlign::Left);
       }
 
       // Zoom factor — bottom-left (top-right in VStack). Precision varies
