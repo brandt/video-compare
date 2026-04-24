@@ -24,11 +24,16 @@ def test_backward_convergence(video_compare_binary, lg_daylight_backward_pair):
       1. Unpause briefly to advance both past LEFT's intro into shared
          content territory.
       2. Pause.
-      3. Press `[` three times — retry expansion grows the window from
-         [-1 s, 0] to [-2 s, 0] to [-3 s, 0]. The true target (-2002 ms)
-         falls near the edge of the 2-retry window; on this content it
-         takes the third press's wider window to land a confident peak.
+      3. Press `[` twice. Press 1 searches [-1 s, 0] — the target at
+         -2002 ms is outside this window, so low_confidence. Press 2
+         extends the searched interval to [-2 s, 0] (interval grows as
+         new territory is walked, carried forward across presses) and
+         captures the target peak.
       4. Assert effective_time_shift lands on the target frame-exact.
+
+    Note: a hypothetical 3rd `[` here would iterate one frame backward
+    under the at-or-above step-through semantics. That's covered
+    separately by the directional-iteration test.
     """
     pair = lg_daylight_backward_pair
 
@@ -42,8 +47,8 @@ def test_backward_convergence(video_compare_binary, lg_daylight_backward_pair):
         vc.key("space")
         vc.seek_wait(timeout=5.0)
 
-        # Three `[` presses. Retry windows: [-1 s, 0], [-2 s, 0], [-3 s, 0].
-        for _ in range(3):
+        # Two `[` presses: intervals [-1 s, 0] then [-2 s, 0].
+        for _ in range(2):
             vc.key("[")
             vc.seek_wait(timeout=10.0)
 

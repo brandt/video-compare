@@ -1,9 +1,17 @@
 """Performance regression canary for the 2160p pair.
 
-Runs the same three-press forward-alignment sequence as the logic tests,
-but against the full-resolution 2160p h264/VP9 pair to stress the matcher
-at UHD. The end-state must be frame-exact (same contract as the 480p test),
-AND the total wall-clock time must stay within a per-host baseline.
+Runs the two-press forward-alignment sequence against the full-resolution
+2160p h264/VP9 pair to stress the matcher at UHD. The end-state must be
+frame-exact (same contract as the 480p test), AND the total wall-clock
+time must stay within a per-host baseline.
+
+Two presses is the convergence sequence under the current directional
+semantics: press 1 seeds the cache with searched_window=[0, +1]s (too
+narrow for this pair's +2069 ms target, so low_confidence), press 2
+extends to [0, +2]s which captures the 1.000 peak and seeks frame-exact.
+A third `]` press here would iterate one frame forward to the next
+at-or-above candidate (0.9994 neighbor) per the directional step-through
+semantics — that's the intended behavior, not frame-exact on the target.
 
 **Hardware-dependent baseline**: the threshold is tuned for the author's
 dev machine (Apple M-series). On slower hardware this test may fail even
@@ -22,15 +30,15 @@ from .harness import VideoCompareSession
 
 
 # Baseline measurement on Apple M-series (Apr 2026):
-#   3-press end-to-end wall-clock for 2160p h264/VP9 pair: ~7–8 s with the
+#   2-press end-to-end wall-clock for 2160p h264/VP9 pair: ~5-6 s with the
 #   current matcher. Threshold allows 2.5× headroom for noise on the same
 #   host; a significant regression would push it well above ceiling.
-BASELINE_SECONDS = 8.0
+BASELINE_SECONDS = 6.0
 REGRESSION_CEILING_MULTIPLIER = 2.5
 
 
-def test_2160p_three_press_frame_exact_and_under_budget(video_compare_binary, lg_daylight_2160p_pair):
-    """Runs the full 3-press alignment at 2160p; asserts frame-exact landing
+def test_2160p_two_press_frame_exact_and_under_budget(video_compare_binary, lg_daylight_2160p_pair):
+    """Runs the full 2-press alignment at 2160p; asserts frame-exact landing
     AND total wall-clock under the regression ceiling."""
     pair = lg_daylight_2160p_pair
 
@@ -38,7 +46,7 @@ def test_2160p_three_press_frame_exact_and_under_budget(video_compare_binary, lg
         vc.seek_wait(timeout=20.0)
 
         start = time.monotonic()
-        for _ in range(3):
+        for _ in range(2):
             vc.key("]")
             # 2160p L2 drain + walk can take 1–3 s per press; give ample room
             # so the test fails on correctness, not timeout.

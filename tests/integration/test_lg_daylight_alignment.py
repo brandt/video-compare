@@ -1,4 +1,4 @@
-"""Integration tests for the 3-press auto-align retry mechanism on the
+"""Integration tests for the auto-align interval-expansion mechanism on the
 lg-daylight pair.
 
 Guards the regressions surfaced during the 2026-04-22 session:
@@ -10,22 +10,22 @@ Guards the regressions surfaced during the 2026-04-22 session:
   3. static_shift drift — total_frames × avg_delta didn't match the exact
      landed raw PTS.
 
-Current known gap (see test_three_press_reaches_target_frame_exact xfail):
-the L2 seek path lands imprecisely on this specific fixture pair. The
-mechanism tests still run green because they observe the algorithm's
-decisions (retry counter, cache reuse), which are what the regressions
-actually changed.
+Under the current directional semantics (at-or-above current_score -
+kAutoAlignImprovementEps), two `]` presses converge frame-exactly on this
+pair: press 1 seeds a [0, +1]s window which is too narrow, so it returns
+low_confidence; press 2 expands to [0, +2]s, captures the 1.0 peak at
++2069 ms, and seeks. A hypothetical third press would iterate one frame
+forward to the next at-or-above candidate per the step-through spec — a
+different test covers that.
 """
-
-import pytest
 
 from .harness import VideoCompareSession
 
 
-def test_three_press_decision_sequence(video_compare_binary, lg_daylight_pair):
-    """The retry counter and decisions must follow the expected sequence:
-    press 1 low_confidence (retry=0), press 2 seeks (retry=1 — cache
-    reused, ring=0 confirms), press 3 is a fresh press (retry=0)."""
+def test_two_press_decision_sequence(video_compare_binary, lg_daylight_pair):
+    """Press 1 returns low_confidence with searched_window [0, +1]s; press 2
+    carries the cache forward, extends the interval to [0, +2]s without new
+    ring work, and seeks on the 1.0 peak."""
     pair = lg_daylight_pair
 
     with VideoCompareSession(pair) as vc:
@@ -33,36 +33,31 @@ def test_three_press_decision_sequence(video_compare_binary, lg_daylight_pair):
         assert vc.get("play_state") == "PAUSE"
         assert vc.get("effective_time_shift") == 0.0
 
-        for _ in range(3):
+        for _ in range(2):
             vc.key("]")
             vc.seek_wait()
 
         summaries = vc.auto_align_summaries()
-        assert len(summaries) >= 3, (
-            f"expected at least 3 auto-align summaries, got {len(summaries)}:\n"
+        assert len(summaries) >= 2, (
+            f"expected at least 2 auto-align summaries, got {len(summaries)}:\n"
             + "\n".join(str(s) for s in summaries)
         )
 
-        # Press 1: fresh (retry=0), low_confidence (window [0, +1s] too
-        # narrow to reach the true alignment at +2069 ms).
-        assert summaries[0]["retry"] == "0"
+        # Press 1: fresh (no prior cache), low_confidence (window [0, +1s]
+        # too narrow to reach the true alignment at +2069 ms).
+        assert summaries[0]["searched_window"] == "[0.000,1.000]s"
         assert summaries[0]["decision"] == "low_confidence", (
             f"press 1 expected low_confidence, got decision={summaries[0].get('decision')}"
         )
 
-        # Press 2: retry=1 — cache carried forward from press 1. ring=0
-        # confirms the cache was reused (no new ring contribution). Press 2
-        # reaches the true alignment region and seeks.
-        assert summaries[1]["retry"] == "1"
+        # Press 2: cache carried forward from press 1 (ring=0 confirms no
+        # new ring contribution). Searched interval expands to [0, +2]s and
+        # the extended strip contains the 1.0 peak at +2069 ms.
         assert summaries[1]["ring"] == "0", (
-            f"press 2 expected ring=0 (cache reused), got ring={summaries[1].get('ring')}"
+            f"press 2 expected ring=0 (cache reused across presses), got ring={summaries[1].get('ring')}"
         )
         assert summaries[1]["decision"] == "seek"
-        # Windowed extension check: press 2's window expanded to [0, +2s].
-        assert summaries[1]["window"] == "[0.000,2.000]s"
-
-        # Press 3: cache cleared by the seek, retry=0 again.
-        assert summaries[2]["retry"] == "0"
+        assert summaries[1]["searched_window"] == "[0.000,2.000]s"
 
 
 def test_press_2_finds_high_structural_match(video_compare_binary, lg_daylight_pair):
@@ -90,8 +85,8 @@ def test_press_2_finds_high_structural_match(video_compare_binary, lg_daylight_p
         )
 
 
-def test_three_press_reaches_target_frame_exact(video_compare_binary, lg_daylight_pair):
-    """Frame-exact endgame: after three `]` presses, effective_time_shift
+def test_two_press_reaches_target_frame_exact(video_compare_binary, lg_daylight_pair):
+    """Frame-exact endgame: after two `]` presses, effective_time_shift
     must equal the pair's declared target (right_raw - left_raw for
     source_frame=124) to within 2 ms.
 
@@ -111,7 +106,7 @@ def test_three_press_reaches_target_frame_exact(video_compare_binary, lg_dayligh
         # decoded + rendered before --start-paused flips to PAUSE. Use
         # seek_wait with a longer timeout to absorb that.
         vc.seek_wait(timeout=15.0)
-        for _ in range(3):
+        for _ in range(2):
             vc.key("]")
             vc.seek_wait()
 

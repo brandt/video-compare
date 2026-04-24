@@ -1661,34 +1661,44 @@ void VideoCompare::compare() {
       // frames after fingerprinting — the FrameRing is untouched.
       if (display_->get_auto_align_requested()) {
         // Tunables. Kept as locals (not CLI flags) until field data says otherwise.
-        constexpr float kAutoAlignSymmetricHalfSec = 0.5f;    // ± half-window for SDLK_GRAVE
-        constexpr float kAutoAlignDirectionalSec = 1.0f;      // full one-sided window for SDLK_LEFTBRACKET/SDLK_RIGHTBRACKET
-        constexpr float kAutoAlignConfidenceFloor = 0.60f;    // below this, don't seek
-        constexpr float kAutoAlignImprovementEps = 0.005f;    // smaller = "already aligned"
-        // Scores within this → tie-break on smaller |Δt|. Kept tight because
-        // for content with a sharp structural peak (our 1.0-scoring true
-        // alignment), a 0.002 band let a neighboring candidate with score
-        // 0.9982 beat the 1.0000 peak by being 2 frames closer to the
-        // current follower position. 0.0005 is still well above the 4-decimal
-        // reporting noise floor but won't override a genuine peak.
+        constexpr float kAutoAlignSymmetricBaseWidthSec = 0.5f;    // per-press expansion for `
+        constexpr float kAutoAlignDirectionalBaseWidthSec = 1.0f;  // per-press expansion for [ or ]
+        constexpr float kAutoAlignConfidenceFloor = 0.60f;         // below this, don't seek
+        constexpr float kAutoAlignImprovementEps = 0.005f;         // `: "strictly stronger" means > current + eps
+        // Tie-break band: two scores within this are treated as equal for the
+        // "prefer nearest-to-current" tie-break. Much tighter than the
+        // improvement eps because a sharp 1.000 peak can be beaten by a
+        // near-peer only a few frames closer to current — we want the peak
+        // to win whenever it's even slightly stronger.
         constexpr float kAutoAlignTieBreakBand = 0.0005f;
-        constexpr int kAutoAlignProbeRadius = 2;              // probes at k ∈ {-2..+2}
+        // Candidates within this of 1.0 short-circuit directional selection:
+        // once a near-perfect match exists in the pressed direction, it wins
+        // regardless of its distance from current.
+        constexpr float kAutoAlignShortCircuitEps = 0.002f;
+        constexpr int kAutoAlignProbeRadius = 2;                   // probes at k ∈ {-2..+2}
         const bool log_auto_align = env_flag_enabled("VIDEO_COMPARE_LOG_AUTO_ALIGN");
 
-        // Resolve the mode into signed window endpoints relative to master.current.pts.
+        // Resolve the mode into a base width + directionality (which ends of
+        // the searched interval this press is allowed to grow). The actual
+        // window on the follower axis is derived below from the retry cache's
+        // searched interval plus one mode_base_width of growth.
         const AutoAlignMode auto_align_mode = display_->get_auto_align_mode();
-        float window_start_rel_sec = -kAutoAlignSymmetricHalfSec;
-        float window_end_rel_sec = kAutoAlignSymmetricHalfSec;
         const char* mode_label = "sym";
+        float mode_base_width_sec = kAutoAlignSymmetricBaseWidthSec;
+        bool mode_grows_low = true;
+        bool mode_grows_high = true;
         if (auto_align_mode == AutoAlignMode::Backward) {
-          window_start_rel_sec = -kAutoAlignDirectionalSec;
-          window_end_rel_sec = 0.0f;
           mode_label = "back";
+          mode_base_width_sec = kAutoAlignDirectionalBaseWidthSec;
+          mode_grows_low = true;
+          mode_grows_high = false;
         } else if (auto_align_mode == AutoAlignMode::Forward) {
-          window_start_rel_sec = 0.0f;
-          window_end_rel_sec = kAutoAlignDirectionalSec;
           mode_label = "fwd";
+          mode_base_width_sec = kAutoAlignDirectionalBaseWidthSec;
+          mode_grows_low = false;
+          mode_grows_high = true;
         }
+        const int64_t mode_base_width_pts = static_cast<int64_t>(static_cast<double>(mode_base_width_sec) * AV_TIME_BASE);
 
         // Follower is the side the user means when they press a "right video"
         // input; under swap that's underlying LEFT, otherwise underlying RIGHT.
@@ -1770,50 +1780,101 @@ void VideoCompare::compare() {
           using Candidate = AutoAlignCandidate;
 
           // Decide whether the previous press's cached candidates/probes are
-          // still valid for this press. The cache is populated only on a
-          // low-confidence outcome (see end of this block) and is invalidated
-          // the moment anything implies different intent:
-          //   - different mode key (sym vs back vs fwd)
-          //   - master or follower position moved between presses
-          //   - user swapped sides
-          //   - packet-ring coverage already exhausted last time
+          // still valid for this press. The cache is invalidated when:
+          //   - master or follower position moved outside what auto-align
+          //     produced (manual seek, scrub, +/- frame shift);
+          //   - user swapped follower sides.
+          // Mode-change does NOT invalidate: pressing ` then [ keeps the
+          // candidates and master probes from the first press, and just
+          // expands the searched interval in the new mode's allowed
+          // direction(s). Post-seek preservation is handled at cache-update
+          // time below (master_pts stays, follower_pts advances to landed).
           AutoAlignRetryCache& retry = auto_align_retry_cache_;
           const bool retry_context_matches = retry.valid &&
-                                             retry.mode == auto_align_mode &&
                                              retry.follower_side == auto_align_follower_side &&
                                              retry.master_pts_at_cache == master_current->pts &&
                                              retry.follower_pts_at_cache == follower_current->pts;
-          const bool packet_ring_already_exhausted = retry_context_matches && retry.packet_ring_exhausted;
-          const bool can_reuse_cache = retry_context_matches && !retry.packet_ring_exhausted;
+          const bool can_reuse_cache = retry_context_matches;
 
-          // If the previous press already bailed on packet-ring exhaustion,
-          // don't even try to expand: we'd compute a wider window that also
-          // can't be covered. Warn and short-circuit.
-          if (packet_ring_already_exhausted) {
-            display_->set_pending_message("Auto-align: reached end of packet buffer");
-            if (log_auto_align) {
-              std::cerr << "[auto-align] decision=packet_ring_exhausted" << std::endl;
+          // Query follower clip bounds for boundary-aware expansion. PTS on
+          // the follower axis is start-time-normalized (see demuxer_start_us
+          // subtraction in the walk below), so the valid range is [0, duration).
+          int64_t follower_clip_min_pts = 0;
+          int64_t follower_clip_max_pts = std::numeric_limits<int64_t>::max();
+          {
+            auto demuxer_it = demuxers_.find(follower_state.side_);
+            if (demuxer_it != demuxers_.end() && demuxer_it->second) {
+              const int64_t duration_us = demuxer_it->second->duration();
+              if (duration_us > 0) {
+                follower_clip_max_pts = duration_us;
+              }
             }
-            // Leave the cache in place so further repeats keep short-circuiting;
-            // any other input will reset it via the mismatch check above.
+          }
+
+          // --- Compute searched interval for this press ---
+          // The cache stores [searched_low_pts, searched_high_pts] on the
+          // follower's PTS axis. Each press grows the interval in its mode's
+          // allowed direction(s) by one mode_base_width, clamped to the clip
+          // bounds. Saturation flags record which directions have reached a
+          // boundary and can't grow further.
+          int64_t searched_low_pts;
+          int64_t searched_high_pts;
+          bool low_saturated;
+          bool high_saturated;
+          bool new_work_low = false;
+          bool new_work_high = false;
+          const int64_t follower_current_pts = follower_current->pts;
+          if (can_reuse_cache) {
+            searched_low_pts = retry.searched_low_pts;
+            searched_high_pts = retry.searched_high_pts;
+            low_saturated = retry.low_saturated;
+            high_saturated = retry.high_saturated;
+            if (mode_grows_low && !low_saturated) {
+              int64_t new_low = searched_low_pts - mode_base_width_pts;
+              if (new_low <= follower_clip_min_pts) {
+                new_low = follower_clip_min_pts;
+                low_saturated = true;
+              }
+              if (new_low < searched_low_pts) {
+                searched_low_pts = new_low;
+                new_work_low = true;
+              }
+            }
+            if (mode_grows_high && !high_saturated) {
+              int64_t new_high = searched_high_pts + mode_base_width_pts;
+              if (new_high >= follower_clip_max_pts) {
+                new_high = follower_clip_max_pts;
+                high_saturated = true;
+              }
+              if (new_high > searched_high_pts) {
+                searched_high_pts = new_high;
+                new_work_high = true;
+              }
+            }
           } else {
-            const int retry_count_this_press = can_reuse_cache ? retry.retry_count + 1 : 0;
-
-            // Expand the window by (retry_count + 1) × the mode's base width.
-            // Symmetric grows both bounds; directional grows the single open bound.
-            if (auto_align_mode == AutoAlignMode::Symmetric) {
-              const float half = kAutoAlignSymmetricHalfSec * static_cast<float>(retry_count_this_press + 1);
-              window_start_rel_sec = -half;
-              window_end_rel_sec = half;
-            } else if (auto_align_mode == AutoAlignMode::Backward) {
-              window_start_rel_sec = -kAutoAlignDirectionalSec * static_cast<float>(retry_count_this_press + 1);
-              window_end_rel_sec = 0.0f;
-            } else if (auto_align_mode == AutoAlignMode::Forward) {
-              window_start_rel_sec = 0.0f;
-              window_end_rel_sec = kAutoAlignDirectionalSec * static_cast<float>(retry_count_this_press + 1);
+            // Fresh cache: seed from follower_current extended by mode's base
+            // width on each allowed side, clamped to clip bounds.
+            searched_low_pts = follower_current_pts;
+            searched_high_pts = follower_current_pts;
+            if (mode_grows_low) {
+              const int64_t target_low = follower_current_pts - mode_base_width_pts;
+              searched_low_pts = std::max(follower_clip_min_pts, target_low);
+              // new_work reflects actual expansion, not just mode intent —
+              // when follower_current is at the clip start, [ couldn't
+              // expand at all and should report saturation instead.
+              new_work_low = (searched_low_pts < follower_current_pts);
             }
+            if (mode_grows_high) {
+              const int64_t target_high = follower_current_pts + mode_base_width_pts;
+              searched_high_pts = std::min(follower_clip_max_pts, target_high);
+              new_work_high = (searched_high_pts > follower_current_pts);
+            }
+            low_saturated = mode_grows_low && (searched_low_pts <= follower_clip_min_pts);
+            high_saturated = mode_grows_high && (searched_high_pts >= follower_clip_max_pts);
+          }
 
-          // --- Build the follower-side candidate pool ---
+          {
+            // --- Build the follower-side candidate pool ---
           // Seed from cache (if reusing), then top up from the current ring.
           // The ring contribution is deduped against whatever cache provided,
           // so ring frames already fingerprinted last press are skipped.
@@ -1850,39 +1911,28 @@ void VideoCompare::compare() {
             }
           }
 
-          // Master-axis PTS used throughout the rest of this block. The window
-          // endpoints below live on the follower's axis; we derive them by
-          // adding the mode-resolved relative window to the master-axis origin.
+          // Master-axis PTS used throughout scoring (for delta-t hypotheses).
           const int64_t master_current_pts = master_current->pts;
-          int64_t window_start_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_start_rel_sec) * AV_TIME_BASE);
-          int64_t window_end_pts = master_current_pts + static_cast<int64_t>(static_cast<double>(window_end_rel_sec) * AV_TIME_BASE);
 
-          // Extend the scoring window to cover the ring's full extent around
-          // follower_current plus the probe radius. Without this, a candidate
-          // at the ring's forward edge (typical after a prior seek has pushed
-          // follower near the true alignment) can't muster enough valid
-          // probes to score — probe targets fall outside the pool — and the
-          // algorithm picks a worse ring-interior candidate instead. The
-          // extension uses the coarser side's delta_pts as a probe-step
-          // estimate (the exact probe_step_pts is computed later, but this
-          // approximation is tight enough for the bound).
+          // The scoring window is the searched interval on the follower axis
+          // (absolute PTS) extended outward with ring + probe slack so that
+          // probes near the interval's edges can find their partner frames.
+          // Slack doesn't contribute to the user-visible searched_window: it's
+          // invisible padding that makes the edge candidates scorable.
           const int64_t approx_probe_step_pts = std::max(master_delta_pts, follower_delta_pts);
           const int64_t probe_edge_slack_pts = static_cast<int64_t>(kAutoAlignProbeRadius + 1) * approx_probe_step_pts;
-          const int64_t follower_current_pts = follower_current->pts;
-          // Use the ring's CAPACITY (not current count) for slack. After a
-          // fresh L2 seek the ring's prefetch is empty; using prefetch_size()
-          // there makes the extension collapse to just probe_edge_slack,
-          // truncating the walk before it decodes past `follower_current`.
-          // Capacity-based slack guarantees the walk covers what the ring
-          // would hold once intake_prefetch refills it.
+          // Capacity-based slack (not current count): after a fresh L2 seek the
+          // ring's prefetch is empty, so prefetch_size() would collapse the
+          // extension and truncate the walk. Capacity guarantees the walk
+          // covers what the ring will hold once intake_prefetch refills.
           const int64_t ring_forward_slack_pts = static_cast<int64_t>(follower_state.ring.prefetch_capacity()) * follower_delta_pts;
           const int64_t ring_backward_slack_pts = static_cast<int64_t>(follower_state.ring.history_capacity()) * follower_delta_pts;
-          if (auto_align_mode == AutoAlignMode::Forward || auto_align_mode == AutoAlignMode::Symmetric) {
-            window_end_pts = std::max(window_end_pts, follower_current_pts + ring_forward_slack_pts + probe_edge_slack_pts);
-          }
-          if (auto_align_mode == AutoAlignMode::Backward || auto_align_mode == AutoAlignMode::Symmetric) {
-            window_start_pts = std::min(window_start_pts, follower_current_pts - ring_backward_slack_pts - probe_edge_slack_pts);
-          }
+          int64_t window_start_pts = searched_low_pts - ring_backward_slack_pts - probe_edge_slack_pts;
+          int64_t window_end_pts = searched_high_pts + ring_forward_slack_pts + probe_edge_slack_pts;
+          // Also ensure the follower's current position is always in-window
+          // even if the searched interval was seeded/expanded only on one side.
+          window_start_pts = std::min(window_start_pts, follower_current_pts - probe_edge_slack_pts);
+          window_end_pts = std::max(window_end_pts, follower_current_pts + probe_edge_slack_pts);
 
           // Figure out how much of the requested window the candidate pool
           // already covers. If at least one candidate is at-or-before
@@ -2206,10 +2256,15 @@ void VideoCompare::compare() {
           };
 
           // --- Score each candidate with windowed multi-probe correlation ---
-          float best_score = -std::numeric_limits<float>::max();
-          int64_t best_pts = follower_current->pts;
-          float current_score = -std::numeric_limits<float>::max();
-          bool current_scored = false;
+          // Scores are PTS-keyed so the decision phase below can look up an
+          // arbitrary candidate (e.g. follower_current, or a tie-break peer).
+          struct ScoredCandidate {
+            int64_t pts{0};
+            float score{0.0f};
+            int n_valid{0};
+          };
+          std::vector<ScoredCandidate> scored;
+          scored.reserve(candidates.size());
           int valid_scored = 0;
 
           for (const auto& cand : candidates) {
@@ -2239,10 +2294,7 @@ void VideoCompare::compare() {
             }
             const float score = sum / static_cast<float>(n_valid);
             ++valid_scored;
-            if (cand.pts == follower_current->pts) {
-              current_score = score;
-              current_scored = true;
-            }
+            scored.push_back({cand.pts, score, n_valid});
             if (log_auto_align) {
               std::cerr << "[auto-align]"
                         << " pts_delta_ms=" << string_sprintf("%.3f", static_cast<double>(cand.pts - master_current_pts) / 1000.0)
@@ -2250,49 +2302,249 @@ void VideoCompare::compare() {
                         << " score=" << string_sprintf("%.4f", score)
                         << std::endl;
             }
-            // Pick higher score; on near-ties, prefer the offset closer to the
-            // current follower position (minimises seek distance when current
-            // is already near-optimal).
-            const bool strictly_better = score > best_score + kAutoAlignTieBreakBand;
-            const bool tied_and_closer = (std::abs(score - best_score) <= kAutoAlignTieBreakBand) && (std::abs(cand.pts - follower_current->pts) < std::abs(best_pts - follower_current->pts));
-            if (strictly_better || tied_and_closer) {
-              best_score = score;
-              best_pts = cand.pts;
-            }
           }
 
+          // Look up the score of a specific candidate by PTS. Linear over
+          // `scored` — small list, called a handful of times per press.
+          const auto score_of_pts = [&](int64_t pts, float* out) -> bool {
+            for (const auto& s : scored) {
+              if (s.pts == pts) {
+                *out = s.score;
+                return true;
+              }
+            }
+            return false;
+          };
+
+          // Resolve follower_current's own score if we managed to score it.
+          // (We always fingerprint ring.at(0) = current above, so this should
+          // hold unless probe_step or ring depth made probes undiscoverable.)
+          float current_score = -std::numeric_limits<float>::max();
+          const bool current_scored = score_of_pts(follower_current->pts, &current_score);
+
           // --- Decide ---
-          // A compact human-readable window descriptor for HUD messages.
-          // Symmetric shows "±0.5s", directional shows "+1.0s" / "-1.0s".
-          const auto format_window_span = [&]() -> std::string {
+          // Human-readable searched-interval descriptor on the follower axis
+          // (relative to follower_current). Symmetric "±N.Ns"; directional
+          // "+N.Ns" or "-N.Ns".
+          const int64_t searched_low_rel_pts = searched_low_pts - follower_current_pts;
+          const int64_t searched_high_rel_pts = searched_high_pts - follower_current_pts;
+          const auto format_searched_interval = [&]() -> std::string {
+            const double low_s = static_cast<double>(searched_low_rel_pts) * static_cast<double>(AV_TIME_TO_SEC);
+            const double high_s = static_cast<double>(searched_high_rel_pts) * static_cast<double>(AV_TIME_TO_SEC);
             if (auto_align_mode == AutoAlignMode::Symmetric) {
-              return string_sprintf("+/-%.1fs", static_cast<double>(window_end_rel_sec));
+              const double max_half = std::max(-low_s, high_s);
+              return string_sprintf("+/-%.1fs", max_half);
             } else if (auto_align_mode == AutoAlignMode::Forward) {
-              return string_sprintf("+%.1fs", static_cast<double>(window_end_rel_sec));
+              return string_sprintf("+%.1fs", high_s);
             } else {
-              return string_sprintf("-%.1fs", static_cast<double>(-window_start_rel_sec));
+              return string_sprintf("-%.1fs", -low_s);
             }
           };
 
+          // Clip-boundary saturation signals that this press can't do new work
+          // in the pressed direction. Used to override "nothing found" outcomes
+          // with a directional boundary message, and to block ` when both ends
+          // are saturated.
+          const bool sym_fully_saturated = (auto_align_mode == AutoAlignMode::Symmetric) && low_saturated && high_saturated && !new_work_low && !new_work_high;
+          const bool back_saturated = (auto_align_mode == AutoAlignMode::Backward) && low_saturated && !new_work_low;
+          const bool fwd_saturated = (auto_align_mode == AutoAlignMode::Forward) && high_saturated && !new_work_high;
+
+          // Mode-specific candidate filtering / selection. For `, pick only
+          // candidates with score strictly greater than current + eps, with
+          // distance + "ahead preferred over behind" tie-breaks. For [ / ],
+          // pick in-direction candidates with score >= current - eps
+          // (excluding current itself), with nearest-in-direction tie-break.
+          const auto pick_symmetric_best = [&]() -> const ScoredCandidate* {
+            if (!current_scored) {
+              return nullptr;
+            }
+            // Eligibility gate: strictly stronger than current by improvement
+            // eps. Tie-break between eligible candidates uses the much tighter
+            // tie-break band so a sharp peak beats a nearby near-peer.
+            const float threshold = current_score + kAutoAlignImprovementEps;
+            const ScoredCandidate* best = nullptr;
+            for (const auto& s : scored) {
+              if (s.score <= threshold) {
+                continue;
+              }
+              if (best == nullptr) {
+                best = &s;
+                continue;
+              }
+              const bool strictly_stronger = s.score > best->score + kAutoAlignTieBreakBand;
+              const bool score_tied = std::abs(s.score - best->score) <= kAutoAlignTieBreakBand;
+              if (strictly_stronger) {
+                best = &s;
+                continue;
+              }
+              if (!score_tied) {
+                continue;
+              }
+              const int64_t s_dist = std::abs(s.pts - follower_current->pts);
+              const int64_t best_dist = std::abs(best->pts - follower_current->pts);
+              if (s_dist < best_dist) {
+                best = &s;
+                continue;
+              }
+              if (s_dist == best_dist && s.pts > follower_current->pts && best->pts <= follower_current->pts) {
+                best = &s;
+              }
+            }
+            return best;
+          };
+          const auto pick_directional_best = [&](bool forward) -> const ScoredCandidate* {
+            if (!current_scored) {
+              return nullptr;
+            }
+            // Eligibility gate: at-or-above current by improvement eps, in the
+            // pressed direction, excluding current itself. Tie-break between
+            // eligible candidates uses the tight tie-break band so peaks win
+            // cleanly; a 1.0 short-circuit covers the case where a near-
+            // perfect match should be chosen regardless of distance.
+            const float threshold = current_score - kAutoAlignImprovementEps;
+            const ScoredCandidate* best = nullptr;
+            for (const auto& s : scored) {
+              if (s.pts == follower_current->pts) {
+                continue;
+              }
+              if (forward && s.pts <= follower_current->pts) {
+                continue;
+              }
+              if (!forward && s.pts >= follower_current->pts) {
+                continue;
+              }
+              if (s.score < threshold) {
+                continue;
+              }
+              const bool s_near_one = s.score >= 1.0f - kAutoAlignShortCircuitEps;
+              const bool best_near_one = (best != nullptr) && best->score >= 1.0f - kAutoAlignShortCircuitEps;
+              if (best == nullptr) {
+                best = &s;
+                continue;
+              }
+              if (s_near_one && !best_near_one) {
+                best = &s;
+                continue;
+              }
+              if (!s_near_one && best_near_one) {
+                continue;
+              }
+              const bool strictly_stronger = s.score > best->score + kAutoAlignTieBreakBand;
+              const bool score_tied = std::abs(s.score - best->score) <= kAutoAlignTieBreakBand;
+              if (strictly_stronger) {
+                best = &s;
+                continue;
+              }
+              if (!score_tied) {
+                continue;
+              }
+              const int64_t s_dist = std::abs(s.pts - follower_current->pts);
+              const int64_t best_dist = std::abs(best->pts - follower_current->pts);
+              if (s_dist < best_dist) {
+                best = &s;
+              }
+            }
+            return best;
+          };
+
+          const ScoredCandidate* picked = nullptr;
+          if (auto_align_mode == AutoAlignMode::Symmetric) {
+            picked = pick_symmetric_best();
+          } else if (auto_align_mode == AutoAlignMode::Forward) {
+            picked = pick_directional_best(/*forward=*/true);
+          } else {
+            picked = pick_directional_best(/*forward=*/false);
+          }
+
+          // Find the best unconstrained score in the pool — used as a floor
+          // check: if nothing in the whole pool meets the confidence floor,
+          // this press's search region contained no reliable alignment
+          // candidates and the user should expand further.
+          float pool_best_score = -std::numeric_limits<float>::max();
+          int64_t pool_best_pts = follower_current->pts;
+          for (const auto& s : scored) {
+            if (s.score > pool_best_score) {
+              pool_best_score = s.score;
+              pool_best_pts = s.pts;
+            }
+          }
+
           std::string decision_kind;
           int shift_applied = 0;
+          int64_t best_pts = follower_current->pts;
+          float best_score = current_scored ? current_score : -std::numeric_limits<float>::max();
           if (valid_scored == 0) {
-            display_->set_pending_message("Auto-align: insufficient probes — no change");
-            decision_kind = "no_frames";
-          } else if (best_score < kAutoAlignConfidenceFloor) {
-            // Hint the user that pressing again extends the window on the
-            // first low-confidence press; on subsequent retries, report the
-            // current span so they can see how far the search has walked.
-            if (retry_count_this_press == 0) {
-              display_->set_pending_message(string_sprintf("Auto-align: low confidence (score %.3f) — press again to extend", best_score));
+            // Boundary saturation with no scoreable candidates: report the
+            // boundary rather than generic "insufficient probes" so the user
+            // knows why.
+            if (back_saturated) {
+              display_->set_pending_message("Auto-align: reached clip start");
+              decision_kind = "boundary_start";
+            } else if (fwd_saturated) {
+              display_->set_pending_message("Auto-align: reached clip end");
+              decision_kind = "boundary_end";
+            } else if (sym_fully_saturated) {
+              display_->set_pending_message("Auto-align: search exhausted (both clip boundaries reached)");
+              decision_kind = "boundary_both";
             } else {
-              display_->set_pending_message(string_sprintf("Auto-align: still low confidence (score %.3f, window %s)", best_score, format_window_span().c_str()));
+              display_->set_pending_message("Auto-align: insufficient probes — no change");
+              decision_kind = "no_frames";
             }
-            decision_kind = "low_confidence";
-          } else if (best_pts == follower_current->pts || (current_scored && (best_score - current_score) < kAutoAlignImprovementEps)) {
-            display_->set_pending_message(string_sprintf("Auto-align: already aligned (score %.3f)", best_score));
-            decision_kind = "already";
+          } else if (pool_best_score < kAutoAlignConfidenceFloor) {
+            // Nothing in the pool meets the confidence floor. If the pressed
+            // direction is saturated, expanding further won't help — report
+            // the boundary. Otherwise prompt the user to expand.
+            if (back_saturated) {
+              display_->set_pending_message("Auto-align: reached clip start");
+              decision_kind = "boundary_start";
+            } else if (fwd_saturated) {
+              display_->set_pending_message("Auto-align: reached clip end");
+              decision_kind = "boundary_end";
+            } else if (sym_fully_saturated) {
+              display_->set_pending_message(string_sprintf("Auto-align: search exhausted (both clip boundaries reached, best score %.3f)", pool_best_score));
+              decision_kind = "boundary_both";
+            } else if (!new_work_low && !new_work_high) {
+              display_->set_pending_message(string_sprintf("Auto-align: still low confidence (score %.3f, window %s)", pool_best_score, format_searched_interval().c_str()));
+              decision_kind = "low_confidence";
+            } else {
+              display_->set_pending_message(string_sprintf("Auto-align: low confidence (score %.3f) — press again to extend", pool_best_score));
+              decision_kind = "low_confidence";
+            }
+            best_score = pool_best_score;
+            best_pts = pool_best_pts;
+          } else if (picked == nullptr) {
+            // We have at least one confident candidate, but nothing satisfies
+            // the mode's pick rule. Distinguish boundary vs genuine no-op.
+            if (auto_align_mode == AutoAlignMode::Symmetric) {
+              if (sym_fully_saturated) {
+                display_->set_pending_message(string_sprintf("Auto-align: search exhausted (both clip boundaries reached, score %.3f)", pool_best_score));
+                decision_kind = "boundary_both";
+              } else {
+                display_->set_pending_message(string_sprintf("Auto-align: already aligned (score %.3f)", current_scored ? current_score : pool_best_score));
+                decision_kind = "already";
+              }
+            } else if (auto_align_mode == AutoAlignMode::Forward) {
+              if (fwd_saturated) {
+                display_->set_pending_message("Auto-align: reached clip end");
+                decision_kind = "boundary_end";
+              } else {
+                display_->set_pending_message(string_sprintf("Auto-align: no stronger match ahead (score %.3f)", current_scored ? current_score : pool_best_score));
+                decision_kind = "no_stronger_in_direction";
+              }
+            } else {
+              if (back_saturated) {
+                display_->set_pending_message("Auto-align: reached clip start");
+                decision_kind = "boundary_start";
+              } else {
+                display_->set_pending_message(string_sprintf("Auto-align: no stronger match behind (score %.3f)", current_scored ? current_score : pool_best_score));
+                decision_kind = "no_stronger_in_direction";
+              }
+            }
+            best_score = pool_best_score;
+            best_pts = pool_best_pts;
           } else {
+            best_pts = picked->pts;
+            best_score = picked->score;
             const int64_t shift_pts = best_pts - follower_current->pts;
             shift_applied = static_cast<int>(std::llround(static_cast<double>(shift_pts) / static_cast<double>(follower_delta_pts)));
 
@@ -2309,8 +2561,6 @@ void VideoCompare::compare() {
             } else {
               const double follower_start_sec = static_cast<double>(follower_state.start_time_);
               const double target_abs_sec = static_cast<double>(best_pts) * static_cast<double>(AV_TIME_TO_SEC) + follower_start_sec;
-              // seek_relative in seek_from_start mode is a normalized [0,1]
-              // fraction of shortest_duration_. Convert our absolute target.
               const double duration = (shortest_duration_ > 0.0) ? shortest_duration_ : 1.0;
               const double fractional = (target_abs_sec - follower_start_sec) / duration;
               seek_relative = static_cast<float>(fractional);
@@ -2329,7 +2579,10 @@ void VideoCompare::compare() {
             pending_auto_align_verification_.master_current_pts = master_current_pts;
             pending_auto_align_verification_.probe_step_pts = probe_step_pts;
             pending_auto_align_verification_.delta_t_pts = best_pts - master_current_pts;
-            pending_auto_align_verification_.master_probe_fingerprints = std::move(master_probe_fps);
+            // Clone (not move) the master fingerprints so the cache update
+            // below can also preserve them across this seek for subsequent
+            // directional-iteration presses.
+            pending_auto_align_verification_.master_probe_fingerprints = master_probe_fps;
             display_->set_pending_message(string_sprintf("Auto-align: shift %+d frame%s (score %.3f)", shift_applied, std::abs(shift_applied) == 1 ? "" : "s", best_score));
             decision_kind = "seek";
           }
@@ -2342,7 +2595,6 @@ void VideoCompare::compare() {
             std::cerr << "[auto-align]"
                       << " mode=" << mode_label
                       << " follower=" << auto_align_follower_side.to_string()
-                      << " retry=" << retry_count_this_press
                       << " ring=" << ring_contributed
                       << " decoded=" << decoded_added
                       << " decode_ms=" << decode_ms
@@ -2354,33 +2606,34 @@ void VideoCompare::compare() {
                       << " current_score=" << current_score_s
                       << " shift_frames=" << shift_applied
                       << " decision=" << decision_kind
-                      << " window=[" << string_sprintf("%.3f", static_cast<double>(window_start_rel_sec)) << "," << string_sprintf("%.3f", static_cast<double>(window_end_rel_sec)) << "]s"
+                      << " searched_window=[" << string_sprintf("%.3f", static_cast<double>(searched_low_rel_pts) * static_cast<double>(AV_TIME_TO_SEC))
+                      << "," << string_sprintf("%.3f", static_cast<double>(searched_high_rel_pts) * static_cast<double>(AV_TIME_TO_SEC)) << "]s"
+                      << " low_sat=" << (low_saturated ? 1 : 0)
+                      << " high_sat=" << (high_saturated ? 1 : 0)
                       << std::endl;
           }
 
           // --- Update retry cache ---
-          // Stash on low_confidence (so the next same-key press can extend
-          // the search window using what we've already fingerprinted).
-          // Clear on any outcome that implies the user got what they wanted
-          // (seek), the algorithm converged (already), or had nothing to
-          // work with (no_frames) — those fresh-start the next press.
-          if (decision_kind == "low_confidence") {
-            retry.valid = true;
-            retry.mode = auto_align_mode;
-            retry.follower_side = auto_align_follower_side;
-            retry.master_pts_at_cache = master_current->pts;
-            retry.follower_pts_at_cache = follower_current->pts;
-            retry.retry_count = retry_count_this_press;
-            // A walk was attempted but bailed → further expansion can't help.
-            // Freeze the cache so the next same-key press short-circuits with
-            // the "reached end of packet buffer" message.
-            retry.packet_ring_exhausted = (walk_attempted && walk_skip_reason != nullptr);
-            retry.candidates = std::move(candidates);
-            retry.master_probe_fingerprints = std::move(master_probe_fps);
-          } else {
-            retry = {};
-          }
-          }  // end of else (packet_ring_already_exhausted check)
+          // Persist on every successful pass through the decide branch so the
+          // next press can extend the searched interval regardless of which
+          // key was pressed. Invalidation is handled at the TOP of the next
+          // press (master/follower PTS mismatch, side swap).
+          retry.valid = true;
+          retry.follower_side = auto_align_follower_side;
+          retry.master_pts_at_cache = master_current->pts;
+          // On a seek the follower is about to land at best_pts; the next
+          // press will compare its master/follower PTS against this to
+          // validate cache freshness. Post-seek verification will fix up
+          // follower_pts_at_cache to the exact landed PTS.
+          retry.follower_pts_at_cache = (decision_kind == "seek") ? best_pts : follower_current->pts;
+          retry.searched_low_pts = searched_low_pts;
+          retry.searched_high_pts = searched_high_pts;
+          retry.low_saturated = low_saturated;
+          retry.high_saturated = high_saturated;
+          retry.packet_buffer_miss = (walk_attempted && walk_skip_reason != nullptr);
+          retry.candidates = std::move(candidates);
+          retry.master_probe_fingerprints = std::move(master_probe_fps);
+          }  // end of cache/decode/score/decide block
         }
       }
 
@@ -3451,6 +3704,17 @@ void VideoCompare::compare() {
               right_ptr->effective_time_shift_ = time_shifter_.effective_shift(follower_current_after->pts);
               right_ptr->pts_ = follower_current_after->pts - right_ptr->effective_time_shift_;
             }
+          }
+
+          // Sync the retry cache's follower_pts_at_cache to the actual landed
+          // PTS so the next auto-align press (same or different key) can
+          // reuse the cached candidate pool and master probes, and extend
+          // from the current searched interval. Without this, the next
+          // press's invalidation check would see a mismatch between
+          // retry.follower_pts_at_cache (our pre-seek estimate) and the
+          // actual landed follower_current and throw away the cache.
+          if (auto_align_retry_cache_.valid && follower_current_after != nullptr) {
+            auto_align_retry_cache_.follower_pts_at_cache = follower_current_after->pts;
           }
           // When ok, the main-pass "shift %+d (score %.3f)" message set earlier
           // stays on screen — no need to overwrite it with a near-identical one.

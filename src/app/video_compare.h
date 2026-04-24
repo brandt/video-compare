@@ -162,32 +162,41 @@ struct AutoAlignCandidate {
   std::vector<float> fp;
 };
 
-// Cache carried across consecutive auto-align presses when the previous press
-// returned "low confidence". Lets the user extend the search window by pressing
-// the same key again without redoing the fingerprint work for the region that
-// was already covered. Cleared the moment the user does anything that implies
-// a different intent (different mode, master/follower position moved, a
-// successful seek, packet-ring coverage exhausted).
+// Cache carried across consecutive auto-align presses. Lets the user extend
+// the search region incrementally — pressing any auto-align key (same or
+// different) after a non-seek outcome expands the searched interval rather
+// than resetting. Also survives a successful seek so that directional
+// iteration (` / [ / ] stepping to equally-strong candidates) doesn't need
+// to re-decode the same region. The cache invalidates when the user does
+// something that implies different intent: master or follower position
+// moved outside what the algorithm itself produced (manual seek, scrub,
+// +/- frame shift), or follower-side swap.
 struct AutoAlignRetryCache {
   bool valid{false};
-  AutoAlignMode mode{AutoAlignMode::Symmetric};
-  // Guards: positions we saw on both sides when the cache was last populated.
-  // If either has moved when the next press arrives, something else intervened
-  // and the cache is stale.
+  // Guards: positions we saw on both sides when the cache was last populated
+  // or last updated post-seek. If either mismatches at the next press it means
+  // something outside auto-align moved one of the sides, so the cache is stale.
   int64_t master_pts_at_cache{0};
   int64_t follower_pts_at_cache{0};
-  // 0 on the first press that populated the cache; +1 per low-confidence retry.
-  // The window expands as (retry_count + 1) × the mode's base width.
-  int retry_count{0};
-  // Follower side that participated. If the user swaps mid-retry the cache is
-  // effectively invalidated (the swap changes which side is the follower).
+  // Follower side that participated. If the user swaps mid-search the cache
+  // becomes invalid (the swap changes which side is the follower).
   Side follower_side{SideType::Right};
-  // Set when a packet-ring walk was attempted but bailed (keyframe not in
-  // coverage). Expanding further won't help — short-circuit subsequent presses
-  // with a HUD warning instead of silently freezing.
-  bool packet_ring_exhausted{false};
+  // Searched interval on the follower's PTS axis (AV_TIME_BASE µs), absolute
+  // (not relative to follower_current). Every candidate in `candidates` has
+  // a pts inside [searched_low_pts, searched_high_pts]. The interval grows
+  // monotonically across presses until a cache-invalidating event clears it.
+  int64_t searched_low_pts{0};
+  int64_t searched_high_pts{0};
+  // Set when the interval's low/high edge is at the follower clip's start/end
+  // boundary and further expansion in that direction can't gain new frames.
+  bool low_saturated{false};
+  bool high_saturated{false};
+  // Set when a packet-ring walk was attempted but couldn't find a starting
+  // keyframe in-coverage (distinct from clip-boundary saturation — the clip
+  // may extend further, but the packet buffer doesn't hold it).
+  bool packet_buffer_miss{false};
   // The candidate pool and master-side probe fingerprints, carried forward so
-  // each retry only decodes+fingerprints the newly-exposed region.
+  // each press only decodes + fingerprints net-new territory.
   std::vector<AutoAlignCandidate> candidates;
   std::unordered_map<int64_t, std::vector<float>> master_probe_fingerprints;
 };

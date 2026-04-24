@@ -18,15 +18,19 @@ All line numbers referenced in this doc are anchors into the current tree, not s
 
 ## 1. Keybindings and modes
 
-| Key     | `AutoAlignMode` | Window (relative to left's current PTS)  | Typical cost
-| ------- | --------------- | ---------------------------------------- | -------------
-| `` ` `` | `Symmetric`     | `[-0.5 s, +0.5 s]`                       | Ring-only, no decode (microseconds)
-| `[`     | `Backward`      | `[-1.0 s,  0.0 s]`                       | Ring + ~15 decoded frames at 30 fps
-| `]`     | `Forward`       | `[ 0.0 s, +1.0 s]`                       | Ring + ~15 decoded frames at 30 fps
+Each key's *first* press seeds a searched interval on the follower PTS axis, centered on the follower's current frame. Subsequent presses grow the interval outward in the pressed key's allowed direction(s), carrying the candidate pool and master probes forward — the searched region monotonically grows across presses until something invalidates the cache (see §12).
 
-The Symmetric window sits entirely inside the default 15/15 FrameRing on typical framerates — a `` ` `` press usually runs with zero decode cost. The directional `[` / `]` windows extend past the ring on one side; the uncovered half is decoded inline via a barriered PacketRing walk (§4 below).
+| Key     | `AutoAlignMode` | Grows on each press                          | Typical cost
+| ------- | --------------- | -------------------------------------------- | -------------
+| `` ` `` | `Symmetric`     | ±0.5 s on both ends                          | Ring-only on first press, then +decode per extension
+| `[`     | `Backward`      | -1.0 s on the low end only                   | Ring + ~15 decoded frames at 30 fps per press
+| `]`     | `Forward`       | +1.0 s on the high end only                  | Ring + ~15 decoded frames at 30 fps per press
 
-Window extents are constants (`kAutoAlignSymmetricHalfSec`, `kAutoAlignDirectionalSec`) in `video_compare.cpp`, not CLI flags. The user explicitly called out a future interest in making them configurable and in handling pairs with "different sustained black intro cards" — that's on the backlog.
+Mode changes carry the cache forward: pressing `` ` `` then `[` keeps the 0.5 s forward strip the symmetric press already fingerprinted, and extends the low end by another 1.0 s (net interval becomes `[-1.5 s, +0.5 s]`). The mental model is "progress bar on the follower axis that fills in whatever direction the pressed key allows." See §12 for the full cache rules.
+
+The searched interval is clamped to the follower clip's `[start_time, start_time + duration)` — pressing `[` near the clip start stops growing at 0, pressing `]` near the end stops at `duration`. When a directional press lands saturated against its boundary, the decision becomes `boundary_start` / `boundary_end` (not `low_confidence`) so the user knows expansion in that direction has no more frames to offer.
+
+Base widths are constants (`kAutoAlignSymmetricBaseWidthSec`, `kAutoAlignDirectionalBaseWidthSec`) in `video_compare.cpp`, not CLI flags. The user called out a future interest in making them configurable and in handling pairs with "different sustained black intro cards" — that's on the backlog.
 
 ---
 
@@ -34,11 +38,11 @@ Window extents are constants (`kAutoAlignSymmetricHalfSec`, `kAutoAlignDirection
 
 Each press runs the same five-phase pipeline:
 
-1. **Resolve window**: map the requested `AutoAlignMode` to signed `[window_start_rel_sec, window_end_rel_sec]` offsets on the left time axis.
-2. **Seed candidate pool from the right FrameRing**: fingerprint every ring-resident right frame. These are free — the frames are already RGB-packed after the format converter.
-3. **Extend via PacketRing walk** if the ring doesn't span the window: enter a right-side-only `ReadyToSeek` barrier, drive the decoder inline from `keyframe_at_or_before(window_start - 0.5 s)`, fingerprint each decoded YUV frame whose PTS lands in the window, restore the pipeline. The FrameRing is never touched during the walk — the decoded frames are discarded after fingerprinting.
-4. **Score every candidate** with a 5-probe windowed structural correlation against left-ring probe frames. Pick the best offset, tie-breaking toward the smallest seek distance.
-5. **Decide and dispatch**: refuse to seek under low confidence, "already aligned" early-out, or fold the offset into `shift_right_frames` so the standard L0/L1/L2 seek path carries out the motion. On the next main-loop iteration after the seek lands, rescore against the new right-ring current to verify.
+1. **Resolve searched interval**: look up the retry cache; if the prior press's cache is still valid, grow its `[searched_low_pts, searched_high_pts]` by the mode's base width in the allowed direction(s), clamped to the follower clip bounds. If the cache is invalid (or this is a fresh press after a manual intervention), seed the interval from follower.current ± base width. Saturation flags are set whenever growth hits a clip boundary.
+2. **Seed candidate pool** from the cache (if reusing) and the follower FrameRing: fingerprint every ring-resident follower frame not already in the cache. Ring frames are free — they're already RGB-packed after the format converter.
+3. **Extend via PacketRing walk** if the pool doesn't span the searched interval (plus probe/ring slack): enter a follower-only `ReadyToSeek` barrier, drive the decoder inline from `keyframe_at_or_before(searched_low - 0.5 s warmup)`, fingerprint each decoded YUV frame whose PTS lands in-window and isn't already in the pool, restore the pipeline. Dedup is PTS-keyed, so ring frames are never re-fingerprinted and cache-carried frames from earlier presses are preserved.
+4. **Score every candidate** with a 5-probe windowed structural correlation against master-ring probe frames. Scores are stored per-PTS; the decision phase picks based on the mode's rule.
+5. **Decide and dispatch per mode**: strictly-stronger-than-current gate for `` ` ``, at-or-above-current gate (iteration-friendly) for `[` / `]`. Boundary saturation overrides "nothing found" outcomes with a dedicated boundary message. On seek, fold into `shift_right_frames` (or the absolute-seek path under swap) and populate `pending_auto_align_verification_`; the next main-loop iteration rescores the landed frame.
 
 The whole thing is synchronous with the press — no background thread, no follow-up work across frames other than the one verification pass after the seek.
 
@@ -64,29 +68,31 @@ SwsContext instances are cached on the VideoCompare object (`auto_align_sws_cach
 
 The pool is a `std::vector<Candidate>` where each entry is `{int64_t pts, std::vector<float> fp}`.
 
-### 4.1 Ring-resident candidates
+### 4.1 Cache and ring-resident candidates
 
-Iterate `right.ring.at(off)` for `off ∈ [-history_size(), +prefetch_size()]`, fingerprint each frame via the RGB path (source format matches the format-converter output — e.g. `AV_PIX_FMT_RGB24`, `AV_PIX_FMT_RGB48LE`). A `std::unordered_set<int64_t>` of ring PTS values is built alongside for the dedup check used during the walk.
+On presses with a valid cache, the pool is seeded from `retry.candidates` (move, not copy — reclaimed from the cache). The dedup set `already_fingerprinted_pts` is populated from the cached PTS values so the ring and walk phases skip them.
 
-Ring-resident candidates are included **regardless of whether their PTS lies inside the requested window**. They're free, they improve scoring density, and — particularly under Symmetric mode — they give the tie-break path natural candidates to prefer.
+Then iterate `follower.ring.at(off)` for `off ∈ [-history_size(), +prefetch_size()]`, fingerprint each ring frame whose PTS isn't already in the dedup set. Ring frames use the RGB path (source format matches the format-converter output — e.g. `AV_PIX_FMT_RGB24`, `AV_PIX_FMT_RGB48LE`).
+
+Ring-resident candidates are included **regardless of whether their PTS lies inside the searched interval**. They're free, they improve scoring density, and — particularly under Symmetric mode — they give the tie-break path natural candidates to prefer.
 
 ### 4.2 PacketRing walk (conditional)
 
-If the ring already covers the window (`!candidates.empty() && ring_min_pts ≤ window_start_pts && ring_max_pts ≥ window_end_pts`), the walk is skipped. This is the common case for `` ` ``.
+If the pool already spans `[searched_low_pts − slack, searched_high_pts + slack]` (cache + ring combined), the walk is skipped. This is the common case for `` ` `` and for repeat presses where the cache already covers the expanded interval.
 
 Otherwise the walk runs. The sequence mirrors the L1 re-decode pattern ([buffer.md §11](buffer.md)):
 
-1. **Barrier the right side** via `enter_seek_barrier(right_only_pred)`. Left keeps running.
-2. **Reinit the right filterer** — the worker called `close_src()` on it while `is_seeking` was true, so the graph is torn down; calling `reinit()` here leaves it ready for the post-walk pipeline restart.
+1. **Barrier the follower side** via `enter_seek_barrier(follower_only_pred)`. Master keeps running.
+2. **Reinit the follower filterer** — the worker called `close_src()` on it while `is_seeking` was true, so the graph is torn down; calling `reinit()` here leaves it ready for the post-walk pipeline restart.
 3. **Flush the decoder** and reset its PTS state. The main thread now owns the codec.
-4. **Locate the starting keyframe** via `packet_ring.keyframe_at_or_before(window_start - 0.5 s slack)`. The 0.5 s warmup gives the decoder a GOP to stabilize before its output reaches the window. If no keyframe hit, log `[auto-align-walk-skip]` and fall through to scoring without the walk's contribution.
+4. **Locate the starting keyframe** via `packet_ring.keyframe_at_or_before(searched_low - 0.5 s warmup)`. The 0.5 s warmup gives the decoder a GOP to stabilize before its output reaches the searched interval. If no keyframe hit, log `[auto-align-walk-skip]` and fall through to scoring without the walk's contribution; this press's decision tags `packet_buffer_miss` so the user sees a distinct message from a clip-boundary saturation.
 5. **Iterate packets** from the keyframe forward using `range->iterate_from(index, visitor)`:
    - Clone each packet, `VideoDecoder::send` it, then pump `receive()` in a loop.
    - For each decoded raw frame: if it's in the hardware pixel format, `av_hwframe_transfer_data` it to a CPU frame; otherwise use it directly.
    - Convert `raw.pts` from stream time_base to AV_TIME_BASE µs (the same unit ring frames use) via `av_rescale_q(raw.pts, stream_tb, AV_TIME_BASE_Q) - demuxer_start_us`.
-   - If `frame_pts_us > window_end_pts`, stop. If `< window_start_pts`, skip (before the window; keep walking forward). If `ring_candidate_pts.count(frame_pts_us) > 0`, skip (ring already has it). Otherwise fingerprint via the YUV path (native source format) and push onto the candidate pool.
+   - If `frame_pts_us > window_end_pts` (searched_high + slack), stop. If `< window_start_pts`, skip (before the window; keep walking forward). If `already_fingerprinted_pts.count(frame_pts_us) > 0`, skip (ring or cache already has it). Otherwise fingerprint via the YUV path (native source format) and push onto the candidate pool.
 6. **Drain the decoder's reorder buffer** with a `send(nullptr)` + `receive` loop.
-7. **Post-walk restore**: flush decoder + reset PTS state; **forward**-seek the demuxer to `right.current.pts + 0.001 s` (with a backward fallback if the forward seek fails on sparse-keyframe inputs); restart all right-side queues. The forward-seek direction prevents the pipeline from re-emitting any frames we just fingerprinted.
+7. **Post-walk restore**: flush decoder + reset PTS state; **backward**-seek the demuxer to `follower.current.pts + 0.001 s`; restart all follower-side queues. Backward-seek direction prevents landing on a far-forward keyframe (sparse-key encodes) that would pollute the ring prefetch.
 
 Exceptions during the walk are caught and logged; the post-walk restore runs either way.
 
@@ -102,46 +108,72 @@ Ring-resident frames are already filtered (tone-mapped) and upscaled to `max_wid
 
 For each candidate entry `(cand_pts, cand_fp)`:
 
-1. **Hypothesize the time shift**: `delta_t = cand_pts - left_current_pts`.
-2. **Build 5 probe targets** on the left axis at `t_k = left_current_pts + k · probe_step_pts` for `k ∈ {-2, -1, 0, +1, +2}`. `probe_step_pts = max(left.delta_pts, right.delta_pts)` — spacing at the coarser frame rate guarantees each probe maps to a distinct frame on both sides.
-3. **Score per probe**: find the nearest left frame to `t_k` within `probe_step_pts / 2` tolerance; fingerprint it (cached by left PTS); find the nearest candidate to `t_k + delta_t` within the same tolerance; correlate.
+1. **Hypothesize the time shift**: `delta_t = cand_pts - master_current_pts`.
+2. **Build 5 probe targets** on the master axis at `t_k = master_current_pts + k · probe_step_pts` for `k ∈ {-2, -1, 0, +1, +2}`. `probe_step_pts = max(master.delta_pts, follower.delta_pts)` — spacing at the coarser frame rate guarantees each probe maps to a distinct frame on both sides.
+3. **Score per probe**: find the nearest master frame to `t_k` within `probe_step_pts / 2` tolerance; fingerprint it (cached by master PTS); find the nearest candidate to `t_k + delta_t` within the same tolerance; correlate.
 4. **Aggregate**: if fewer than 3 probes landed, disregard the hypothesis — under-supported. Otherwise `score[cand_pts] = sum / n_valid`.
-5. **Track best**: prefer higher scores; on near-ties (`|Δscore| ≤ 0.002`), prefer the smaller `|cand_pts - right_current.pts|` (minimise seek distance when the current position is already near-optimal).
+
+Scores are stored per-PTS; the decision phase (§6) picks based on the pressed mode's rule. The tie-break band used inside those rules is 0.0005 (`kAutoAlignTieBreakBand`) — much tighter than the improvement epsilon (0.005) so that a sharp 1.000 peak beats a near-peer a few frames closer to current. A 0.002 band historically let a 0.9982 candidate beat a 1.0000 peak on this content; 0.0005 preserves the peak-wins ordering while still absorbing reporting-noise-level jitter.
 
 This multi-probe structure is the defence against motion aliasing. A single-pose visual match gets a good score at only the center probe; neighbouring probes fail. A genuine alignment scores well across all five. The framerate asymmetry that motivated the redesign falls out naturally from the same mechanism — each probe lands on whatever frame happens to be nearest on each side, so differing frame densities don't bias the score.
 
-Left probe fingerprints are stored in an `std::unordered_map<int64_t, std::vector<float>>` keyed by left frame PTS, populated on first use inside the scoring loop.
+Master probe fingerprints are stored in an `std::unordered_map<int64_t, std::vector<float>>` keyed by master frame PTS, populated on first use and carried forward across subsequent presses via the retry cache — the master never moves during auto-align, so the same probes are always valid.
 
 ---
 
 ## 6. Decision gating
 
-After scoring, the loop has `best_score`, `best_pts`, `current_score` (the score at `cand_pts == right_current.pts` if that candidate was present), and `valid_scored`. Four decisions, in order:
+After scoring, each candidate has a score keyed by its PTS. The decision phase picks based on the pressed mode, with clip-boundary saturation overriding "nothing found" outcomes. The improvement epsilon (`kAutoAlignImprovementEps = 0.005`) governs WHEN a candidate is eligible for selection; the tie-break band (`kAutoAlignTieBreakBand = 0.0005`) governs ordering between eligible candidates.
 
-| Condition                                                   | Decision          | User message
-| ----------------------------------------------------------- | ----------------- | -------------
-| `valid_scored == 0`                                         | `no_frames`       | "Auto-align: insufficient probes — no change"
-| `best_score < 0.60` (`kAutoAlignConfidenceFloor`)           | `low_confidence`  | "Auto-align: low confidence (score …) — no change"
-| `best_pts == right_current.pts` or `best - current < 0.005` | `already`         | "Auto-align: already aligned (score …)"
-| *else*                                                      | `seek`            | "Auto-align: shift +N frame(s) (score …)"
+**`` ` `` Symmetric — strictly stronger wins:**
 
-On `seek`, the code computes `shift_right_frames += round((best_pts - right_current.pts) / right.delta_pts)` and populates `pending_auto_align_verification_` with everything needed to rescore post-seek:
+- Eligibility: `candidate.score > current_score + 0.005`.
+- Among eligible, pick strongest. Score ties (within 0.0005) break by smaller `|pts − follower_current|`; distance ties break toward ahead of current.
+- If no eligible candidate: decision = `already` (convergent — re-pressing from a peak doesn't move).
+- If both clip boundaries reached and no eligible candidate: decision = `boundary_both`.
+
+**`[` Backward / `]` Forward — at-or-above steps through near-equals:**
+
+- Eligibility: in the pressed direction, `pts ≠ follower_current`, and `candidate.score ≥ current_score - 0.005`.
+- Among eligible, pick strongest. A 1.0 short-circuit (score ≥ `1.0 - 0.002`) wins immediately regardless of distance. Score ties break by nearest-in-direction to current.
+- If no eligible candidate in the direction and the direction is saturated: decision = `boundary_start` (for `[`) / `boundary_end` (for `]`).
+- If no eligible candidate and the direction isn't saturated: decision = `no_stronger_in_direction` — the HUD message suggests pressing again to expand further.
+
+**Confidence floor**: regardless of mode, if the best *unconstrained* score in the pool is below `0.60` (`kAutoAlignConfidenceFloor`), nothing in the pool meets the "this looks like a real alignment" bar. Decision = `low_confidence`. If the pressed direction is saturated this becomes a boundary decision instead, since expansion can't help.
+
+Full decision table:
+
+| Condition                                                      | Decision                        | User message
+| -------------------------------------------------------------- | ------------------------------- | -------------
+| `valid_scored == 0` and the pressed direction is saturated     | `boundary_start`/`_end`/`_both` | "Auto-align: reached clip start/end" (or exhausted)
+| `valid_scored == 0` otherwise                                  | `no_frames`                     | "Auto-align: insufficient probes — no change"
+| `pool_best < 0.60` and pressed direction saturated             | `boundary_start`/`_end`/`_both` | (same as above)
+| `pool_best < 0.60` and no new work this press                  | `low_confidence`                | "Auto-align: still low confidence (…, window …)"
+| `pool_best < 0.60` otherwise                                   | `low_confidence`                | "Auto-align: low confidence (…) — press again to extend"
+| Mode rule picked nothing, direction saturated (`[`/`]`)        | `boundary_start`/`_end`         | "Auto-align: reached clip start/end"
+| Mode rule picked nothing, `` ` `` with both ends saturated     | `boundary_both`                 | "Auto-align: search exhausted (both clip boundaries reached…)"
+| Mode rule picked nothing, `` ` `` otherwise                    | `already`                       | "Auto-align: already aligned (score …)"
+| Mode rule picked nothing, `[` / `]` otherwise                  | `no_stronger_in_direction`      | "Auto-align: no stronger match ahead/behind (…)"
+| Mode rule picked a candidate                                   | `seek`                          | "Auto-align: shift +N frame(s) (score …)"
+
+On `seek`, the code computes `shift_right_frames += round((best_pts - follower_current.pts) / follower.delta_pts)` when follower == RIGHT, or dispatches via the absolute-seek path (see §11 for swap). It populates `pending_auto_align_verification_` with everything needed to rescore post-seek:
 
 ```
 struct PendingAutoAlignVerification {
   bool active;
   float expected_score;
   int expected_shift_frames;
-  int64_t left_current_pts;
+  Side follower_side;
+  int64_t master_current_pts;
   int64_t probe_step_pts;
   int64_t delta_t_pts;
-  std::unordered_map<int64_t, std::vector<float>> left_probe_fingerprints;
+  std::unordered_map<int64_t, std::vector<float>> master_probe_fingerprints;
 };
 ```
 
-The left probe fingerprints survive the seek because left isn't touched during a pure right-frame shift.
+The master probe fingerprints survive the seek because the master side isn't touched during a follower-scoped shift.
 
-The confidence floor refuses to act on a guess. If the user pressed `` ` `` with the pair genuinely misaligned by > 0.5 s, no candidate will structurally match — `best_score` stays near 0 or negative, and the seek is declined. The user sees "low confidence — no change" and knows to use `[` / `]` or manually shift with `+` / `-` before trying again.
+**Iteration semantics** for `[` / `]` fall out of the at-or-above gate: after a seek, follower.current is the previous target, and its score becomes the new `current_score`. The next press filters in-direction candidates with score ≥ new-current-score − eps, excluding current. Near-peer candidates in the direction still qualify; the picker's nearest-in-direction tie-break advances one frame at a time through them. Convergence isn't automatic for `[` / `]` — the user decides when to stop.
 
 ---
 
@@ -149,11 +181,12 @@ The confidence floor refuses to act on a guess. If the user pressed `` ` `` with
 
 After the seek branch (`after_seek_block:` → `log_seek()` in `compare()`), if `pending_auto_align_verification_.active`, the verification block runs:
 
-1. For each stored left probe fingerprint (keyed by left PTS), compute the expected right target at `left_pts + delta_t_pts`.
-2. Find the nearest right frame in the (now-updated) right ring at that target, within `probe_step_pts / 2` tolerance. Fingerprint it fresh.
-3. Correlate with the stored left fingerprint. Sum, count valid probes, divide.
+1. For each stored master probe fingerprint (keyed by master PTS), compute the expected follower target at `master_pts + delta_t_pts`.
+2. Find the nearest follower frame in the (now-updated) follower ring at that target, within `probe_step_pts / 2` tolerance. Fingerprint it fresh.
+3. Correlate with the stored master fingerprint. Sum, count valid probes, divide.
 4. Compare the result to `expected_score`. If `landed_score >= expected_score - 0.01` (`kAutoAlignVerificationSlack`), the seek landed cleanly — no action. If worse, emit "Auto-align: landed score X.XXX (expected Y.YYY) — seek imprecision" so the user knows the alignment didn't land quite where it was supposed to.
-5. Clear `pending_auto_align_verification_`.
+5. Sync `auto_align_retry_cache_.follower_pts_at_cache` to the actual landed PTS — this keeps the cache valid for the next press (without this update, the invalidation guard would reject the cache the moment the seek lands on a slightly-different PTS than planned).
+6. Clear `pending_auto_align_verification_`.
 
 No retry, no rollback — that was an explicit user-chosen policy. A failing verification is a diagnostic, not a correction.
 
@@ -168,38 +201,36 @@ Set `VIDEO_COMPARE_LOG_AUTO_ALIGN=1` to stream per-press diagnostics to stderr, 
 ```
 [auto-align] pts_delta_ms=<per-candidate>  probes=<n>/5  score=<per-candidate>
   ... one line per scored candidate ...
-[auto-align] mode=<sym|back|fwd> ring=<n> decoded=<n> decode_ms=<int>
-             walk=<none|done|skipped> candidates=<total> scored=<n>
+[auto-align] mode=<sym|back|fwd> follower=<LEFT|RIGHT> ring=<n> decoded=<n>
+             decode_ms=<int> walk=<none|done|skipped>
+             candidates=<total> scored=<n>
              best_pts_delta_ms=<float>  best_score=<float|n/a>
              current_score=<float|n/a>  shift_frames=<int>
-             decision=<seek|already|low_confidence|no_frames>
-             window=[start_rel, end_rel]s
+             decision=<seek|already|no_stronger_in_direction|low_confidence
+                       |no_frames|boundary_start|boundary_end|boundary_both>
+             searched_window=[low_rel, high_rel]s
+             low_sat=<0|1>  high_sat=<0|1>
 [auto-align] landed_pts_delta_ms=<float>  landed_score=<float>
              expected_score=<float>  ok=<true|false>  probes=<n>
 ```
 
-The per-candidate lines come first, then the decision summary, then — for a `seek` decision — the post-seek verification line after the seek dispatch completes. `[auto-align-walk-skip] reason=...` fires if the PacketRing walk is skipped (e.g., target not covered by the PacketRing, single-decoder mode, single-frame media).
+The per-candidate lines come first, then the decision summary, then — for a `seek` decision — the post-seek verification line after the seek dispatch completes. `searched_window` is reported relative to `follower_current` at press-time, so you can see at a glance how far the searched region has walked in each direction across consecutive presses. `low_sat` / `high_sat` report clip-boundary saturation on the low/high ends of the searched interval. `[auto-align-walk-skip] reason=...` fires if the PacketRing walk is skipped (e.g., target not covered by the PacketRing, single-decoder mode, single-frame media).
 
 ---
 
-## 9. Headless testing via the input-script harness
+## 9. Headless testing
 
-The full pipeline can be driven headlessly by the scripted-keystroke harness (see [`input-testing.md`](input-testing.md)). The ` ` `, `[`, and `]` keys are recognized by name (`grave` / `backtick` / `backquote`) or as single characters.
+The pytest integration harness ([tests/README.md](../../tests/README.md)) drives the binary through the Unix-socket control surface and parses `[auto-align]` log lines for verification. Tests covering the current auto-align behavior:
 
-Primary ground-truth test — the lg1 SDR/HDR pair with a known +2.066 s content offset:
+- [`test_lg_daylight_alignment.py`](../../tests/integration/test_lg_daylight_alignment.py) — 2-press forward-mode convergence on the lg-daylight pair, frame-exact to 2 ms. Verifies `searched_window` growth ([0, +1]s then [0, +2]s) and cache carry-forward via `ring=0` on press 2.
+- [`test_directional_backward.py`](../../tests/integration/test_directional_backward.py) — backward-mode convergence on a testsrc+concat pair with a known -2.002 s shift.
+- [`test_auto_align_boundary.py`](../../tests/integration/test_auto_align_boundary.py) — clip-boundary saturation on repeated `[` presses at clip start.
+- [`test_auto_align_cross_mode.py`](../../tests/integration/test_auto_align_cross_mode.py) — cache carries across mode changes (`` ` `` → `[`).
+- [`test_auto_align_iteration.py`](../../tests/integration/test_auto_align_iteration.py) — directional step-through past a converged peak.
+- [`test_retry_cache_reset.py`](../../tests/integration/test_retry_cache_reset.py) — cache invalidation by intervening `+` keypress.
+- [`test_2160p_alignment_performance.py`](../../tests/integration/test_2160p_alignment_performance.py) — UHD performance canary with frame-exact endgame.
 
-```
-VIDEO_COMPARE_INPUT_SCRIPT=tmp/auto_align_lg1.txt \
-VIDEO_COMPARE_LOG_AUTO_ALIGN=1 \
-./video-compare -t 2.0 \
-  testdata/lg1/lg1-extrashifted-border10px-sdr-yuv420p-2160p-59.9fps-x264.mp4 \
-  testdata/lg1/lg1-full-hdr-yuv420p10le-720p-30fps-hevc.mp4 \
-  2> tmp/auto_align_lg1.log
-```
-
-Where the script presses space to pause, then `]`, then quits. The expected `[auto-align]` summary line has `best_pts_delta_ms ≈ 2085.4`, `best_score ≥ 0.90`, `decision=seek`, and the subsequent `landed_…` line has `ok=true`.
-
-See [testdata/alignment/README.md](../../testdata/alignment/README.md) for the frame-level ground truth.
+Primary ground-truth fixture is the lg-daylight pair; see [tests/fixtures/pairs/](../../tests/fixtures/pairs/) for pair manifests and [testdata/alignment/README.md](../../testdata/alignment/README.md) for the frame-level ground truth.
 
 ---
 
@@ -234,32 +265,52 @@ The L0 pivot is not symmetric. Under swap, even small LEFT shifts fall through t
 
 **Verification** (`PendingAutoAlignVerification`) carries `follower_side` so the post-seek rescore looks up the landed frame in the correct ring. Probe fingerprints are stored against master PTS keys (master doesn't move during the seek). See [`app/video_compare.h`](../../app/video_compare.h) for the struct.
 
-**Diagnostic logging** gained a `follower=LEFT|RIGHT` field in the `[auto-align] mode=…` summary line. Example:
+**Diagnostic logging** includes a `follower=LEFT|RIGHT` field in the `[auto-align] mode=…` summary line. Example:
 
 ```
 [auto-align] mode=fwd follower=LEFT ring=25 decoded=0 decode_ms=725 walk=done \
              candidates=25 scored=25 best_pts_delta_ms=-2052.056 \
              best_score=0.9657 current_score=0.9657 shift_frames=0 \
-             decision=already window=[0.000,1.000]s
+             decision=already searched_window=[0.000,1.000]s low_sat=0 high_sat=0
 ```
 
-**Verification harness**: [tmp/swap_autoalign_test.py](../../tmp/swap_autoalign_test.py) drives the socket API to run an auto-align key press both with and without swap and asserts that the `follower=` field in the log follows the swap state. Reproducible in CI without a display.
+**Verification**: [tests/integration/test_swap.py::test_autoalign_follower_follows_swap](../../tests/integration/test_swap.py) drives the socket API to run an auto-align key press with and without swap and asserts that the `follower=` field follows the swap state.
 
 ---
 
-## 12. Retry-to-extend window
+## 12. Searched-interval cache
 
-When a press returns `low_confidence`, pressing the same key again extends the search window rather than rescanning the same region. Each retry grows the window by the mode's base width — Symmetric adds ±0.5 s per retry, Backward/Forward each add 1.0 s per retry — so press N covers N × the base window. The candidate pool and master probe fingerprints from the previous press are carried forward, so each retry only decodes and fingerprints the *newly-exposed* strip of the window.
+The retry cache tracks a *searched interval* on the follower PTS axis — a single absolute range `[searched_low_pts, searched_high_pts]` that grows monotonically across consecutive presses. Each press extends the interval in its mode's allowed direction(s) by one base width, clamped to the follower clip's `[start_time, start_time + duration)`. The candidate pool and master probe fingerprints are carried forward; PTS-keyed dedup ensures each new press's decode work is limited to the net-new strip.
 
-State lives on `VideoCompare::auto_align_retry_cache_` (`AutoAlignRetryCache` in [`app/video_compare.h`](../../app/video_compare.h)). The cache is valid for the next press iff every one of these is still true when that press arrives:
+The cache stays valid across **mode changes and successful seeks**. The user's mental model is "progress bar that fills in as I search" — whatever key they press, the searched region grows rather than resets. Examples:
 
-- Same mode as the cached press (mixing `]` and `[` resets).
-- Same follower side (swapping sides mid-retry resets).
-- Master-side and follower-side `current.pts` are unchanged (any intervening seek, `+`/`-` shift, playback advance, or shift-click resets by construction — no explicit reset hooks needed elsewhere).
-- A previous walk didn't already hit Case C (packet-ring coverage exhausted). When that has happened, the next matching press short-circuits with `"Auto-align: reached end of packet buffer"` and an `[auto-align] decision=packet_ring_exhausted` log line; further expansion won't help because the same keyframe lookup would also bail.
+- `` ` `` then `[`: symmetric press seeds `[-0.5 s, +0.5 s]` around follower.current; backward press extends the low end by 1.0 s, keeping the symmetric press's forward half. Net searched interval: `[-1.5 s, +0.5 s]`.
+- `[` then `[` then `]`: two backward presses walk the low end to `-2.0 s`; the forward press extends the high end to `+1.0 s`. Net: `[-2.0 s, +1.0 s]`.
+- Successful `` ` `` seek then `` ` `` again: cache preserved; `follower_pts_at_cache` is updated to the landed PTS by the post-seek verification block; the next press grows the interval around the new follower position.
 
-On any other outcome (`seek`, `already`, `no_frames`), the cache is cleared so the next press starts fresh.
+The cache **is** invalidated when:
 
-The `retry=N` field in the `[auto-align] mode=…` summary line counts retries: `retry=0` is the first press (or a fresh press after invalidation), `retry=1` is the first retry, etc. When the cache is reused, `ring=` shows `0` (no new ring contribution — everything was already in the cache) and `decoded=` shows only the newly-decoded frames from the extended strip.
+- Follower side was swapped (different side = different FrameRing, master axes flipped).
+- Master-side or follower-side `current.pts` mismatches the cached values without auto-align having produced the move: any `+`/`-` shift, manual scrub, shift-click, playback advance.
 
-HUD messages differ between the first low_confidence and subsequent retries: the first hints "press again to extend", subsequent retries show the current window span, so the user can tell how far the search has walked.
+State lives on `VideoCompare::auto_align_retry_cache_` (`AutoAlignRetryCache` in [`app/video_compare.h`](../../app/video_compare.h)):
+
+```
+struct AutoAlignRetryCache {
+  bool valid;
+  int64_t master_pts_at_cache;
+  int64_t follower_pts_at_cache;  // post-seek: landed PTS
+  Side follower_side;
+  int64_t searched_low_pts;
+  int64_t searched_high_pts;
+  bool low_saturated;              // low end at clip start
+  bool high_saturated;             // high end at clip end
+  bool packet_buffer_miss;         // last walk failed to find a keyframe
+  std::vector<AutoAlignCandidate> candidates;
+  std::unordered_map<int64_t, std::vector<float>> master_probe_fingerprints;
+};
+```
+
+`packet_buffer_miss` is distinct from clip-boundary saturation: the former means the PacketRing's keyframe lookup failed (buffer doesn't currently cover the target — the clip might extend further), the latter means the clip itself ends here (no further expansion possible in that direction). Each surfaces a different user message.
+
+The `searched_window=[low_rel, high_rel]s` field in the `[auto-align]` summary line reports the interval relative to follower.current at press-time, so you can watch it grow across consecutive presses. The `low_sat` / `high_sat` flags show saturation. When the cache is reused, `ring=0` confirms no new ring contribution and `decoded=N` is only the net-new strip from the extended portion.
