@@ -168,7 +168,7 @@ test: check
 .PHONY: clean
 clean:
 	$(RM) $(obj) $(target) $(dep) $(test_obj) $(test_dep) $(test_target)
-	$(RM) -r tests/integration/_artifacts
+	$(RM) -r tests/integration/_artifacts tests/integration/__pycache__ .pytest_cache
 
 .PHONY: distclean
 distclean: clean
