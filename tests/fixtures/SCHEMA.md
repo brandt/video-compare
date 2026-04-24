@@ -13,7 +13,7 @@ per-frame PTS values are.
 
   "source": {
     "id": "lg-daylight-sdr-vp9-2160p-59.94",
-    "url": "https://s3.amazonaws.com/public-test-fixtures/video-compare/sources/lg-daylight-sdr-vp9-2160p.webm",
+    "url": "https://public-test-fixtures.s3.amazonaws.com/video-compare/sources/lg-daylight-sdr-vp9-2160p.webm",
     "sha256": "<source file sha>"
   },
 
@@ -23,7 +23,7 @@ per-frame PTS values are.
   },
 
   "output": {
-    "url": "https://s3.amazonaws.com/public-test-fixtures/video-compare/fixtures/lg-daylight-sdr-h264-2160p-trim124.mp4",
+    "url": "https://public-test-fixtures.s3.amazonaws.com/video-compare/fixtures/lg-daylight-sdr-h264-2160p-trim124.mp4",
     "sha256": "<sha of output>",
     "byte_size": 12345678
   },

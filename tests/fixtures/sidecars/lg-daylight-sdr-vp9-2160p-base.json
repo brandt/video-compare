@@ -1,9 +1,9 @@
 {
   "fixture_id": "lg-daylight-sdr-vp9-2160p-base",
-  "description": "SDR VP9 2160p 8-bit, plays source[0..] from raw_pts=0. Used as RIGHT side in lg-daylight-auto-align \u2014 contains 124 source-frames of \"intro\" content before the aligned region. 8-bit (yuv420p) to match the fingerprint path's ring-frame format; a 10-bit variant is a separate recipe.",
+  "description": "SDR VP9 2160p 8-bit, plays source[0..] from raw_pts=0. Used as RIGHT side in lg-daylight-auto-align - contains 124 source-frames of 'intro' content before the aligned region. 8-bit (yuv420p) to match the fingerprint path's ring-frame format; a 10-bit variant is a separate recipe.",
   "source": {
     "id": "lg-daylight-sdr-vp9-2160p-59.94",
-    "url": "https://s3.amazonaws.com/public-test-fixtures/video-compare/sources/lg-daylight-sdr-vp9-2160p-59.94.webm",
+    "url": "https://public-test-fixtures.s3.amazonaws.com/video-compare/sources/lg-daylight-sdr-vp9-2160p-59.94.webm",
     "sha256": "5b7e8b51f2f82ac4b6ecd8e854e57068d2e5a23718c56db835ff5ec7c3574e42"
   },
   "generation": {
@@ -45,7 +45,7 @@
     ]
   },
   "output": {
-    "url": "https://s3.amazonaws.com/public-test-fixtures/video-compare/fixtures/lg-daylight-sdr-vp9-2160p-base.webm",
+    "url": "https://public-test-fixtures.s3.amazonaws.com/video-compare/fixtures/lg-daylight-sdr-vp9-2160p-base.webm",
     "sha256": "a6abd135ccb35c766373d900f0731c46f063d8433f1e5486cb7585c19ba019c3",
     "byte_size": 62174404
   },

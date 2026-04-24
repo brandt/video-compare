@@ -44,7 +44,7 @@ PAIR_DIR = REPO_ROOT / "tests" / "fixtures" / "pairs"
 S3_BUCKET = "public-test-fixtures"
 S3_PREFIX = "video-compare"  # so uploaded objects live at s3://<bucket>/video-compare/...
 S3_AWS_PROFILE = "public-test-fixtures"
-S3_PUBLIC_URL_BASE = f"https://s3.amazonaws.com/{S3_BUCKET}/{S3_PREFIX}"
+S3_PUBLIC_URL_BASE = f"https://{S3_BUCKET}.s3.amazonaws.com/{S3_PREFIX}"
 
 
 # ---------------------------------------------------------------------------

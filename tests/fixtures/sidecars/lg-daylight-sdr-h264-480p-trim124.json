@@ -3,7 +3,7 @@
   "description": "SDR x264 480p, trimmed to start at source frame 124. 480p downscale of lg-daylight-sdr-h264-2160p-trim124 for lightweight logic tests.",
   "source": {
     "id": "lg-daylight-sdr-vp9-2160p-59.94",
-    "url": "https://s3.amazonaws.com/public-test-fixtures/video-compare/sources/lg-daylight-sdr-vp9-2160p-59.94.webm",
+    "url": "https://public-test-fixtures.s3.amazonaws.com/video-compare/sources/lg-daylight-sdr-vp9-2160p-59.94.webm",
     "sha256": "5b7e8b51f2f82ac4b6ecd8e854e57068d2e5a23718c56db835ff5ec7c3574e42"
   },
   "generation": {
@@ -45,7 +45,7 @@
     ]
   },
   "output": {
-    "url": "https://s3.amazonaws.com/public-test-fixtures/video-compare/fixtures/lg-daylight-sdr-h264-480p-trim124.mp4",
+    "url": "https://public-test-fixtures.s3.amazonaws.com/video-compare/fixtures/lg-daylight-sdr-h264-480p-trim124.mp4",
     "sha256": "5b53e78de368c49e3b4d4722a2c76c94ea5bc41d609c2071f234d9a6efb8f2ff",
     "byte_size": 6247784
   },

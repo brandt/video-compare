@@ -1,9 +1,9 @@
 {
   "fixture_id": "lg-daylight-sdr-h264-480p-intro2s-trim124",
-  "description": "SDR x264 480p: 2-s `testsrc2` lavfi intro prepended to source[124..]. Used as LEFT side in lg-daylight-480p-backward-align \u2014 the intro's length makes source-content appear at raw=+2s, making the aligned shift target negative and `[` the natural convergence key.",
+  "description": "SDR x264 480p: 2-s `testsrc2` lavfi intro prepended to source[124..]. Used as LEFT side in lg-daylight-480p-backward-align - the intro's length makes source-content appear at raw=+2s, making the aligned shift target negative and `[` the natural convergence key.",
   "source": {
     "id": "lg-daylight-sdr-vp9-2160p-59.94",
-    "url": "https://s3.amazonaws.com/public-test-fixtures/video-compare/sources/lg-daylight-sdr-vp9-2160p-59.94.webm",
+    "url": "https://public-test-fixtures.s3.amazonaws.com/video-compare/sources/lg-daylight-sdr-vp9-2160p-59.94.webm",
     "sha256": "5b7e8b51f2f82ac4b6ecd8e854e57068d2e5a23718c56db835ff5ec7c3574e42"
   },
   "generation": {
@@ -47,7 +47,7 @@
     ]
   },
   "output": {
-    "url": "https://s3.amazonaws.com/public-test-fixtures/video-compare/fixtures/lg-daylight-sdr-h264-480p-intro2s-trim124.mp4",
+    "url": "https://public-test-fixtures.s3.amazonaws.com/video-compare/fixtures/lg-daylight-sdr-h264-480p-intro2s-trim124.mp4",
     "sha256": "37d160a38e8707cf9cbb1a2cbc738e6f11eca96ed344097a9152340d62d4d70a",
     "byte_size": 6677872
   },
