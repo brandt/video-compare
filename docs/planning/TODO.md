@@ -1,12 +1,12 @@
 # TODO
 
-- BUG: Fix "Window exceeds display area (use -W flag to resize)" warning firing when the screen actually is big enough.
 - FEATURE: Increase the performance of `-t SECS` which currently has to play through the entire pre-shift duration.
 
 ## WIP
 
 ## Done
 
+- BUG: "Window exceeds display area" warning fired spuriously on macOS Retina displays. Root cause was unit-mismatch plus bad chrome estimates: `SDL_GetDisplayUsableBounds` and `SDL_GetWindowSize` both return *points* on HiDPI, but the subtracted chrome constants (`border_width=10`, `border_height=34`) were tuned for X11/Windows pixels. macOS windows have no side chrome (0 pts) and a ~28-pt titlebar, so a legitimately-fitting window at exactly the usable width fired the warning. Switched the fallback constants to `__APPLE__`-specific values (0/28), and the check now prefers `SDL_GetWindowBordersSize` when the platform actually reports it (Windows, some X11). macOS returns `have_frame=0` so the fallback still drives the comparison — now correctly.
 - FEATURE (tests): Backward-mode convergence tested end-to-end via a `lavfi + testsrc + concat` fixture family. New `Recipe.intro_seconds`/`intro_pattern` fields let recipes prepend a synthetic testsrc intro of configurable length; sidecars record `intro_frames` so `Fixture.raw_pts_us_for_source_frame` still maps source-frame→raw-pts correctly. Fixture `lg-daylight-sdr-h264-480p-intro2s-trim124` (2-s testsrc intro + source[124..]) paired with the no-intro `trim124` gives an aligned shift of −2002 ms. The test plays forward ~3 s past the intro, then fires three `[` presses — retry-expansion grows the backward window to [−3 s, 0] on press 3 where the true target peaks cleanly. Lands frame-exact within 2 ms.
 - FEATURE (tests): Port `tmp/swap_click_test.py` to pytest. Simpler than anticipated — the shift-click handler (`Display::handle_mouse_button_event`) computes `mouse_x / window_width` regardless of y coordinate, so no timeline_rect lookup was needed. Lives as `test_swap_click.py` with Case A (no swap — LEFT stationary) and Case B (swap active — RIGHT stationary) mirroring the standalone script's coverage.
 - FEATURE: `VIDEO_COMPARE_TEST_HOLD=1` env var for manual inspection. When set, `VideoCompareSession.__exit__` blocks on stdin before teardown so an operator can visually verify the final landed state. Prints final `play_state`, `effective_time_shift`, and log path. Useful with `pytest -s` to keep the video-compare window alive after a test's actions complete.

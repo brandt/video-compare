@@ -97,11 +97,18 @@ Display::Display(const int display_number,
   int window_width;
   int window_height;
 
-  // account for window frame and title bar
+  // Account for window frame and title bar (in points — same units as
+  // SDL_GetDisplayUsableBounds and SDL_GetWindowSize). Platform-tuned
+  // fallbacks; SDL_GetWindowBordersSize replaces these at warn-time when
+  // available (Windows, some X11), but reliably returns 0 on macOS.
+#if defined(__APPLE__)
+  constexpr int border_width = 0;   // macOS windows have no side chrome.
+  constexpr int border_height = 28; // Standard macOS titlebar height.
+#elif defined(__linux__)
   constexpr int border_width = 10;
-#ifdef __linux__
   constexpr int border_height = 40;
 #else
+  constexpr int border_width = 10;
   constexpr int border_height = 34;
 #endif
 
@@ -226,12 +233,28 @@ Display::Display(const int display_number,
   startup_window_size_ = {window_width_, window_height_};
   saved_window_size_ = startup_window_size_;
 
-  // Check if window is larger than display and warn user
-  const int usable_width = bounds.w - border_width;
-  const int usable_height = bounds.h - border_height;
+  // Check if the window (including its frame/titlebar) is larger than the
+  // display's usable area and warn the user. Prefer the window's actual
+  // frame sizes from SDL over the hardcoded pre-creation estimates — on
+  // macOS the side borders are 0 and the titlebar is ~28 pts (not 10/34),
+  // so the estimates produce false-positive warnings when a legitimately-
+  // fitting window is computed from a Retina-sized video.
+  int frame_top = 0;
+  int frame_left = 0;
+  int frame_bottom = 0;
+  int frame_right = 0;
+  const bool have_frame = SDL_GetWindowBordersSize(window_, &frame_top, &frame_left, &frame_bottom, &frame_right);
 
-  if (window_width_ > usable_width || window_height_ > usable_height) {
-    std::cout << "WARNING: Window size (" << window_width_ << "x" << window_height_ << ") exceeds display area (" << usable_width << "x" << usable_height
+  // Fallback to the pre-creation estimates when the platform can't report
+  // actual chrome (e.g. Wayland, where the compositor owns the frame).
+  const int chrome_w = have_frame ? (frame_left + frame_right) : border_width;
+  const int chrome_h = have_frame ? (frame_top + frame_bottom) : border_height;
+
+  const int total_window_width = window_width_ + chrome_w;
+  const int total_window_height = window_height_ + chrome_h;
+
+  if (total_window_width > bounds.w || total_window_height > bounds.h) {
+    std::cout << "WARNING: Window size (" << total_window_width << "x" << total_window_height << ") exceeds display area (" << bounds.w << "x" << bounds.h
               << "). Consider reducing the window size (use -W flag to resize) or using a larger display." << std::endl;
 
     set_pending_message("Window exceeds display area (use -W flag to resize)");
