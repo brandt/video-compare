@@ -1,0 +1,14 @@
+{
+  "pair_id": "lg-daylight-480p-backward-align",
+  "description": "Pair designed to exercise `[` (Backward) auto-align convergence. LEFT has a 2-s synthetic `testsrc2` intro prepended to source[124..]; RIGHT is source[124..] with no intro. At both raw=0 their contents don't overlap (LEFT shows testsrc, RIGHT shows source[124]). After a brief forward playback both sides land on real content, with LEFT's content trailing RIGHT's by 2 seconds — the aligned shift is negative, making `[` the natural convergence key.",
+
+  "left":  "lg-daylight-sdr-h264-480p-intro2s-trim124",
+  "right": "lg-daylight-sdr-h264-480p-trim124",
+
+  "check_points": [
+    {
+      "source_frame": 124,
+      "rationale": "First aligned frame: left raw=+2002000us, right raw=0. Expected effective_time_shift = right - left = -2002000us."
+    }
+  ]
+}

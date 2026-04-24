@@ -82,6 +82,12 @@ class Fixture:
     def first_source_frame(self) -> int:
         return self.data["content_mapping"]["first_source_frame_shown"]
 
+    @property
+    def intro_frames(self) -> int:
+        """Number of encoded frames belonging to a synthetic pre-content
+        intro (e.g., lavfi testsrc), if any. Zero for plain recipes."""
+        return self.data["content_mapping"].get("intro_frames", 0)
+
     def local_path(self) -> pathlib.Path:
         return CACHE_DIR / self.filename
 
@@ -117,14 +123,18 @@ class Fixture:
         """Return the raw PTS (in microseconds) of the given source frame in
         this fixture, or None if that source frame isn't present.
 
-        The fixture's `first_source_frame_shown` maps source_frame → local
-        frame index; `frame_pts_us[local_idx]` is the exact PTS the encoded
-        file emits for that frame.
+        `first_source_frame_shown` names the source-frame index at the
+        first CONTENT frame of this fixture. For a plain recipe that's at
+        local_idx=0. For a recipe with a synthetic intro, source content
+        starts at local_idx=intro_frames.
         """
         rel = source_frame - self.first_source_frame
-        if rel < 0 or rel >= self.total_frames:
+        if rel < 0:
             return None
-        return self.frame_pts_us[rel]
+        local_idx = self.intro_frames + rel
+        if local_idx >= self.total_frames:
+            return None
+        return self.frame_pts_us[local_idx]
 
 
 @dataclasses.dataclass

@@ -160,6 +160,30 @@ class VideoCompareSession:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        # When VIDEO_COMPARE_TEST_HOLD is set, pause before teardown so the
+        # operator can manually inspect the video-compare window + final
+        # state. Blocks on stdin; press Enter (or Ctrl-C) to continue and
+        # close the session. Test actions have already completed by this
+        # point, so what you see is the final landed state.
+        if os.environ.get("VIDEO_COMPARE_TEST_HOLD"):
+            status = "FAIL" if exc is not None else "pass"
+            try:
+                final_shift = self.get("effective_time_shift")
+                final_state = self.get("play_state")
+                sys.stderr.write(
+                    f"\n[hold] test actions complete ({status}); "
+                    f"play_state={final_state} effective_time_shift={final_shift:.4f} s. "
+                    f"Log: {self._log_path}\n"
+                    f"[hold] Press Enter (or Ctrl-C) to close the session.\n"
+                )
+                sys.stderr.flush()
+                try:
+                    input()
+                except (KeyboardInterrupt, EOFError):
+                    pass
+            except Exception as inspect_err:
+                sys.stderr.write(f"[hold] couldn't read state: {inspect_err}\n")
+
         # If an assertion failed, copy the log out before teardown so the
         # user can inspect it. Uses an artifacts dir under tests/integration/.
         if exc is not None and self._log_path is not None and self._log_path.exists():

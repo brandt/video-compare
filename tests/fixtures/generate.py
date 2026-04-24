@@ -92,8 +92,18 @@ class Recipe:
     extension: str  # "mp4" | "webm" | ...
     # Number of source frames skipped from the start. 0 means "no intro".
     # A nonzero value puts the source frame at this index at the fixture's
-    # raw_pts=0.
+    # raw_pts=0 (unless `intro_seconds > 0`, in which case a synthetic
+    # lavfi intro is prepended first — see below).
     first_source_frame: int
+    # Optional synthetic intro prepended to the encoded output. When > 0,
+    # the generator runs ffmpeg with two inputs (`-f lavfi -i testsrc2...`
+    # + the real source) and concats them. Used to create pairs where
+    # each side has a structurally-distinguishable pre-content region of a
+    # known duration — the enabling primitive for backward-convergence
+    # tests. `intro_pattern` is appended to the lavfi input string so
+    # different recipes can produce visually-different intros.
+    intro_seconds: float = 0.0
+    intro_pattern: str = "testsrc2"  # any lavfi source filter name
     # Declared encoded properties — the generator verifies the real output
     # matches these via ffprobe after encoding.
     encoded_fps_num: int = 60000
@@ -207,6 +217,45 @@ RECIPES: list[Recipe] = [
             "-an",
         ],
     ),
+    # Backward-convergence test fixture. Same encoded codec/size as the
+    # 480p pair above, but with a 2-s synthetic `testsrc2` intro prepended
+    # before the source content (starting at source_frame=124). When used
+    # as the LEFT side of a pair whose RIGHT is `lg-daylight-sdr-h264-480p-
+    # trim124` (no intro, plays source[124..] from raw_pts=0), the aligned
+    # shift target is -2 s — RIGHT's content is always "ahead" of LEFT's
+    # in common time — which exercises `[` (Backward mode) convergence.
+    Recipe(
+        fixture_id="lg-daylight-sdr-h264-480p-intro2s-trim124",
+        description=(
+            "SDR x264 480p: 2-s `testsrc2` lavfi intro prepended to source[124..]. "
+            "Used as LEFT side in lg-daylight-480p-backward-align — the intro's "
+            "length makes source-content appear at raw=+2s, making the aligned "
+            "shift target negative and `[` the natural convergence key."
+        ),
+        source_id="lg-daylight-sdr-vp9-2160p-59.94",
+        extension="mp4",
+        first_source_frame=124,
+        intro_seconds=2.0,
+        intro_pattern="testsrc2",
+        encoded_codec="h264",
+        encoded_pixel_format="yuv420p",
+        encoded_keyframe_interval_frames=250,
+        duration_seconds=13.0,  # 2s intro + 13s content ≈ 15s total, same as peers
+        extra_args=[
+            "-r", "60000/1001",
+            "-vf", "scale=854:480",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-g", "250",
+            "-keyint_min", "250",
+            "-bf", "2",
+            "-sc_threshold", "0",
+            "-video_track_timescale", "1000",
+            "-an",
+        ],
+    ),
     Recipe(
         fixture_id="lg-daylight-sdr-vp9-2160p-base",
         description=(
@@ -302,19 +351,77 @@ def ffprobe_frame_pts(path: pathlib.Path) -> list[int]:
 def build_ffmpeg_argv(recipe: Recipe, source_path: pathlib.Path, output_path: pathlib.Path) -> list[str]:
     """Construct the ffmpeg argv for a recipe.
 
-    We use input-side seeking to skip frames cheaply, then output-side -t to cap
-    duration. For frame-exactness we rely on the encoder producing sequential
-    PTSes from 0 (which is the default with no -copyts).
+    Two shapes:
+      - Standard: `-ss <start> -i source -t <dur> <encoder-args> out`. Used
+        when `intro_seconds == 0`. Input-side seeking skips frames cheaply;
+        output-side `-t` caps duration.
+      - Concat-with-synthetic-intro: two inputs (`-f lavfi -i testsrc2...`
+        + the real source) joined by a filter_complex `concat` graph. The
+        resulting file plays `intro_seconds` of the lavfi pattern, then
+        `duration_seconds` of source content starting at
+        `first_source_frame`. Enables backward-convergence tests where one
+        side needs a structurally-distinguishable pre-content region.
     """
-    # Convert first_source_frame to a start time using the source's source fps.
-    # Our known sources are 60000/1001 ≈ 59.94 fps.
     start_seconds = recipe.first_source_frame * recipe.encoded_fps_den / recipe.encoded_fps_num
+
+    # Determine the target resolution. Look for `scale=WxH` in extra_args;
+    # default to the source's native size if absent. This is best-effort —
+    # the lavfi input must match the filter graph's declared size.
+    scale_w, scale_h = None, None
+    for i, arg in enumerate(recipe.extra_args):
+        if arg == "-vf" and i + 1 < len(recipe.extra_args):
+            vf = recipe.extra_args[i + 1]
+            if vf.startswith("scale="):
+                parts = vf.split("=", 1)[1].split(":")
+                if len(parts) == 2:
+                    scale_w, scale_h = int(parts[0]), int(parts[1])
+
+    if recipe.intro_seconds <= 0:
+        # Standard path.
+        argv = [
+            "ffmpeg", "-y", "-hide_banner",
+            "-ss", f"{start_seconds:.9f}",
+            "-i", str(source_path),
+            "-t", f"{recipe.duration_seconds:.6f}",
+        ] + list(recipe.extra_args) + [
+            str(output_path),
+        ]
+        return argv
+
+    # Concat-with-intro path.
+    if scale_w is None or scale_h is None:
+        # For safety: require an explicit scale filter on concat recipes so
+        # the lavfi size matches the source-trim size.
+        raise SystemExit(
+            f"Recipe {recipe.fixture_id}: intro_seconds > 0 requires a "
+            f"`-vf scale=WxH` entry in extra_args (so the lavfi intro size "
+            f"matches the source)."
+        )
+    # Strip `-vf scale=...` from extra_args since the filter_complex graph
+    # handles scaling of the source branch itself.
+    extra = list(recipe.extra_args)
+    if "-vf" in extra:
+        idx = extra.index("-vf")
+        del extra[idx:idx + 2]
+
+    intro_src = (
+        f"{recipe.intro_pattern}=size={scale_w}x{scale_h}"
+        f":rate={recipe.encoded_fps_num}/{recipe.encoded_fps_den}"
+        f":duration={recipe.intro_seconds:.6f}"
+    )
+    filter_complex = (
+        f"[0:v]setsar=1[intro];"
+        f"[1:v]trim=start={start_seconds:.9f}:duration={recipe.duration_seconds:.6f},"
+        f"setpts=PTS-STARTPTS,scale={scale_w}:{scale_h},setsar=1[content];"
+        f"[intro][content]concat=n=2:v=1:a=0[out]"
+    )
     argv = [
         "ffmpeg", "-y", "-hide_banner",
-        "-ss", f"{start_seconds:.9f}",  # seek before -i for speed (keyframe-aligned)
+        "-f", "lavfi", "-i", intro_src,
         "-i", str(source_path),
-        "-t", f"{recipe.duration_seconds:.6f}",
-    ] + list(recipe.extra_args) + [
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+    ] + extra + [
         str(output_path),
     ]
     return argv
@@ -437,9 +544,24 @@ def generate_one(recipe: Recipe) -> pathlib.Path:
         },
         "content_mapping": {
             "first_source_frame_shown": recipe.first_source_frame,
+            "intro_seconds": recipe.intro_seconds,
+            "intro_pattern": recipe.intro_pattern if recipe.intro_seconds > 0 else None,
+            # Number of encoded frames that make up the synthetic intro.
+            # Tests use `frame_pts_us[intro_frames]` to get the raw PTS of
+            # the first source-content frame.
+            "intro_frames": (
+                round(recipe.intro_seconds * recipe.encoded_fps_num / recipe.encoded_fps_den)
+                if recipe.intro_seconds > 0
+                else 0
+            ),
             "description": (
-                f"At this fixture's raw_pts=0, the frame shown corresponds to "
-                f"source_frame={recipe.first_source_frame}."
+                f"At this fixture's raw_pts=0, the frame shown is "
+                + (
+                    f"synthetic `{recipe.intro_pattern}` intro (first {recipe.intro_seconds:.3f}s), "
+                    f"then source_frame={recipe.first_source_frame}.."
+                    if recipe.intro_seconds > 0
+                    else f"source_frame={recipe.first_source_frame}."
+                )
             ),
         },
     }

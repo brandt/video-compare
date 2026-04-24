@@ -37,3 +37,10 @@ def lg_daylight_2160p_pair() -> fx.Pair:
     regression tests. Slower (1–3 s per L2 seek on 2160p h264/VP9 decode)
     so use sparingly."""
     return fx.load_pair("lg-daylight-auto-align")
+
+
+@pytest.fixture
+def lg_daylight_backward_pair() -> fx.Pair:
+    """Pair where aligned target is a NEGATIVE shift (LEFT has synthetic
+    intro, RIGHT has no intro). Used by backward-convergence tests."""
+    return fx.load_pair("lg-daylight-480p-backward-align")
