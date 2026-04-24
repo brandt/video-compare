@@ -62,10 +62,9 @@ def test_plus_minus_swap_sign_flip(video_compare_binary, lg_daylight_pair):
         )
 
 
-# Phase 2 (shift-click scopes to visual right) is covered by the standalone
-# script at tmp/swap_click_test.py, which depends on window-layout coordinates
-# tuned to the lg1 / -t2.0 launch. Porting here would need a robust way to
-# locate the timeline strip on arbitrary fixture sizes; deferred.
+# Phase 2 (shift-click scopes to visual right) lives in test_swap_click.py —
+# separate file because it uses the mouse button API and a different state-
+# snapshot pattern from the keyboard tests here.
 
 
 def test_autoalign_follower_follows_swap(video_compare_binary, lg_daylight_pair):
