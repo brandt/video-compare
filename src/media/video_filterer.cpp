@@ -139,13 +139,17 @@ VideoFilterer::VideoFilterer(const Side& side,
     // rotation
     if (demuxer->rotation() == 90) {
       pre_filters.push_back("transpose=clock");
+      rotation_baked_ = true;
     } else if (demuxer->rotation() == 270) {
       pre_filters.push_back("transpose=cclock");
+      rotation_baked_ = true;
     } else if (demuxer->rotation() == 180) {
       pre_filters.push_back("hflip");
       pre_filters.push_back("vflip");
+      rotation_baked_ = true;
     } else if (demuxer->rotation() != 0) {
       pre_filters.push_back(string_sprintf("rotate=%d*PI/180", demuxer->rotation()));
+      rotation_baked_ = true;
     }
   }
 
@@ -447,6 +451,15 @@ bool VideoFilterer::receive(AVFrame* filtered_frame) {
   // convert PTS and duration to microseconds
   filtered_frame->pts = av_rescale_q(filtered_frame->pts, av_buffersink_get_time_base(buffersink_ctx_), AV_R_MICROSECONDS) - demuxer_->start_time();
   ffmpeg::frame_duration(filtered_frame) = av_rescale_q(ffmpeg::frame_duration(filtered_frame), time_base_, AV_R_MICROSECONDS);
+
+  // Strip the displaymatrix side data when our filter chain has already
+  // baked rotation into pixels. libavfilter's hflip/vflip/transpose/rotate
+  // do not update or remove this side data, and downstream consumers that
+  // auto-apply it (e.g. libplacebo's pl_map_avframe) would otherwise rotate
+  // a second time.
+  if (rotation_baked_) {
+    av_frame_remove_side_data(filtered_frame, AV_FRAME_DATA_DISPLAYMATRIX);
+  }
 
   // add filter generation and resolved filters to metadata
   av_dict_set(&filtered_frame->metadata, "filter_generation", std::to_string(filter_generation_.load(std::memory_order_acquire)).c_str(), 0);

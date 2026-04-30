@@ -109,4 +109,11 @@ class VideoFilterer : public SideAware {
 
   std::atomic_bool filter_changed_{false};
   std::atomic<int> filter_generation_{0};
+
+  // True when the filter chain bakes the source's displaymatrix rotation
+  // into pixels (via hflip/vflip/transpose/rotate). The filtered frame's
+  // AV_FRAME_DATA_DISPLAYMATRIX is then stripped at the buffersink so a
+  // downstream consumer that auto-applies it (e.g. libplacebo's GPU
+  // renderer reading side data on map) does not double-rotate.
+  bool rotation_baked_{false};
 };
