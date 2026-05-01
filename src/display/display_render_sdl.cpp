@@ -266,22 +266,54 @@ void Display::sdl_render_video_textures(const RenderContext& ctx,
     }
   }
 
-  // Render from per-side textures to screen regions
-  if (show_left_ && (split_x > 0)) {
-    const SDL_FRect src_left = {0, 0, static_cast<float>(split_x), static_cast<float>(video_height_)};
-    const SDL_Rect video_quad_left = {0, 0, split_x, video_height_};
-    const SDL_FRect screen_quad_left = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad_left, zoom_rect));
-    check_sdl(SDL_RenderTexture(renderer_, get_side_texture(0), &src_left, &screen_quad_left), "left video texture render");
-  }
-  if (show_right_ && ((split_x < video_width_) || mode_ != Mode::Split)) {
-    const int start_right = (mode_ == Mode::Split) ? std::max(split_x, 0) : 0;
+  // Render from per-side textures to screen regions.
+  //
+  // In Split mode, both sides' src/dst depend on split_x. To keep the
+  // source→target slope identical to the unsplit case (and identical
+  // between the two sides), snap the boundary to an integer drawable
+  // pixel and back-compute a fractional image_x1 from the full-frame
+  // slope. Without this, integer source-space split_x produces a
+  // fractional drawable-space boundary; SDL_RenderTexture then rounds
+  // and the effective slope wobbles by up to ~half a drawable pixel
+  // between successive split_x values, jittering the visible content
+  // by 1 drawable pixel as the slider sweeps fractional zooms.
+  const bool split_mode = (mode_ == Mode::Split);
+  if (split_mode) {
+    const SDL_Rect video_quad_full = {0, 0, video_width_, video_height_};
+    const SDL_FRect screen_full = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad_full, zoom_rect));
+    const float slope_x = (video_width_ > 0) ? screen_full.w / static_cast<float>(video_width_) : 0.f;
+    const float right_edge = screen_full.x + screen_full.w;
+    const float split_dst_x_unrounded = screen_full.x + static_cast<float>(split_x) * slope_x;
+    const float split_dst_x = std::clamp(std::round(split_dst_x_unrounded), screen_full.x, right_edge);
+    const float image_split = (slope_x > 0.f) ? (split_dst_x - screen_full.x) / slope_x : static_cast<float>(split_x);
+
+    if (show_left_ && split_dst_x > screen_full.x) {
+      const SDL_FRect src_left = {0, 0, image_split, static_cast<float>(video_height_)};
+      const SDL_FRect screen_quad_left = {screen_full.x, screen_full.y, split_dst_x - screen_full.x, screen_full.h};
+      check_sdl(SDL_RenderTexture(renderer_, get_side_texture(0), &src_left, &screen_quad_left), "left video texture render");
+    }
+    if (show_right_ && split_dst_x < right_edge) {
+      const SDL_FRect src_right = {image_split, 0, static_cast<float>(video_width_) - image_split, static_cast<float>(video_height_)};
+      const SDL_FRect screen_quad_right = {split_dst_x, screen_full.y, right_edge - split_dst_x, screen_full.h};
+      check_sdl(SDL_RenderTexture(renderer_, get_side_texture(1), &src_right, &screen_quad_right), "right video texture render");
+    }
+  } else {
+    // HStack / VStack: sides occupy disjoint screen areas; no boundary jitter.
     const int right_x_offset = (mode_ == Mode::HStack) ? video_width_ : 0;
     const int right_y_offset = (mode_ == Mode::VStack) ? video_height_ : 0;
 
-    const SDL_FRect src_right = {static_cast<float>(start_right), 0, static_cast<float>(video_width_ - start_right), static_cast<float>(video_height_)};
-    const SDL_Rect video_quad_right = {right_x_offset + start_right, right_y_offset, video_width_ - start_right, video_height_};
-    const SDL_FRect screen_quad_right = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad_right, zoom_rect));
-    check_sdl(SDL_RenderTexture(renderer_, get_side_texture(1), &src_right, &screen_quad_right), "right video texture render");
+    if (show_left_) {
+      const SDL_FRect src_left = {0, 0, static_cast<float>(video_width_), static_cast<float>(video_height_)};
+      const SDL_Rect video_quad_left = {0, 0, video_width_, video_height_};
+      const SDL_FRect screen_quad_left = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad_left, zoom_rect));
+      check_sdl(SDL_RenderTexture(renderer_, get_side_texture(0), &src_left, &screen_quad_left), "left video texture render");
+    }
+    if (show_right_) {
+      const SDL_FRect src_right = {0, 0, static_cast<float>(video_width_), static_cast<float>(video_height_)};
+      const SDL_Rect video_quad_right = {right_x_offset, right_y_offset, video_width_, video_height_};
+      const SDL_FRect screen_quad_right = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad_right, zoom_rect));
+      check_sdl(SDL_RenderTexture(renderer_, get_side_texture(1), &src_right, &screen_quad_right), "right video texture render");
+    }
   }
 }
 

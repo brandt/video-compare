@@ -901,13 +901,40 @@ void Display::gpu_build_main_video_ops(const RenderContext& ctx, std::vector<Gpu
     // target rect, independent of split position), then paint the left video
     // on top clipped at split_x. This keeps the right video's rendered pixels
     // stable while the split line moves.
+    const SDL_Rect video_quad_full = {0, 0, video_width_, video_height_};
+    const SDL_FRect screen_full = video_rect_to_drawable_transform(view_transform_.video_to_zoom_space(video_quad_full, zoom_rect));
+
     if (show_right_) {
-      const SDL_Rect video_quad_right = {0, 0, video_width_, video_height_};
-      push_op(1, 0, 0, video_width_, video_height_, video_quad_right);
+      GpuRenderer::SideRenderOp op{};
+      op.side = 1;
+      op.src_x0 = 0.f; op.src_y0 = 0.f;
+      op.src_x1 = static_cast<float>(video_width_); op.src_y1 = static_cast<float>(video_height_);
+      op.dst_x0 = screen_full.x; op.dst_y0 = screen_full.y;
+      op.dst_x1 = screen_full.x + screen_full.w; op.dst_y1 = screen_full.y + screen_full.h;
+      ops.push_back(op);
     }
-    if (show_left_ && split_x > 0) {
-      const SDL_Rect video_quad_left = {0, 0, split_x, video_height_};
-      push_op(0, 0, 0, split_x, video_height_, video_quad_left);
+    if (show_left_ && split_x > 0 && screen_full.w > 0.f) {
+      // Snap the LEFT video's right edge to an integer drawable pixel and
+      // derive image.x1 from the full-frame slope. Without this, libplacebo
+      // rounds target.x1 to the nearest pixel while image.x1 stays at the
+      // (integer) source-pixel split — so the effective source→target slope
+      // wobbles between consecutive split_x values, jittering the rendered
+      // interior by up to ~1 drawable pixel as the slider sweeps. Matching
+      // the RIGHT side's slope keeps the LEFT video's pixels glued in place.
+      const float slope_x = screen_full.w / static_cast<float>(video_width_);
+      const float split_dst_x_unrounded = screen_full.x + static_cast<float>(split_x) * slope_x;
+      const float right_edge = screen_full.x + screen_full.w;
+      const float split_dst_x = std::clamp(std::round(split_dst_x_unrounded), screen_full.x, right_edge);
+      const float image_x1 = (split_dst_x - screen_full.x) / slope_x;
+      if (split_dst_x > screen_full.x) {
+        GpuRenderer::SideRenderOp op{};
+        op.side = 0;
+        op.src_x0 = 0.f; op.src_y0 = 0.f;
+        op.src_x1 = image_x1; op.src_y1 = static_cast<float>(video_height_);
+        op.dst_x0 = screen_full.x; op.dst_y0 = screen_full.y;
+        op.dst_x1 = split_dst_x; op.dst_y1 = screen_full.y + screen_full.h;
+        ops.push_back(op);
+      }
     }
   } else {
     // HStack / VStack: sides occupy disjoint screen areas; order doesn't matter.
