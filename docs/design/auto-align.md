@@ -127,7 +127,7 @@ After scoring, each candidate has a score keyed by its PTS. The decision phase p
 
 **`` ` `` Symmetric — strictly stronger wins:**
 
-- Eligibility: `candidate.score > current_score + 0.005`.
+- Eligibility: `candidate.score > max(current_score, min(current_score + 0.005, 1.0 − 0.0005))`. The clamp at the ceiling keeps a perfect-score neighbour reachable when current is near 1.0 (without it, current=0.999 produces threshold=1.004 and locks out a 1.000 peak); the lower bound at `current_score` keeps the clamp from ever admitting a worse candidate.
 - Among eligible, pick strongest. Score ties (within 0.0005) break by smaller `|pts − follower_current|`; distance ties break toward ahead of current.
 - If no eligible candidate: decision = `already` (convergent — re-pressing from a peak doesn't move).
 - If both clip boundaries reached and no eligible candidate: decision = `boundary_both`.

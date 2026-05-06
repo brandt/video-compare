@@ -2411,7 +2411,15 @@ void VideoCompare::compare() {
             // Eligibility gate: strictly stronger than current by improvement
             // eps. Tie-break between eligible candidates uses the much tighter
             // tie-break band so a sharp peak beats a nearby near-peer.
-            const float threshold = current_score + kAutoAlignImprovementEps;
+            //
+            // The threshold is clamped just below 1.0 so the correlation
+            // ceiling never becomes unreachable: with a 0.005 eps, a current
+            // score of 0.999 would otherwise produce threshold=1.004 and
+            // permanently lock out a perfect-score neighbour. The lower
+            // bound keeps the gate at-or-above current, so the clamp can
+            // never let a worse candidate through.
+            const float ceiling = 1.0f - kAutoAlignTieBreakBand;
+            const float threshold = std::max(current_score, std::min(current_score + kAutoAlignImprovementEps, ceiling));
             const ScoredCandidate* best = nullptr;
             for (const auto& s : scored) {
               if (s.score <= threshold) {
