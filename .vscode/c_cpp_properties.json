@@ -5,6 +5,7 @@
       "name": "Mac",
       "includePath": [
         "${workspaceFolder}/src/**",
+        "${workspaceFolder}",
         "/opt/homebrew/include",
         "/opt/homebrew/include/SDL3",
         "/usr/local/include",
