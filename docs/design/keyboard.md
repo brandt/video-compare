@@ -1,6 +1,6 @@
 # Keyboard Input
 
-See also: [Key bindings](../user/key-bindings.md) for a current snapshot of all bindings in table form.
+See also: **[Keyboard and Mouse Controls](user/keyboard-and-mouse-controls.md)** for a user-facing reference.
 
 This doc describes how SDL key events become user actions in `video-compare`: the dispatch path, the first-match-wins cascade that maps keycodes to handlers, the rules for transient keys, and how the help overlay derives its labels.
 

@@ -26,5 +26,5 @@ Directories:
 
 ## User
 
-- [Key bindings](user/key-bindings.md)
+- [Keyboard and mouse controls](user/keyboard-and-mouse-controls.md)
 - [Windows](user/Windows.md)
