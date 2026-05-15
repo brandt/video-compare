@@ -73,8 +73,8 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         // near the dst center but shifts by up to half a video pixel (×
         // dst-scale drawable pixels) so the slider sits exactly on the
         // left/right frame edge in the zoomed view.
-        const float zoom_dst_y = static_cast<float>(drawable_height_ - dst_zoomed_size);
-        const float zoom_dst_y1 = static_cast<float>(drawable_height_);
+        const float zoom_dst_y = static_cast<float>(hud_bottom_drawable_y() - dst_zoomed_size);
+        const float zoom_dst_y1 = static_cast<float>(hud_bottom_drawable_y());
         if (view_transform_.zoom_left() && zoom_left_slider_dx >= 0.f) {
           const float sx = std::round(zoom_left_slider_dx);
           push_rect(sx, zoom_dst_y, sx + 1.f, zoom_dst_y1, 255, 255, 255, 255);
@@ -94,7 +94,7 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         const int dot_height = std::round(drawable_to_window_height_factor_ * dot_size);
 
         auto render_dots = [&](float position, float progress, bool is_top) {
-          const int y_offset = is_top ? 1 : drawable_height_ - 1 - dot_height;
+          const int y_offset = is_top ? 1 : hud_bottom_drawable_y() - 1 - dot_height;
           const int x_position = std::round(position * drawable_width_ / duration_);
           const int x_progress = std::round(progress * drawable_width_ / duration_);
 
@@ -253,8 +253,8 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         TTF_GetStringSize(small_font_, right_pos_str.c_str(), 0, &w_pos, &h_pos);
 
         if (mode_ == Mode::VStack) {
-          push_text(right_label, small_font_, TEXT_COLOR, line1_y_, drawable_height_ - line2_y_ - h_label, TextAlign::Left);
-          push_text(right_pos_str, small_font_, POSITION_COLOR, line1_y_, drawable_height_ - line1_y_ - h_pos, TextAlign::Left);
+          push_text(right_label, small_font_, TEXT_COLOR, line1_y_, hud_bottom_drawable_y() - line2_y_ - h_label, TextAlign::Left);
+          push_text(right_pos_str, small_font_, POSITION_COLOR, line1_y_, hud_bottom_drawable_y() - line1_y_ - h_pos, TextAlign::Left);
         } else {
           push_text(right_label, small_font_, TEXT_COLOR, drawable_width_ - line1_y_ - w_label, line1_y_, TextAlign::Right);
           push_text(right_pos_str, small_font_, POSITION_COLOR, drawable_width_ - line1_y_ - w_pos, line2_y_, TextAlign::Right);
@@ -276,7 +276,7 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         const int pair_anchor_x = drawable_width_ * 2 / 3; // ~67% across
         const int vid_x = pair_anchor_x - pair_w / 2 + border_extension_;
         const int ui_x = vid_x + vid_w + double_border_extension_ + gap;
-        const int fps_y = drawable_height_ - line1_y_ - std::max(vid_h, ui_h);
+        const int fps_y = hud_bottom_drawable_y() - line1_y_ - std::max(vid_h, ui_h);
 
         push_text(vid_str, small_font_, FPS_VIDEO_COLOR, vid_x, fps_y, TextAlign::Left);
         push_text(ui_str, small_font_, FPS_UI_COLOR, ui_x, fps_y, TextAlign::Left);
@@ -313,7 +313,7 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
 
         const int left_anchor_x = drawable_width_ / 3;  // ~33% across (mirror of 2/3)
         const int state_x = left_anchor_x - state_w / 2 + border_extension_;
-        const int left_y = drawable_height_ - line1_y_ - state_h;
+        const int left_y = hud_bottom_drawable_y() - line1_y_ - state_h;
 
         push_text(state_str, small_font_, state_color, state_x, left_y, TextAlign::Left);
       }
@@ -338,7 +338,7 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         int zw = 0, zh = 0;
         TTF_GetStringSize(small_font_, zoom_factor_str.c_str(), 0, &zw, &zh);
         const int zx = (mode_ == Mode::VStack) ? drawable_width_ - line1_y_ - zw : line1_y_;
-        const int zy = (mode_ == Mode::VStack) ? line1_y_ : drawable_height_ - line1_y_ - zh;
+        const int zy = (mode_ == Mode::VStack) ? line1_y_ : hud_bottom_drawable_y() - line1_y_ - zh;
         push_text(zoom_factor_str, small_font_, ZOOM_COLOR, zx, zy, TextAlign::Left,
                   0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 2));
       }
@@ -368,7 +368,7 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         int sw = 0, sh = 0;
         TTF_GetStringSize(small_font_, united.c_str(), 0, &sw, &sh);
         const int sx = drawable_width_ / 2 - sw / 2 - border_extension_;
-        const int sy = drawable_height_ - line1_y_ - sh;
+        const int sy = hud_bottom_drawable_y() - line1_y_ - sh;
         push_text(united, small_font_, PLAYBACK_SPEED_COLOR, sx, sy, TextAlign::Left,
                   0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 2));
       }
@@ -405,7 +405,7 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         int tw = 0, th = 0;
         TTF_GetStringSize(small_font_, target_str.c_str(), 0, &tw, &th);
         const int tx = drawable_width_ - line1_y_ - tw;
-        const int ty = drawable_height_ - line1_y_ - th;
+        const int ty = hud_bottom_drawable_y() - line1_y_ - th;
         push_text(target_str, small_font_, TARGET_COLOR, tx, ty, TextAlign::Right,
                   0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 2));
       }
@@ -652,6 +652,11 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
         }
       }
     }
+
+    // Append dock overlay/text ops just before submission so the dock sits on
+    // top of the HUD/help/metadata layers. Pixel pointers reference bitmaps
+    // owned by the Dock; they outlive the render call.
+    render_dock_gpu(overlays, text_ops);
 
     if (gpu_renderer_.render(ops.data(), static_cast<int>(ops.size()),
                               overlays.data(), static_cast<int>(overlays.size()),
@@ -1067,7 +1072,7 @@ void Display::gpu_build_zoom_magnifier_ops(const RenderContext& ctx,
     }
   };
 
-  const float zoom_dst_y = static_cast<float>(drawable_height_ - dst_zoomed_size);
+  const float zoom_dst_y = static_cast<float>(hud_bottom_drawable_y() - dst_zoomed_size);
   if (view_transform_.zoom_left()) {
     push_zoom_box(0.f, zoom_dst_y, static_cast<float>(dst_zoomed_size), zoom_dst_y + dst_zoomed_size);
   }

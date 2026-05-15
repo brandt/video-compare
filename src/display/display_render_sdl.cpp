@@ -61,14 +61,16 @@ void Display::render_frame_sdl(const RenderContext& ctx, const std::string& curr
   sdl_render_message_toast();
 
   if (mode_ == Mode::Split && show_hud_ && compare_mode) {
-    // Split slider line + zoom-window slider(s).
+    // Split slider line + zoom-window slider(s). Bottom edge clips above the
+    // dock when it's visible so the magnifier slider doesn't draw over the
+    // dock bar.
     SDL_SetRenderDrawColor(renderer_, 255, 255, 255, SDL_ALPHA_OPAQUE);
-    SDL_RenderLine(renderer_, mouse_drawable_x, 0, mouse_drawable_x, drawable_height_);
+    SDL_RenderLine(renderer_, mouse_drawable_x, 0, mouse_drawable_x, hud_bottom_drawable_y());
     if (view_transform_.zoom_left()) {
-      SDL_RenderLine(renderer_, dst_half_zoomed_size, drawable_height_ - dst_zoomed_size, dst_half_zoomed_size, drawable_height_);
+      SDL_RenderLine(renderer_, dst_half_zoomed_size, hud_bottom_drawable_y() - dst_zoomed_size, dst_half_zoomed_size, hud_bottom_drawable_y());
     }
     if (view_transform_.zoom_right()) {
-      SDL_RenderLine(renderer_, drawable_width_ - dst_half_zoomed_size - 1, drawable_height_ - dst_zoomed_size, drawable_width_ - dst_half_zoomed_size - 1, drawable_height_);
+      SDL_RenderLine(renderer_, drawable_width_ - dst_half_zoomed_size - 1, hud_bottom_drawable_y() - dst_zoomed_size, drawable_width_ - dst_half_zoomed_size - 1, hud_bottom_drawable_y());
     }
   }
 
@@ -90,6 +92,8 @@ void Display::render_frame_sdl(const RenderContext& ctx, const std::string& curr
   if (overlay_.show_help()) {
     overlay_.render_help_sdl(renderer_);
   }
+
+  render_dock_sdl();
 
   sdl_finalize_deferred(left_frame, right_frame);
 
@@ -333,11 +337,11 @@ void Display::sdl_render_zoom_magnifier(const int mouse_drawable_x, const int mo
 
   if (render_texture) {
     if (view_transform_.zoom_left()) {
-      const SDL_FRect dst_zoomed_area = {0, static_cast<float>(drawable_height_ - dst_zoomed_size), static_cast<float>(dst_zoomed_size), static_cast<float>(dst_zoomed_size)};
+      const SDL_FRect dst_zoomed_area = {0, static_cast<float>(hud_bottom_drawable_y() - dst_zoomed_size), static_cast<float>(dst_zoomed_size), static_cast<float>(dst_zoomed_size)};
       SDL_RenderTexture(renderer_, render_texture, nullptr, &dst_zoomed_area);
     }
     if (view_transform_.zoom_right()) {
-      const SDL_FRect dst_zoomed_area = {static_cast<float>(drawable_width_ - dst_zoomed_size), static_cast<float>(drawable_height_ - dst_zoomed_size), static_cast<float>(dst_zoomed_size), static_cast<float>(dst_zoomed_size)};
+      const SDL_FRect dst_zoomed_area = {static_cast<float>(drawable_width_ - dst_zoomed_size), static_cast<float>(hud_bottom_drawable_y() - dst_zoomed_size), static_cast<float>(dst_zoomed_size), static_cast<float>(dst_zoomed_size)};
       SDL_RenderTexture(renderer_, render_texture, nullptr, &dst_zoomed_area);
     }
   }
@@ -396,9 +400,9 @@ void Display::sdl_render_hud(const RenderContext& ctx, const std::string& curren
     int text1_x, text1_y, text2_x, text2_y;
     if (mode_ == Mode::VStack) {
       text1_x = line1_y_;
-      text1_y = drawable_height_ - line2_y_ - side_ui_[displayed_right_side_.as_simple_index()].text_height;
+      text1_y = hud_bottom_drawable_y() - line2_y_ - side_ui_[displayed_right_side_.as_simple_index()].text_height;
       text2_x = line1_y_;
-      text2_y = drawable_height_ - line1_y_ - side_ui_[displayed_right_side_.as_simple_index()].text_height;
+      text2_y = hud_bottom_drawable_y() - line1_y_ - side_ui_[displayed_right_side_.as_simple_index()].text_height;
     } else {
       text1_x = drawable_width_ - line1_y_ - side_ui_[displayed_right_side_.as_simple_index()].text_width;
       text1_y = line1_y_;
@@ -423,7 +427,7 @@ void Display::sdl_render_hud(const RenderContext& ctx, const std::string& curren
     SDL_DestroySurface(text_surface);
 
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, BACKGROUND_ALPHA * 2);
-    render_text(drawable_width_ - line1_y_ - target_position_text_width, drawable_height_ - line1_y_ - target_position_text_height, target_position_text_texture, target_position_text_width, target_position_text_height, border_extension_,
+    render_text(drawable_width_ - line1_y_ - target_position_text_width, hud_bottom_drawable_y() - line1_y_ - target_position_text_height, target_position_text_texture, target_position_text_width, target_position_text_height, border_extension_,
                 false);
 
     SDL_DestroyTexture(target_position_text_texture);
@@ -455,7 +459,7 @@ void Display::sdl_render_hud(const RenderContext& ctx, const std::string& curren
   SDL_SetRenderDrawColor(renderer_, 0, 0, 0, BACKGROUND_ALPHA * 2);
 
   int text_x = (mode_ == Mode::VStack) ? drawable_width_ - line1_y_ - zoom_position_text_width : line1_y_;
-  int text_y = (mode_ == Mode::VStack) ? line1_y_ : drawable_height_ - line1_y_ - zoom_position_text_height;
+  int text_y = (mode_ == Mode::VStack) ? line1_y_ : hud_bottom_drawable_y() - line1_y_ - zoom_position_text_height;
 
   render_text(text_x, text_y, zoom_position_text_texture, zoom_position_text_width, zoom_position_text_height, border_extension_, false);
   SDL_DestroyTexture(zoom_position_text_texture);
@@ -497,7 +501,7 @@ void Display::sdl_render_hud(const RenderContext& ctx, const std::string& curren
   SDL_DestroySurface(text_surface);
 
   text_x = drawable_width_ / 2 - playack_speed_text_width / 2 - border_extension_;
-  text_y = drawable_height_ - line1_y_ - zoom_position_text_height;
+  text_y = hud_bottom_drawable_y() - line1_y_ - zoom_position_text_height;
 
   render_text(text_x, text_y, playack_speed_text_texture, playack_speed_text_width, playack_speed_text_height, border_extension_, false);
   SDL_DestroyTexture(playack_speed_text_texture);

@@ -432,6 +432,34 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
   if (config.scopes.histogram || config.scopes.vectorscope || config.scopes.waveform) {
     display_->focus_main_window();
   }
+
+  // Initialize the bottom dock with one entry per input video, in CLI order
+  // (left first, then right_videos[0..N-1]). The dock keeps this order for
+  // the lifetime of the program and uses it for results output.
+  std::vector<DockEntry> dock_entries;
+  dock_entries.reserve(1 + config.right_videos.size());
+  dock_entries.push_back(DockEntry{LEFT, config.left.file_name, DockAction::Skip});
+  for (size_t i = 0; i < config.right_videos.size(); ++i) {
+    dock_entries.push_back(DockEntry{Side::Right(i), config.right_videos[i].file_name, DockAction::Skip});
+  }
+  display_->init_dock(dock_entries);
+
+  // Spawn the async thumbnail loader. Paths are collected in the same CLI
+  // input order so the index passed to set_dock_thumbnail matches the dock
+  // entry indices. The callback is invoked from the worker thread; Dock's
+  // set_thumbnail is thread-safe (it holds thumb_mutex_).
+  std::vector<std::string> thumb_paths;
+  thumb_paths.reserve(dock_entries.size());
+  for (const auto& e : dock_entries) {
+    thumb_paths.push_back(e.file_path);
+  }
+  const auto [thumb_w, thumb_h] = display_->dock_thumb_target_size();
+  Display* display_ptr = display_.get();
+  thumbnail_loader_ = std::make_unique<ThumbnailLoader>(
+      std::move(thumb_paths), thumb_w, thumb_h,
+      [display_ptr](size_t index, DockBitmap bitmap) {
+        display_ptr->set_dock_thumbnail(static_cast<int>(index), std::move(bitmap));
+      });
 }
 
 void VideoCompare::recreate_format_converter_for_side(const Side& side, const int sws_flags) {
@@ -554,6 +582,77 @@ double VideoCompare::get_uptime_seconds() const {
   const auto now = std::chrono::steady_clock::now();
   const std::chrono::duration<double> delta = now - start_time_;
   return delta.count();
+}
+
+namespace {
+// Minimal JSON string escaping for paths: backslash, double-quote, control chars.
+// Paths with embedded newlines / unicode escapes are exceptionally unlikely; this
+// is sufficient to keep the RESULTS line and the --result file parseable.
+std::string json_escape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 2);
+  for (const char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+}  // namespace
+
+std::string VideoCompare::format_results_json() const {
+  auto action_name = [](DockAction a) {
+    switch (a) {
+      case DockAction::Keep: return "keep";
+      case DockAction::Toss: return "toss";
+      case DockAction::Skip: default: return "skip";
+    }
+  };
+
+  std::string out = "[";
+  bool first = true;
+  if (display_) {
+    for (const auto& r : display_->get_dock_results()) {
+      if (!first) out += ", ";
+      first = false;
+      out += "{ \"path\": \"";
+      out += json_escape(r.path);
+      out += "\", \"action\": \"";
+      out += action_name(r.action);
+      out += "\" }";
+    }
+  }
+  if (first) {
+    // Fallback when the dock never got initialized (shouldn't happen in
+    // practice, but keeps the contract that results are always emitted).
+    auto append_entry = [&](const std::string& path, const char* an) {
+      if (!first) out += ", ";
+      first = false;
+      out += "{ \"path\": \"";
+      out += json_escape(path);
+      out += "\", \"action\": \"";
+      out += an;
+      out += "\" }";
+    };
+    append_entry(config_.left.file_name, "skip");
+    for (const auto& right : config_.right_videos) {
+      append_entry(right.file_name, "skip");
+    }
+  }
+  out += "]";
+  return out;
 }
 
 void VideoCompare::operator()() {
@@ -4018,11 +4117,23 @@ void VideoCompare::compare() {
         if (!skip_refresh) {
           // `frame_offset` of 0 is the current frame; positive values index back into
           // history (hence the sign flip when calling `ring.at(-frame_offset)`).
-          FrameRing& left_ring = !display_->get_swap_left_right() ? left.ring : right_ptr->ring;
-          FrameRing& right_ring = !display_->get_swap_left_right() ? right_ptr->ring : left.ring;
+          //
+          // Slot mapping: the dock can place any pipeline in either visual slot,
+          // so the displayed frames come from the SideStates named by the
+          // current slot sides. The "state" frames (used for filter-metadata
+          // refresh) continue to track LEFT + active-right, because those are
+          // the pipelines whose filter chain changes drive the metadata panel.
+          const Side slot_left_side = display_->get_slot_side(0);
+          const Side slot_right_side = display_->get_slot_side(1);
+          auto find_state = [&](const Side& s) -> SideState& {
+            auto it = side_states.find(s);
+            return (it != side_states.end()) ? it->second : (s.is_left() ? left : *right_ptr);
+          };
+          SideState& visual_left_state = find_state(slot_left_side);
+          SideState& visual_right_state = find_state(slot_right_side);
 
-          const auto left_display_frame = left_ring.at(-frame_offset);
-          const auto right_display_frame = right_ring.at(-frame_offset);
+          const auto left_display_frame = visual_left_state.ring.at(-frame_offset);
+          const auto right_display_frame = visual_right_state.ring.at(-frame_offset);
           const auto left_state_frame = left.ring.at(-frame_offset);
           const auto right_state_frame = right_ptr->ring.at(-frame_offset);
 

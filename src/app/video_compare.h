@@ -18,6 +18,7 @@
 #include "core/core_types.h"
 #include "media/demuxer.h"
 #include "display/display.h"
+#include "display/subsystems/thumbnail_extractor.h"
 #include "media/format_converter.h"
 #include "media/buffering/frame_ring.h"
 #include "media/buffering/packet_ring.h"
@@ -274,6 +275,12 @@ class VideoCompare {
   /** Seconds elapsed since the VideoCompare instance was constructed. */
   double get_uptime_seconds() const;
 
+  /** Per-input keep/skip/toss results formatted as a JSON array string. Each
+   *  entry is `{ "path": "...", "action": "keep|skip|toss" }`. Order matches
+   *  the CLI input order (left first, then right_videos[0..N-1]). Safe to call
+   *  after compare() returns. */
+  std::string format_results_json() const;
+
  private:
   void recreate_format_converter_for_side(const Side& side, const int sws_flags);
   void recreate_format_converters(const int sws_flags);
@@ -388,6 +395,12 @@ class VideoCompare {
 
   std::unique_ptr<Display> display_;
   std::unique_ptr<Timer> timer_;
+
+  // Background thumbnail loader for the bottom-of-window dock. Spawned at
+  // the end of the constructor (after dock entries are registered) and
+  // joined on destruction. Lives as a unique_ptr so destruction order is
+  // explicit — cancel-and-join before the Dock's mutex goes away.
+  std::unique_ptr<ThumbnailLoader> thumbnail_loader_;
 
   size_t active_right_index_{0};
   std::map<Side, RightVideoInfo> right_video_info_;

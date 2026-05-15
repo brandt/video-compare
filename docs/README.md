@@ -21,4 +21,10 @@ Directories:
 - [Playback buffer](design/buffer.md)
 - [Input testing](design/input-testing.md)
 - [Input socket](design/input-socket.md)
+- [Keyboard](design/keyboard.md)
 - [libplacebo integration](design/libplacebo-integration.md)
+
+## User
+
+- [Key bindings](user/key-bindings.md)
+- [Windows](user/Windows.md)

@@ -94,6 +94,7 @@ void Display::handle_window_event(const SDL_Event& event) {
       break;
     case SDL_EVENT_WINDOW_MOUSE_LEAVE:
       mouse_is_inside_window_ = false;
+      dock_.set_hover_thumb(-1);
       break;
     case SDL_EVENT_WINDOW_MOUSE_ENTER:
       mouse_is_inside_window_ = true;
@@ -137,6 +138,17 @@ void Display::handle_wheel_event(const SDL_Event& event) {
 void Display::handle_mouse_motion_event(const SDL_Event& event) {
   SDL_GetMouseState(&mouse_x_, &mouse_y_);
 
+  // Dock hover tracking: when the dock is visible, expose which thumb (if
+  // any) the mouse is over so the renderer can outline the on-stage video
+  // region that would be replaced by a click on that thumb.
+  if (dock_.visible()) {
+    const int dx = static_cast<int>(std::round(mouse_x_ * drawable_to_window_width_factor_));
+    const int dy = static_cast<int>(std::round(mouse_y_ * drawable_to_window_height_factor_));
+    dock_.set_hover_thumb(dock_.hit_thumb(dx, dy));
+  } else {
+    dock_.set_hover_thumb(-1);
+  }
+
   refresh_selection_end_from_mouse();
 
   if (event.motion.state & SDL_BUTTON_RMASK) {
@@ -165,6 +177,42 @@ void Display::handle_mouse_motion_event(const SDL_Event& event) {
 
 // Mouse-button events: start/complete selection, seek on click, update cursor mode.
 void Display::handle_mouse_button_event(const SDL_Event& event) {
+  // Dock intercept: when the dock is visible and the click lands inside its
+  // bar, route to the dock and return so the video viewport doesn't also see
+  // the click. Mouse coords are in window space; the dock layout is in
+  // drawable space, so scale before hit-testing.
+  if (dock_.visible() && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+      event.button.button == SDL_BUTTON_LEFT) {
+    const int dx = static_cast<int>(std::round(event.button.x * drawable_to_window_width_factor_));
+    const int dy = static_cast<int>(std::round(event.button.y * drawable_to_window_height_factor_));
+    if (dock_.contains(dx, dy)) {
+      const SDL_Keymod mod = SDL_GetModState();
+      const bool shift_down = (mod & SDL_KMOD_SHIFT) != 0;
+      const int thumb_hit = dock_.hit_thumb(dx, dy);
+      if (thumb_hit >= 0) {
+        const Side target_side = dock_.entries()[thumb_hit].pipeline_side;
+        const int target_slot = shift_down ? 0 : 1;
+        const int other_slot = 1 - target_slot;
+        // Refuse no-op: clicking the thumb already on the target slot does nothing.
+        if (get_slot_side(target_slot) != target_side) {
+          // If the target side is already on the other slot, swap them so we
+          // never end up with the same pipeline on both slots.
+          if (get_slot_side(other_slot) == target_side) {
+            const Side displaced = get_slot_side(target_slot);
+            set_slot_side(other_slot, displaced);
+          }
+          set_slot_side(target_slot, target_side);
+        }
+      } else {
+        const auto tristate = dock_.hit_tristate(dx, dy);
+        if (tristate.first >= 0) {
+          dock_.set_action(tristate.first, tristate.second);
+        }
+      }
+      input_received_ = true;
+      return;
+    }
+  }
   if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
     if (event.button.button == SDL_BUTTON_LEFT && selection_.has_active_cursor_mode() && selection_.state() == SelectionState::None) {
       const Vector2D start_pos = view_transform_.window_to_video_position(mouse_x_, mouse_y_, view_transform_.compute_zoom_rect());
@@ -235,7 +283,7 @@ bool Display::handle_right_video_index_shortcut(const SDL_Keycode keycode, const
 
   if (target_index == SIZE_MAX) return false;
   if (target_index < num_right_videos_) {
-    active_right_index_ = target_index;
+    set_slot_side(1, Side::Right(target_index));
     notify_user(string_sprintf("Active right video: %d/%d", active_right_index_ + 1, num_right_videos_));
   }
   return true;
@@ -398,8 +446,14 @@ bool Display::handle_view_mode_keys(const SDL_Keycode keycode, const bool is_shi
         }
         notify_user(string_sprintf("Aspect view mode set to '%s'", to_upper_case(aspect_view_mode_to_string(aspect_view_mode_)).c_str()));
       } else {
-        swap_left_right_ = !swap_left_right_;
-        refresh_display_side_mapping();
+        // Swap the two visual slots so that whatever pipelines were on
+        // visual-left and visual-right trade places. Going through set_slot_side
+        // generalizes the legacy binary LEFT↔RIGHT swap to handle any pair
+        // selected via the dock.
+        const Side old_left = displayed_left_side_;
+        const Side old_right = displayed_right_side_;
+        set_slot_side(0, old_right);
+        set_slot_side(1, old_left);
       }
       return true;
     case SDLK_T:
@@ -442,8 +496,14 @@ bool Display::handle_zoom_pan_keys(const SDL_Keycode keycode, const bool is_shif
       }
       return false;
     case SDLK_Z:
-      view_transform_.set_zoom_left(true);
-      return true;
+      // Magnifier requires Shift now; plain Z is the dock toggle (handled in
+      // handle_misc_keys). Fall through when no Shift so the dispatcher gets
+      // a chance to route it.
+      if (is_shift_down) {
+        view_transform_.set_zoom_left(true);
+        return true;
+      }
+      return false;
     default:
       return false;
   }
@@ -552,6 +612,17 @@ bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymo
   const bool is_ctrl_down = (keymod & SDL_KMOD_CTRL) != 0;
 
   switch (keycode) {
+    case SDLK_Z:
+      // Plain Z toggles the dock. Shift+Z is the zoom-left magnifier and is
+      // handled earlier in handle_zoom_pan_keys, so we only reach here when
+      // Shift isn't held.
+      if (!is_shift_down) {
+        dock_.toggle();
+        on_dock_visibility_changed();
+        notify_user(string_sprintf("Dock %s", dock_.visible() ? "shown" : "hidden"));
+        return true;
+      }
+      return false;
     case SDLK_H:
       overlay_.toggle_help();
       return true;
@@ -571,21 +642,37 @@ bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymo
         show_fps_ = true;
       }
       return true;
-    case SDLK_TAB:
-      if (is_shift_down) active_right_index_ = (active_right_index_ + num_right_videos_ - 1) % num_right_videos_;
-      else               active_right_index_ = (active_right_index_ + 1) % num_right_videos_;
+    case SDLK_TAB: {
+      // Advance the visual-right slot through the available right pipelines,
+      // skipping any pipeline already on the visual-left slot (so Tab never
+      // produces a duplicate-side layout).
+      if (num_right_videos_ == 0) return true;
+      size_t next = active_right_index_;
+      const size_t skip_index = displayed_left_side_.is_right() ? displayed_left_side_.right_index() : SIZE_MAX;
+      for (size_t step = 0; step < num_right_videos_; ++step) {
+        next = is_shift_down ? (next + num_right_videos_ - 1) % num_right_videos_
+                             : (next + 1) % num_right_videos_;
+        if (next != skip_index) break;
+      }
+      set_slot_side(1, Side::Right(next));
       notify_user(string_sprintf("Active right video: %d/%d", active_right_index_ + 1, num_right_videos_));
       return true;
+    }
     case SDLK_C:
       if (is_clipboard_mod_pressed(keymod, is_ctrl_down)) {
         const float previous_left_frame_secs = previous_left_frame_pts_ * AV_TIME_TO_SEC;
         const std::string previous_left_frame_secs_str = format_position(previous_left_frame_secs, false);
         SDL_SetClipboardText(previous_left_frame_secs_str.c_str());
         notify_user(string_sprintf("Copied to clipboard: %s", previous_left_frame_secs_str.c_str()));
-      } else {
-        view_transform_.set_zoom_right(true);
+        return true;
       }
-      return true;
+      // Magnifier requires Shift now (mirroring Shift+Z). Plain C is unused
+      // and falls through so future bindings can claim it.
+      if (is_shift_down) {
+        view_transform_.set_zoom_right(true);
+        return true;
+      }
+      return false;
     case SDLK_V:
       if (is_clipboard_mod_pressed(keymod, is_ctrl_down)) {
         char* clip_text = SDL_GetClipboardText();

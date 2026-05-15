@@ -330,6 +330,8 @@ Display::~Display() {
     SDL_DestroyTexture(side_ui_[RIGHT.as_simple_index()].text_texture);
   }
 
+  destroy_dock_thumb_textures();
+
   // OverlayManager and MetadataPanel clean up their own textures/surfaces.
 
   TTF_CloseFont(small_font_);
@@ -707,4 +709,86 @@ size_t Display::get_active_right_index() const {
 // Switch to a different right-side video by index.
 void Display::set_active_right_index(const size_t index) {
   active_right_index_ = std::min(index, num_right_videos_ > 0 ? num_right_videos_ - 1 : 0UL);
+}
+
+// Initialize the dock with one entry per input video.
+void Display::init_dock(std::vector<DockEntry> entries) {
+  dock_.init(std::move(entries));
+  // Reflect the current slot mapping in dock badge indices.
+  const auto& dock_entries = dock_.entries();
+  int left_idx = -1, right_idx = -1;
+  for (size_t i = 0; i < dock_entries.size(); ++i) {
+    if (dock_entries[i].pipeline_side == displayed_left_side_) left_idx = static_cast<int>(i);
+    if (dock_entries[i].pipeline_side == displayed_right_side_) right_idx = static_cast<int>(i);
+  }
+  dock_.set_slot_indices(left_idx, right_idx);
+}
+
+std::pair<int, int> Display::dock_thumb_target_size() const {
+  // Compute a representative target size from the current drawable.
+  // Fall back to defaults if not yet laid out — the loader uses this once at
+  // startup before the first layout pass.
+  const int w = (dock_.thumb_target_max_width() > 0) ? dock_.thumb_target_max_width() : 160;
+  const int h = (dock_.thumb_target_max_height() > 0) ? dock_.thumb_target_max_height() : 90;
+  return {w, h};
+}
+
+void Display::set_dock_thumbnail(int entry_index, DockBitmap bitmap) {
+  dock_.set_thumbnail(entry_index, std::move(bitmap));
+}
+
+std::vector<Dock::EntryResult> Display::get_dock_results() const {
+  return dock_.snapshot_results();
+}
+
+// Return the pipeline Side currently occupying the requested visual slot.
+// slot 0 = visual-left, 1 = visual-right.
+Side Display::get_slot_side(int slot) const {
+  return (slot == 0) ? displayed_left_side_ : displayed_right_side_;
+}
+
+// Assign a pipeline to a visual slot. Maintains the legacy swap_left_right_
+// flag (true iff the slots are {LEFT, RIGHT} swapped to {RIGHT, LEFT}) and
+// updates active_right_index_ to whichever slot now holds a RIGHT pipeline so
+// existing right-targeted operations (frame shift, auto-align, crop "right",
+// save filenames) continue to target a *visible* pipeline.
+void Display::set_slot_side(int slot, Side side) {
+  if (!side.is_valid()) {
+    return;
+  }
+  if (slot == 0) {
+    displayed_left_side_ = side;
+  } else if (slot == 1) {
+    displayed_right_side_ = side;
+  } else {
+    return;
+  }
+
+  // Legacy swap flag: only "true swap" when the two slots are LEFT↔RIGHT(0).
+  // Any other arrangement (e.g. two Rights, or RIGHT(2) on visual-left)
+  // doesn't fit the old binary swap semantics, so leave the flag false.
+  swap_left_right_ = displayed_left_side_.is_right() && displayed_right_side_.is_left();
+
+  // Keep active_right_index_ pointing at a *visible* right pipeline when
+  // possible. Prefer the visual-right slot's right; fall back to visual-left's.
+  size_t new_active = active_right_index_;
+  if (displayed_right_side_.is_right()) {
+    new_active = displayed_right_side_.right_index();
+  } else if (displayed_left_side_.is_right()) {
+    new_active = displayed_left_side_.right_index();
+  }
+  if (new_active != active_right_index_) {
+    active_right_index_ = std::min(new_active, num_right_videos_ > 0 ? num_right_videos_ - 1 : 0UL);
+  }
+
+  // Sync the dock's L/R badge indices so the picker reflects current slots.
+  const auto& dock_entries = dock_.entries();
+  int left_idx = -1, right_idx = -1;
+  for (size_t i = 0; i < dock_entries.size(); ++i) {
+    if (dock_entries[i].pipeline_side == displayed_left_side_) left_idx = static_cast<int>(i);
+    if (dock_entries[i].pipeline_side == displayed_right_side_) right_idx = static_cast<int>(i);
+  }
+  dock_.set_slot_indices(left_idx, right_idx);
+
+  input_received_ = true;
 }

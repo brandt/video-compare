@@ -86,4 +86,8 @@ struct VideoCompareConfig {
   std::vector<InputVideo> right_videos;
 
   ScopesConfig scopes;
+
+  // If non-empty, the per-input keep/skip/toss results JSON is written to this path on exit
+  // (in addition to the RESULTS: line printed to stdout). Set via --result=PATH.
+  std::string result_path;
 };

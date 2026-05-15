@@ -301,12 +301,34 @@ float Display::compute_active_content_aspect_ratio() const {
 // Recompute content_window_ and the window/drawable/video scale factors from the current window state.
 void Display::update_content_window_layout() {
   const int safe_window_w = std::max(1, window_width_);
-  const int safe_window_h = std::max(1, window_height_);
+  const int safe_window_h_raw = std::max(1, window_height_);
+
+  // If the dock is visible, reserve its drawable-space height from the bottom
+  // of the window. Mapping drawable→window via the height factor keeps the
+  // reservation consistent on high-DPI displays.
+  const int dock_h_drawable = dock_.dock_height_drawable();
+  int dock_h_window = 0;
+  if (dock_h_drawable > 0 && drawable_to_window_height_factor_ > 0.0f) {
+    dock_h_window = static_cast<int>(std::round(static_cast<float>(dock_h_drawable) / drawable_to_window_height_factor_));
+    dock_h_window = std::min(dock_h_window, safe_window_h_raw - 32);  // leave at least some video area
+    if (dock_h_window < 0) dock_h_window = 0;
+  }
+  const int safe_window_h = std::max(1, safe_window_h_raw - dock_h_window);
 
   content_window_ = SDL_Rect{0, 0, safe_window_w, safe_window_h};
 
-  if (aspect_view_mode_ != AspectViewMode::Stretch) {
-    const float content_aspect_ratio = std::max(compute_active_content_aspect_ratio(), 0.001F);
+  // When the dock is reserving space at the bottom we always letterbox the
+  // video to its natural content aspect inside the remaining stage — even in
+  // Stretch mode — so opening the dock shrinks the canvas without squeezing
+  // the picture vertically. The full-window Stretch behavior is preserved
+  // exactly when the dock is hidden.
+  const bool letterbox_to_content = aspect_view_mode_ != AspectViewMode::Stretch || dock_h_window > 0;
+
+  if (letterbox_to_content) {
+    const float content_aspect_ratio = std::max(
+        (aspect_view_mode_ == AspectViewMode::Stretch) ? compute_content_aspect_ratio()
+                                                       : compute_active_content_aspect_ratio(),
+        0.001F);
     const float window_aspect_ratio = static_cast<float>(safe_window_w) / static_cast<float>(safe_window_h);
 
     if (window_aspect_ratio > content_aspect_ratio) {
@@ -437,6 +459,9 @@ void Display::handle_window_resize(const bool reset_forced_size_guard, const boo
 
   drawable_to_window_width_factor_ = static_cast<float>(drawable_width_) / static_cast<float>(window_width_);
   drawable_to_window_height_factor_ = static_cast<float>(drawable_height_) / static_cast<float>(window_height_);
+  // The dock's layout has to be computed before update_content_window_layout
+  // because the latter subtracts the dock-bar height from the renderable area.
+  dock_.layout(drawable_width_, drawable_height_);
   update_content_window_layout();
 
   font_scale_ = (drawable_to_window_width_factor_ + drawable_to_window_height_factor_) / 2.0F;

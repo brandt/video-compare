@@ -14,6 +14,7 @@
 #include "subsystems/difference_processor.h"
 #include "display_types.h"
 #include "display_utils.h"
+#include "subsystems/dock.h"
 #include "display/gpu_renderer.h"
 #include "subsystems/image_saver.h"
 #include "subsystems/metadata_panel.h"
@@ -177,6 +178,7 @@ class Display {
   ImageSaver image_saver_;
   MetadataPanel metadata_panel_;
   OverlayManager overlay_;
+  Dock dock_;
 
   bool input_received_{true};
   // Reported by VideoCompare each refresh. Drives the SEEK badge in the play-
@@ -360,6 +362,37 @@ class Display {
   // directly.
   void save_image_frames_sdl(const AVFrame* left_frame, const AVFrame* right_frame);
 
+  // Bottom-of-window dock rendering. The SDL path issues SDL_Render* calls
+  // directly; the GPU path appends primitives + bitmaps to the overlay/text
+  // op vectors so libplacebo composites them in a single pass with everything
+  // else. Called at the end of the HUD phase, after split lines and toasts.
+  void render_dock_sdl();
+  void render_dock_gpu(std::vector<GpuRenderer::OverlayOp>& overlays,
+                        std::vector<GpuRenderer::TextOverlayOp>& text_ops);
+
+  // Effective drawable-bottom for HUD elements that anchor to the bottom edge:
+  // when the dock is visible, returns the y-coordinate of the top of the dock
+  // bar (so bottom-aligned text and the zoom magnifier sit above the dock).
+  // Otherwise returns drawable_height_.
+  int hud_bottom_drawable_y() const { return drawable_height_ - dock_.dock_height_drawable(); }
+
+  // Returns true and fills `out` with the *drawable*-pixel rectangle for the
+  // given visual slot (0 = left, 1 = right). Computed from content_window_
+  // and the current Mode. Returns false when there's no meaningful region
+  // (e.g. dock-only frame). Used by the dock hover indicator to outline the
+  // video region a click would replace.
+  bool slot_region_drawable(int slot, SDL_FRect& out) const;
+
+  // SDL-renderer-owned per-entry thumbnail textures. Re-uploaded lazily when
+  // the dock's dirty flag flips. Cleared on dock-size / window-resize / dtor.
+  std::vector<SDL_Texture*> dock_thumb_textures_;
+  // Per-entry "tex is up to date" flag; cleared when a fresh bitmap arrives.
+  std::vector<bool> dock_thumb_tex_valid_;
+  void destroy_dock_thumb_textures();
+
+  // Trigger a relayout after the dock's visibility flips.
+  void on_dock_visibility_changed();
+
   inline int static round(const float value) { return static_cast<int>(std::round(value)); }
 
   SDL_FRect video_rect_to_drawable_transform(const SDL_FRect& rect) const {
@@ -534,6 +567,30 @@ class Display {
   size_t get_num_right_videos() const;
   size_t get_active_right_index() const;
   void set_active_right_index(size_t index);
+
+  // Visual slot mapping. Each of the two visual slots (0 = visual-left,
+  // 1 = visual-right) is backed by exactly one pipeline Side. Originally
+  // constrained to {LEFT, RIGHT(active_right_index_)}; the dock allows any
+  // pipeline to occupy either slot (including two different Rights with the
+  // LEFT pipeline running but unrendered). The legacy swap_left_right_ flag
+  // and active_right_index_ are kept consistent with the slot mapping.
+  Side get_slot_side(int slot) const;
+  void set_slot_side(int slot, Side side);
+
+  // Initialize the dock with one entry per input video. Order must match the
+  // CLI input order (left first, then right_videos[0..N-1]) — the dock keeps
+  // this order for the lifetime of the program and uses it for results output.
+  void init_dock(std::vector<DockEntry> entries);
+
+  // Returns the per-entry thumbnail target size the loader should aim for.
+  std::pair<int, int> dock_thumb_target_size() const;
+
+  // Thread-safe: invoked by the ThumbnailLoader worker thread when a thumb
+  // finishes decoding. The render path picks up the new bytes on its next pass.
+  void set_dock_thumbnail(int entry_index, DockBitmap bitmap);
+
+  // Snapshot of the per-entry keep/skip/toss decisions in CLI input order.
+  std::vector<Dock::EntryResult> get_dock_results() const;
 
   // Left/right PTS sync state (pushed by VideoCompare). Drives the SEEK badge.
   void set_playback_in_sync(bool in_sync) { playback_in_sync_ = in_sync; }

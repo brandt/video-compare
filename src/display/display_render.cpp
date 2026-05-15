@@ -137,7 +137,7 @@ void Display::render_progress_dots(const float position, const float progress, c
     const int dot_width = std::round(drawable_to_window_width_factor_ * dot_size);
     const int dot_height = std::round(drawable_to_window_height_factor_ * dot_size);
 
-    const int y_offset = is_top ? 1 : drawable_height_ - 1 - dot_height;
+    const int y_offset = is_top ? 1 : hud_bottom_drawable_y() - 1 - dot_height;
 
     const int x_position = std::round(position * drawable_width_ / duration_);
     const int x_progress = std::round(progress * drawable_width_ / duration_);
