@@ -9,8 +9,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <deque>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <nlohmann/json.hpp>
 #include <thread>
 #include "core/ffmpeg/ffmpeg.h"
 #include "analysis/scope_manager.h"
@@ -443,6 +446,43 @@ VideoCompare::VideoCompare(const VideoCompareConfig& config)
     dock_entries.push_back(DockEntry{Side::Right(i), config.right_videos[i].file_name, DockAction::Skip});
   }
   display_->init_dock(dock_entries);
+
+  // If --choices was given and the file exists, pre-populate dock actions
+  // from it. Entries are matched by file path; missing entries stay "skip".
+  // Malformed JSON or unreadable files log a warning and continue with defaults.
+  if (!config.choices_path.empty()) {
+    std::ifstream in(config.choices_path);
+    if (in) {
+      try {
+        nlohmann::json parsed;
+        in >> parsed;
+        if (parsed.is_array()) {
+          std::map<std::string, DockAction> by_path;
+          for (const auto& item : parsed) {
+            if (!item.is_object()) continue;
+            if (!item.contains("path") || !item.contains("action")) continue;
+            const std::string p = item["path"].get<std::string>();
+            const std::string a = item["action"].get<std::string>();
+            DockAction action = DockAction::Skip;
+            if      (a == "keep") action = DockAction::Keep;
+            else if (a == "toss") action = DockAction::Toss;
+            else if (a == "skip") action = DockAction::Skip;
+            else                  continue;
+            by_path[p] = action;
+          }
+          for (size_t i = 0; i < dock_entries.size(); ++i) {
+            const auto it = by_path.find(dock_entries[i].file_path);
+            if (it != by_path.end() && it->second != DockAction::Skip) {
+              display_->set_dock_action(static_cast<int>(i), it->second);
+            }
+          }
+        }
+      } catch (const std::exception& e) {
+        std::cerr << "Failed to parse --choices file (" << config.choices_path << "): " << e.what() << std::endl;
+      }
+    }
+    // File not existing is fine — the user is creating a fresh choices file.
+  }
 
   // Spawn the async thumbnail loader. Paths are collected in the same CLI
   // input order so the index passed to set_dock_thumbnail matches the dock

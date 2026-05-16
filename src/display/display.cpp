@@ -749,6 +749,10 @@ std::vector<Dock::EntryResult> Display::get_dock_results() const {
   return dock_.snapshot_results();
 }
 
+void Display::set_dock_action(int entry_index, DockAction action) {
+  dock_.set_action(entry_index, action);
+}
+
 // Return the pipeline Side currently occupying the requested visual slot.
 // slot 0 = visual-left, 1 = visual-right.
 Side Display::get_slot_side(int slot) const {

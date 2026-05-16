@@ -604,7 +604,7 @@ int main(int argc, char** argv) {
          {"find-hwaccels", {"--find-hwaccels"}, "find FFmpeg video hardware acceleration types that match the provided search term (e.g. 'videotoolbox' or 'vulkan'; use \"\" to list all)", 1},
          {"libvmaf-options", {"--libvmaf-options"}, "libvmaf FFmpeg filter options (e.g. 'model=version=vmaf_4k_v0.6.1' or 'model=version=vmaf_v0.6.1\\\\:name=hd|version=vmaf_4k_v0.6.1\\\\:name=4k')", 1},
          {"disable-auto-options-file", {"--no-auto-options-file"}, string_sprintf("do not read options from '%s' automatically", AUTO_OPTIONS_FILE_NAME.c_str()), 0},
-         {"result", {"--result"}, "write the per-video keep/skip/toss results as JSON to this path on exit (in addition to the RESULTS: line on stdout)", 1},
+         {"choices", {"--choices"}, "read prior keep/skip/toss selections as JSON from PATH at launch (if it exists), and write the updated selections back to the same path on exit (in addition to the RESULTS: line on stdout)", 1},
          {"disable-auto-filters", {"--no-auto-filters"}, "disable the default behaviour of automatically injecting filters for deinterlacing, DAR correction, frame rate harmonization, rotation and colorimetry", 0}}};
 
     argagg::parser_results initial_args;
@@ -1002,8 +1002,8 @@ int main(int argc, char** argv) {
         VMAFCalculator::instance().set_libvmaf_options(args["libvmaf-options"]);
       }
 
-      if (args["result"]) {
-        config.result_path = static_cast<const std::string&>(args["result"]);
+      if (args["choices"]) {
+        config.choices_path = static_cast<const std::string&>(args["choices"]);
       }
 
       maybe_log_runtime_note();
@@ -1014,12 +1014,12 @@ int main(int argc, char** argv) {
       // After the compare loop returns, emit the keep/skip/toss results.
       const std::string results_json = compare.format_results_json();
       std::cout << "RESULTS: " << results_json << std::endl;
-      if (!config.result_path.empty()) {
-        std::ofstream out(config.result_path);
+      if (!config.choices_path.empty()) {
+        std::ofstream out(config.choices_path);
         if (out) {
           out << results_json << "\n";
         } else {
-          std::cerr << "Failed to write --result file: " << config.result_path << std::endl;
+          std::cerr << "Failed to write --choices file: " << config.choices_path << std::endl;
         }
       }
     }

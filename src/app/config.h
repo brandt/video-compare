@@ -88,6 +88,9 @@ struct VideoCompareConfig {
   ScopesConfig scopes;
 
   // If non-empty, the per-input keep/skip/toss results JSON is written to this path on exit
-  // (in addition to the RESULTS: line printed to stdout). Set via --result=PATH.
-  std::string result_path;
+  // (in addition to the RESULTS: line printed to stdout). Set via --choices=PATH.
+  // If the file already exists at launch time, the dock pre-populates its
+  // keep/skip/toss selections from it (matched by file path); entries whose
+  // path doesn't appear in the file default to "skip".
+  std::string choices_path;
 };

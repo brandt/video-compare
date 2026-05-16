@@ -593,6 +593,10 @@ class Display {
   // Snapshot of the per-entry keep/skip/toss decisions in CLI input order.
   std::vector<Dock::EntryResult> get_dock_results() const;
 
+  // Set the dock action for the entry at `entry_index`. Used to pre-populate
+  // selections from a prior --choices file at startup.
+  void set_dock_action(int entry_index, DockAction action);
+
   // Left/right PTS sync state (pushed by VideoCompare). Drives the SEEK badge.
   void set_playback_in_sync(bool in_sync) { playback_in_sync_ = in_sync; }
 };
