@@ -198,6 +198,7 @@ void Dock::init(std::vector<DockEntry> entries) {
   wells_.assign(n, SDL_Rect{0, 0, 0, 0});
   thumb_rects_.assign(n, SDL_Rect{0, 0, 0, 0});
   tristate_rects_.assign(n, std::array<SDL_Rect, 3>{});
+  focused_entry_idx_ = -1;
   {
     std::lock_guard<std::mutex> lock(thumb_mutex_);
     thumbnails_.assign(n, DockBitmap{});
@@ -333,6 +334,14 @@ DockAction Dock::get_action(int entry_index) const {
 void Dock::set_slot_indices(int left_slot_entry_idx, int right_slot_entry_idx) {
   left_slot_idx_ = left_slot_entry_idx;
   right_slot_idx_ = right_slot_entry_idx;
+}
+
+void Dock::set_focused_entry_index(int entry_index) {
+  if (entry_index < 0 || entry_index >= static_cast<int>(entries_.size())) {
+    focused_entry_idx_ = -1;
+  } else {
+    focused_entry_idx_ = entry_index;
+  }
 }
 
 void Dock::set_thumbnail(int entry_index, DockBitmap bitmap) {

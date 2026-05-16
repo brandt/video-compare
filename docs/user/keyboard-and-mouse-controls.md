@@ -82,12 +82,27 @@ The "primary" modifier is `Cmd` on macOS and `Ctrl` on Linux/Windows. Where a sh
 
 ### Sources
 
-| Key                  | Action
-|----------------------|-------
-| S                    | Swap the two visual slots
-| Tab / Shift+Tab      | Cycle visual-right slot through right pipelines
-| Ctrl+Shift+1..9 / 0  | Direct-select right pipeline into visual-right slot
-| Z                    | Toggle bottom video-picker dock
+| Key                       | Action
+|---------------------------|-------
+| S                         | Swap the two visual slots
+| Tab / Shift+Tab           | Cycle visual-right slot through right pipelines
+| Cmd/Ctrl+1..9 / 0         | Direct-select right pipeline into visual-right slot
+| Cmd/Ctrl+Right / +Left    | Cycle visual-right slot forward / backward
+| Z                         | Toggle bottom video-picker dock
+
+### Dock / triage
+
+The focused entry has a thin white outline. Focus follows the visual-right slot
+automatically; press the dock action keys to mark the focused video for review.
+
+| Key                 | Action
+|---------------------|-------
+| `` ` ``             | Focus the left video
+| M                   | Mark focused video as **Keep**
+| B                   | Mark focused video as **Toss**
+| N                   | Mark focused video as **Skip**
+| X                   | Mark focused video Keep, every other entry Toss
+| Cmd/Ctrl+R          | Reveal focused video in Finder (macOS only)
 
 ### Window
 

@@ -257,14 +257,15 @@ void Display::handle_key_down(const SDL_Event& event) {
   const float relative_seek_scale = is_shift_down ? 1.0F / RELATIVE_SEEK_SLOWDOWN_RATIO : 1.0F;
   const float playback_speed_scale = is_shift_down ? 1.0F / PLAYBACK_SPEED_SLOWDOWN_RATIO : 1.0F;
 
-  if (handle_right_video_index_shortcut(keycode, is_ctrl_down, is_shift_down)) return;
+  if (handle_right_video_select_shortcut(keycode, keymod, is_shift_down, is_ctrl_down)) return;
   if (handle_crop_save_keys(keycode, keymod, is_shift_down, is_ctrl_down)) return;
   if (handle_scope_window_keys(keycode, is_shift_down)) return;
   if (handle_window_size_keys(keycode, keymod, is_shift_down, is_ctrl_down)) return;
   if (handle_view_mode_keys(keycode, is_shift_down, is_ctrl_down, is_alt_down)) return;
-  if (handle_zoom_pan_keys(keycode, is_shift_down, is_alt_down)) return;
+  if (handle_zoom_pan_keys(keycode, keymod, is_shift_down, is_ctrl_down, is_alt_down)) return;
   if (handle_playback_keys(keycode, relative_seek_scale, playback_speed_scale, is_shift_down, is_alt_down)) return;
   if (handle_diff_keys(keycode, is_shift_down)) return;
+  if (handle_dock_action_keys(keycode, keymod, is_shift_down, is_ctrl_down, is_alt_down)) return;
   handle_misc_keys(keycode, keymod, is_shift_down, is_ctrl_down);
 }
 
@@ -277,10 +278,25 @@ void Display::handle_key_up(const SDL_Event& event) {
   }
 }
 
-// Ctrl+Shift+1..9/0 selects a specific right video by index.
-bool Display::handle_right_video_index_shortcut(const SDL_Keycode keycode, const bool is_ctrl_down, const bool is_shift_down) {
-  if (!is_ctrl_down || !is_shift_down) return false;
+// Cmd+1..0 (macOS) / Ctrl+1..0 (other) selects a specific right video by
+// index, and Cmd/Ctrl+Left/Right cycles through right videos like Tab.
+// Plain digits and plain arrows fall through to other handlers.
+bool Display::handle_right_video_select_shortcut(const SDL_Keycode keycode, const SDL_Keymod keymod, const bool is_shift_down, const bool is_ctrl_down) {
+  if (is_shift_down || !is_primary_mod_pressed(keymod, is_ctrl_down)) {
+    return false;
+  }
 
+  // Arrow keys: cycle.
+  if (keycode == SDLK_RIGHT) {
+    cycle_right_slot(+1);
+    return true;
+  }
+  if (keycode == SDLK_LEFT) {
+    cycle_right_slot(-1);
+    return true;
+  }
+
+  // Digit keys: direct-select right pipeline 1..10 (0 maps to index 9).
   size_t target_index = SIZE_MAX;
   if (keycode >= SDLK_1 && keycode <= SDLK_9) {
     target_index = keycode - SDLK_1;
@@ -515,8 +531,10 @@ bool Display::handle_view_mode_keys(const SDL_Keycode keycode, const bool is_shi
 }
 
 // Alt+1..6 preset zooms (1:1, 100%, 200%, 400%, 800%, 50%), E mouse-centered pan,
-// R reset pan/zoom, Shift+Z transient zoom-left magnifier.
-bool Display::handle_zoom_pan_keys(const SDL_Keycode keycode, const bool is_shift_down, const bool is_alt_down) {
+// R reset pan/zoom, Shift+Z transient zoom-left magnifier. Plain R falls
+// through to handle_misc_keys when the primary mod is held so that Cmd+R /
+// Ctrl+R can be claimed there (reveal-in-Finder on macOS).
+bool Display::handle_zoom_pan_keys(const SDL_Keycode keycode, const SDL_Keymod keymod, const bool is_shift_down, const bool is_ctrl_down, const bool is_alt_down) {
   if (is_alt_down) {
     switch (keycode) {
       case SDLK_1: case SDLK_KP_1:
@@ -541,7 +559,10 @@ bool Display::handle_zoom_pan_keys(const SDL_Keycode keycode, const bool is_shif
       return true;
     }
     case SDLK_R:
-      if (!is_shift_down) {
+      // Plain R resets pan/zoom. Cmd/Ctrl+R falls through so handle_misc_keys
+      // can claim it (reveal-in-Finder on macOS); Shift+R also falls through
+      // because Shift+R is the per-side crop-right binding.
+      if (!is_shift_down && !is_primary_mod_pressed(keymod, is_ctrl_down)) {
         view_transform_.reset_pan();
         view_transform_.update_zoom_factor(1.0F);
         return true;
@@ -688,9 +709,74 @@ bool Display::handle_diff_keys(const SDL_Keycode keycode, const bool is_shift_do
   }
 }
 
+// Backtick focuses the LEFT slot's entry; M / B / N set the focused entry's
+// action; X marks the focused entry Keep and every other entry Toss. All
+// require no modifier (Shift / Ctrl / Alt / GUI all fall through so chords
+// like Shift+M reach handle_misc_keys).
+bool Display::handle_dock_action_keys(const SDL_Keycode keycode, const SDL_Keymod keymod, const bool is_shift_down, const bool is_ctrl_down, const bool is_alt_down) {
+  const bool is_gui_down = (keymod & SDL_KMOD_GUI) != 0;
+  if (is_shift_down || is_ctrl_down || is_alt_down || is_gui_down) {
+    return false;
+  }
+
+  // SDLK_GRAVE — focus the LEFT slot's entry.
+  if (keycode == SDLK_GRAVE) {
+    const int left_idx = dock_.left_slot_index();
+    if (left_idx < 0) {
+      notify_user("No left entry to focus");
+    } else {
+      dock_.set_focused_entry_index(left_idx);
+    }
+    input_received_ = true;
+    return true;
+  }
+
+  // The mark keys all act on the focused entry.
+  if (keycode != SDLK_M && keycode != SDLK_B && keycode != SDLK_N && keycode != SDLK_X) {
+    return false;
+  }
+
+  const int focused = dock_.focused_entry_index();
+  const auto& entries = dock_.entries();
+  if (focused < 0 || focused >= static_cast<int>(entries.size())) {
+    notify_user("No focused entry");
+    return true;
+  }
+
+  const std::string label = get_file_name_and_extension(entries[focused].file_path);
+
+  switch (keycode) {
+    case SDLK_M:
+      dock_.set_action(focused, DockAction::Keep);
+      notify_user(string_sprintf("Kept: %s", label.c_str()));
+      break;
+    case SDLK_B:
+      dock_.set_action(focused, DockAction::Toss);
+      notify_user(string_sprintf("Tossed: %s", label.c_str()));
+      break;
+    case SDLK_N:
+      dock_.set_action(focused, DockAction::Skip);
+      notify_user(string_sprintf("Skipped: %s", label.c_str()));
+      break;
+    case SDLK_X:
+      dock_.set_action(focused, DockAction::Keep);
+      for (size_t i = 0; i < entries.size(); ++i) {
+        if (static_cast<int>(i) == focused) continue;
+        dock_.set_action(static_cast<int>(i), DockAction::Toss);
+      }
+      notify_user(string_sprintf("Kept '%s'; tossed the rest", label.c_str()));
+      break;
+    default:
+      break;
+  }
+  input_received_ = true;
+  return true;
+}
+
 // ? help, H HUD toggle, ESCAPE quit, P pixel print, Q quality / Shift+Q metrics print,
 // G fps toggle / Shift+G state print, O subtraction toggle, TAB cycle right slot,
-// Z dock toggle, Shift+C zoom-right magnifier, Cmd/Ctrl+C copy / Cmd/Ctrl+V paste.
+// Z dock toggle, Shift+C zoom-right magnifier, Cmd/Ctrl+C copy / Cmd/Ctrl+V paste,
+// Cmd/Ctrl+R reveal in Finder (macOS).
 bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymod, const bool is_shift_down, const bool is_ctrl_down) {
   switch (keycode) {
     case SDLK_Z:
@@ -730,6 +816,19 @@ bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymo
     case SDLK_P:
       print_mouse_position_and_color_ = mouse_is_inside_window_;
       return true;
+    case SDLK_R:
+      // Plain R is reset-pan-zoom in handle_zoom_pan_keys (returns false when
+      // the primary mod is held). Cmd/Ctrl+R reveals the focused entry in the
+      // OS file browser — only meaningful on macOS today.
+      if (is_primary_mod_pressed(keymod, is_ctrl_down)) {
+#ifdef __APPLE__
+        reveal_focused_in_finder();
+        return true;
+#else
+        return false;
+#endif
+      }
+      return false;
     case SDLK_Q:
       if (is_shift_down) {
         // Print image similarity metrics to console (formerly plain M).
@@ -746,22 +845,9 @@ bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymo
         show_fps_ = !show_fps_;
       }
       return true;
-    case SDLK_TAB: {
-      // Advance the visual-right slot through the available right pipelines,
-      // skipping any pipeline already on the visual-left slot (so Tab never
-      // produces a duplicate-side layout).
-      if (num_right_videos_ == 0) return true;
-      size_t next = active_right_index_;
-      const size_t skip_index = displayed_left_side_.is_right() ? displayed_left_side_.right_index() : SIZE_MAX;
-      for (size_t step = 0; step < num_right_videos_; ++step) {
-        next = is_shift_down ? (next + num_right_videos_ - 1) % num_right_videos_
-                             : (next + 1) % num_right_videos_;
-        if (next != skip_index) break;
-      }
-      set_slot_side(1, Side::Right(next));
-      notify_user(string_sprintf("Active right video: %d/%d", active_right_index_ + 1, num_right_videos_));
+    case SDLK_TAB:
+      cycle_right_slot(is_shift_down ? -1 : +1);
       return true;
-    }
     case SDLK_C:
       if (is_clipboard_mod_pressed(keymod, is_ctrl_down)) {
         const float previous_left_frame_secs = previous_left_frame_pts_ * AV_TIME_TO_SEC;

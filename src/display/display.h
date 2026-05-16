@@ -266,15 +266,25 @@ class Display {
   void handle_key_up(const SDL_Event& event);
 
   // Key-down cascade: first-match-wins. Each returns true when it consumed the key.
-  bool handle_right_video_index_shortcut(SDL_Keycode keycode, bool is_ctrl_down, bool is_shift_down);
+  bool handle_right_video_select_shortcut(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down, bool is_ctrl_down);
   bool handle_crop_save_keys(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down, bool is_ctrl_down);
   bool handle_scope_window_keys(SDL_Keycode keycode, bool is_shift_down);
   bool handle_window_size_keys(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down, bool is_ctrl_down);
   bool handle_view_mode_keys(SDL_Keycode keycode, bool is_shift_down, bool is_ctrl_down, bool is_alt_down);
-  bool handle_zoom_pan_keys(SDL_Keycode keycode, bool is_shift_down, bool is_alt_down);
+  bool handle_zoom_pan_keys(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down, bool is_ctrl_down, bool is_alt_down);
   bool handle_playback_keys(SDL_Keycode keycode, float relative_seek_scale, float playback_speed_scale, bool is_shift_down, bool is_alt_down);
   bool handle_diff_keys(SDL_Keycode keycode, bool is_shift_down);
+  bool handle_dock_action_keys(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down, bool is_ctrl_down, bool is_alt_down);
   bool handle_misc_keys(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down, bool is_ctrl_down);
+
+  // Cycle the visual-right slot through configured right pipelines, skipping
+  // any pipeline already on the visual-left so the swap never produces a
+  // duplicate-side layout. direction is +1 for forward, -1 for backward.
+  void cycle_right_slot(int direction);
+
+  // Reveal the focused dock entry's video file in the system file browser.
+  // macOS-only behavior; non-mac builds no-op with a notification.
+  void reveal_focused_in_finder();
 
   // Input helpers.
   void update_cursor_mode();

@@ -48,7 +48,7 @@ A single polling loop in `VideoCompare::compare()` is the only place that calls 
 `handle_key_down` is structured as a **first-match-wins cascade**. The keycode and modifier flags (`is_shift_down` / `is_ctrl_down` / `is_alt_down`) are computed once at the top, then handed to a sequence of `handle_*_keys` helpers. Each helper returns `bool` — `true` means "I consumed the key, stop the cascade":
 
 ```
-if (handle_right_video_index_shortcut(...)) return;   // Ctrl+Shift+digit ─ highest priority
+if (handle_right_video_select_shortcut(...)) return;  // Cmd/Ctrl+digit, Cmd/Ctrl+Arrow ─ highest priority
 if (handle_crop_save_keys(...))             return;   // Cmd/Ctrl+S, Shift+F/R/L/B, K, Backspace
 if (handle_scope_window_keys(...))          return;   // F1-F3 / Shift+1-3
 if (handle_window_size_keys(...))           return;   // Ctrl+W variants, Cmd/Ctrl+Enter
@@ -56,7 +56,8 @@ if (handle_view_mode_keys(...))             return;   // 1, 2, O, Shift+M, S/Shi
 if (handle_zoom_pan_keys(...))              return;   // Alt+1..6, E, R, Shift+Z
 if (handle_playback_keys(...))              return;   // SPACE, (, ), A/,, D/., J, L, arrows, +/-, \, [, ]
 if (handle_diff_keys(...))                  return;   // Y, U
-handle_misc_keys(...);                                // catch-all: Z, ?, H, ESC, P, Q/Shift+Q, G/Shift+G, TAB, C, V
+if (handle_dock_action_keys(...))           return;   // `, M, B, N, X — dock focus + mark
+handle_misc_keys(...);                                // catch-all: Z, ?, H, ESC, P, Q/Shift+Q, G/Shift+G, TAB, C, V, Cmd/Ctrl+R
 ```
 
 ### Why first-match-wins
@@ -84,15 +85,16 @@ The digit row (`1`..`6`) cooperates the same way across `handle_scope_window_key
 
 | Helper | What it owns |
 |---|---|
-| `handle_right_video_index_shortcut` | `Ctrl+Shift+1..9/0` → `set_slot_side(1, Side::Right(N))`. Highest priority because of the heavy modifier combo. |
+| `handle_right_video_select_shortcut` | `Cmd/Ctrl+1..9/0` → `set_slot_side(1, Side::Right(N))`; `Cmd/Ctrl+Left/Right` → `cycle_right_slot(±1)`. Highest priority so plain digits / arrows can still seek or hide/show. |
 | `handle_crop_save_keys` | `Cmd/Ctrl+S` (save frames), `Shift+F` (save selection), `Shift+R/L/B` (per-side crop), `K` (auto-crop black borders), `Backspace` (clear crop). |
 | `handle_scope_window_keys` | `F1/F2/F3` and `Shift+1/2/3` — toggle scope windows. The latter is checked before `handle_view_mode_keys` so Shift+digit doesn't toggle hide/show. |
 | `handle_window_size_keys` | `Ctrl+W` (startup size), `Shift+W` (saved size), `Ctrl+Shift+W` (save current), `Cmd/Ctrl+Enter` (fullscreen — `Cmd` on macOS, `Ctrl` elsewhere, via `is_primary_mod_pressed`). Plain `W` is swallowed (no-op) so the keycap isn't accidentally bound to anything by a fallthrough. |
 | `handle_view_mode_keys` | `1/2` (hide/show panels), `O` (subtraction), `Shift+M` (mode cycle), `S` (slot swap) / `Shift+S` (aspect view), `Alt+T` (texture filter), `Alt+I` (input alignment filter), plain `I` (info / metadata overlay). Returns `false` when `Alt` is held on a digit key so `handle_zoom_pan_keys` can claim it. |
-| `handle_zoom_pan_keys` | `Alt+1..6` preset zooms (1:1, 100%, 200%, 400%, 800%, 50%), `E` (mouse-centered pan), `R` (reset), `Shift+Z` (transient zoom-left magnifier). Plain Z falls through to `handle_misc_keys`. |
+| `handle_zoom_pan_keys` | `Alt+1..6` preset zooms (1:1, 100%, 200%, 400%, 800%, 50%), `E` (mouse-centered pan), plain `R` (reset pan/zoom — `Cmd/Ctrl+R` falls through to `handle_misc_keys`), `Shift+Z` (transient zoom-left magnifier). Plain Z falls through to `handle_misc_keys`. |
 | `handle_playback_keys` | `Space`, `(`/`)` loop modes (Shift+9 / Shift+0), `,`/`.` aliases of `A`/`D`, `J/L` (speed), `A/D` (buffer step) / `Shift+A/D` (decode-step), arrows + PageUp/Dn (seek), `+/-` (frame time-shift), `Shift +/-` (×10) / `Alt +/-` (×100), `\` symmetric auto-align, `[`/`]` directional auto-align. |
 | `handle_diff_keys` | `Y` / `Shift+Y` (cycle subtraction modes), `U` (luma-only). |
-| `handle_misc_keys` | Last-chance handler: `Z` (dock toggle), `?` (Shift+/, help), `H` (HUD toggle), `Esc` (quit), `P` (pixel print), `Q` quality / `Shift+Q` metrics print, `G` FPS toggle / `Shift+G` state print, `Tab` / `Shift+Tab` (cycle right slot), `Shift+C` (zoom-right transient), `Cmd/Ctrl+C` (copy timestamp), `Cmd/Ctrl+V` (paste timestamp). |
+| `handle_dock_action_keys` | `` ` `` (focus the LEFT entry), `M` (Keep), `B` (Toss), `N` (Skip), `X` (Keep focused, Toss every other entry). All require no modifier so chords like `Shift+M` fall through to `handle_misc_keys`. |
+| `handle_misc_keys` | Last-chance handler: `Z` (dock toggle), `?` (Shift+/, help), `H` (HUD toggle), `Esc` (quit), `P` (pixel print), `Q` quality / `Shift+Q` metrics print, `G` FPS toggle / `Shift+G` state print, `Tab` / `Shift+Tab` (cycle right slot via `cycle_right_slot`), `Shift+C` (zoom-right transient), `Cmd/Ctrl+C` (copy timestamp), `Cmd/Ctrl+V` (paste timestamp), `Cmd/Ctrl+R` (reveal-in-Finder, macOS-only). |
 
 The two platform-aware helpers `is_clipboard_mod_pressed` and `is_primary_mod_pressed` (both in `display_input.cpp`) gate Cmd-on-macOS / Ctrl-elsewhere bindings. They have identical bodies today but are kept separate so the divergence (e.g. clipboard rule changes vs. fullscreen rule changes) can land in only one place.
 

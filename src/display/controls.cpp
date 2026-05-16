@@ -63,8 +63,22 @@ static const std::vector<ControlSection> control_sections{
      {{"S", "Swap left / right"},
       {"Tab", "Cycle right slot"},
       {"Shift+Tab", "Cycle right (back)"},
-      {"Ctrl+Shift+1..0", "Pick right 1-10"},
+      {PRIMARY_MOD_LABEL "+1..0", "Pick right 1-10"},
+      {PRIMARY_MOD_LABEL "+Right", "Focus next right"},
+      {PRIMARY_MOD_LABEL "+Left", "Focus prev right"},
       {"Z", "Toggle bottom dock"}}},
+    {"Dock",
+     {{"`", "Focus left video"},
+      {"M", "Keep focused"},
+      {"B", "Toss focused"},
+      {"N", "Skip focused"},
+      {"X", "Keep focused, toss rest"},
+#ifdef __APPLE__
+      {PRIMARY_MOD_LABEL "+R", "Reveal in Finder"}
+#else
+      {PRIMARY_MOD_LABEL "+R", "Reveal in Finder (macOS)"}
+#endif
+     }},
     {"Window",
      {{PRIMARY_MOD_LABEL "+Enter", "Toggle fullscreen"},
       {"Ctrl+W", "Restore startup size"},

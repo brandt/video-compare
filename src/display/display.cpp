@@ -32,6 +32,12 @@ extern "C" {
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
+#ifdef __APPLE__
+#include <spawn.h>
+#include <cerrno>
+#include <cstring>
+extern char** environ;
+#endif
 
 SDL::SDL() {
   check_sdl(SDL_Init(SDL_INIT_VIDEO), "SDL init");
@@ -723,6 +729,11 @@ void Display::init_dock(std::vector<DockEntry> entries) {
   }
   dock_.set_slot_indices(left_idx, right_idx);
 
+  // Seed keyboard focus to the right-side entry so M / B / N / X work
+  // immediately on the active right pipeline. Backtick later moves focus to
+  // the LEFT entry; subsequent right-slot changes re-claim focus to right.
+  dock_.set_focused_entry_index(right_idx);
+
   // If the dock starts visible (default), entries land after the initial
   // window-resize/layout pass, so the dock rects were last computed with
   // zero entries. Re-run the visibility-change hook to lay out against the
@@ -802,5 +813,73 @@ void Display::set_slot_side(int slot, Side side) {
   }
   dock_.set_slot_indices(left_idx, right_idx);
 
+  // Focus follows the right slot: any action that targets visual-right
+  // (Cmd/Ctrl+digit, Cmd/Ctrl+arrow, Tab, click, S-swap, …) re-claims focus
+  // to whatever now occupies the right slot. Re-affirmations of the current
+  // right pipeline (e.g. Cmd+1 when Right(0) is already active) also re-
+  // focus, so after pressing backtick to focus LEFT the user can hit Cmd+1
+  // or Tab to get back to the right side even without changing pipelines.
+  // The LEFT slot doesn't claim focus on its own — backtick is the only way.
+  if (slot == 1) {
+    dock_.set_focused_entry_index(right_idx);
+  }
+
   input_received_ = true;
+}
+
+// Advance (direction +1) or rewind (direction -1) the visual-right slot
+// through configured right pipelines, skipping the one already on visual-
+// left so the swap never produces a duplicate-side layout.
+void Display::cycle_right_slot(int direction) {
+  if (num_right_videos_ == 0) {
+    return;
+  }
+  size_t next = active_right_index_;
+  const size_t skip_index = displayed_left_side_.is_right() ? displayed_left_side_.right_index() : SIZE_MAX;
+  for (size_t step = 0; step < num_right_videos_; ++step) {
+    if (direction < 0) {
+      next = (next + num_right_videos_ - 1) % num_right_videos_;
+    } else {
+      next = (next + 1) % num_right_videos_;
+    }
+    if (next != skip_index) {
+      break;
+    }
+  }
+  set_slot_side(1, Side::Right(next));
+  notify_user(string_sprintf("Active right video: %d/%d", active_right_index_ + 1, num_right_videos_));
+}
+
+// Reveal the focused dock entry's file in the OS file browser. On macOS this
+// uses `posix_spawn(/usr/bin/open -R <path>)` so the path is passed verbatim
+// as a single argv element (no shell parsing, no quoting needed). On other
+// platforms it just notifies the user; we'd need an xdg-friendly equivalent
+// before claiming the same shortcut.
+void Display::reveal_focused_in_finder() {
+  const int focused = dock_.focused_entry_index();
+  const auto& entries = dock_.entries();
+  if (focused < 0 || focused >= static_cast<int>(entries.size())) {
+    notify_user("Reveal: no focus");
+    return;
+  }
+  const std::string& path = entries[focused].file_path;
+
+#ifdef __APPLE__
+  const char* open_bin = "/usr/bin/open";
+  char* argv[] = {
+      const_cast<char*>(open_bin),
+      const_cast<char*>("-R"),
+      const_cast<char*>(path.c_str()),
+      nullptr};
+  pid_t pid = 0;
+  const int rc = posix_spawn(&pid, open_bin, nullptr, nullptr, argv, environ);
+  if (rc != 0) {
+    notify_user(string_sprintf("Reveal failed: %s", std::strerror(rc)));
+  } else {
+    notify_user(string_sprintf("Revealed: %s", get_file_name_and_extension(path).c_str()));
+  }
+#else
+  (void)path;
+  notify_user("Reveal in file manager is macOS-only");
+#endif
 }

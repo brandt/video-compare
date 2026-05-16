@@ -102,6 +102,12 @@ class Dock {
   int left_slot_index() const { return left_slot_idx_; }
   int right_slot_index() const { return right_slot_idx_; }
 
+  // Keyboard-driven focus. The "focused" entry receives marking commands
+  // (M / B / N / X) and is highlighted in the render path with a thin white
+  // outline around its well. -1 means "no focus".
+  void set_focused_entry_index(int entry_index);
+  int focused_entry_index() const { return focused_entry_idx_; }
+
   // --- Thumbnails (thread-safe) ---
   // Called from the ThumbnailLoader worker thread when a thumbnail finishes
   // decoding. Locks thumb_mutex_; stores the bitmap; flips dirty_ so the
@@ -180,6 +186,7 @@ class Dock {
   int left_slot_idx_{-1};
   int right_slot_idx_{-1};
   int hover_thumb_idx_{-1};
+  int focused_entry_idx_{-1};
 
   // Procedural bitmaps (built once on first layout()).
   bool static_bitmaps_built_{false};

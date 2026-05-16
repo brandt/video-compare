@@ -32,6 +32,8 @@ struct RGBA { uint8_t r, g, b, a; };
 constexpr RGBA kKeepColor{60, 200, 70, 255};
 constexpr RGBA kSkipColor{180, 180, 180, 255};
 constexpr RGBA kTossColor{220, 60, 60, 255};
+constexpr RGBA kFocusOutlineColor{255, 255, 255, 230};
+constexpr int kFocusOutlineWidth = 2;
 
 constexpr RGBA color_for_action(DockAction a) {
   switch (a) {
@@ -224,6 +226,20 @@ void Display::render_dock_sdl() {
       }
     }
   }
+
+  // Keyboard focus outline: thin white rectangle around the focused entry's
+  // well. Drawn last so it sits above wells / thumbs / badges / tristate.
+  const int focused = dock_.focused_entry_index();
+  if (focused >= 0 && focused < static_cast<int>(entries.size())) {
+    const SDL_Rect well = dock_.well_rect_drawable(focused);
+    SDL_SetRenderDrawColor(renderer_, kFocusOutlineColor.r, kFocusOutlineColor.g,
+                            kFocusOutlineColor.b, kFocusOutlineColor.a);
+    for (int i = 0; i < kFocusOutlineWidth; ++i) {
+      SDL_FRect r{static_cast<float>(well.x + i), static_cast<float>(well.y + i),
+                  static_cast<float>(well.w - 2 * i), static_cast<float>(well.h - 2 * i)};
+      SDL_RenderRect(renderer_, &r);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +405,24 @@ void Display::render_dock_gpu(std::vector<GpuRenderer::OverlayOp>& overlays,
         push_rect(static_cast<float>(cell.x + cell.w - 1), static_cast<float>(cell.y),
                   static_cast<float>(cell.x + cell.w), static_cast<float>(cell.y + cell.h), c.r, c.g, c.b, c.a);
       }
+    }
+  }
+
+  // Keyboard focus outline: thin white rectangle around the focused well.
+  // Pushed last so it sits above all earlier dock primitives.
+  const int focused = dock_.focused_entry_index();
+  if (focused >= 0 && focused < static_cast<int>(entries.size())) {
+    const SDL_Rect well = dock_.well_rect_drawable(focused);
+    const auto& c = kFocusOutlineColor;
+    for (int i = 0; i < kFocusOutlineWidth; ++i) {
+      const float x0 = static_cast<float>(well.x + i);
+      const float y0 = static_cast<float>(well.y + i);
+      const float x1 = static_cast<float>(well.x + well.w - i);
+      const float y1 = static_cast<float>(well.y + well.h - i);
+      push_rect(x0, y0,            x1,        y0 + 1, c.r, c.g, c.b, c.a);  // top
+      push_rect(x0, y1 - 1,        x1,        y1,     c.r, c.g, c.b, c.a);  // bottom
+      push_rect(x0, y0,            x0 + 1,    y1,     c.r, c.g, c.b, c.a);  // left
+      push_rect(x1 - 1, y0,        x1,        y1,     c.r, c.g, c.b, c.a);  // right
     }
   }
 }
