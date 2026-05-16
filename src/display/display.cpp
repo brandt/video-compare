@@ -722,6 +722,14 @@ void Display::init_dock(std::vector<DockEntry> entries) {
     if (dock_entries[i].pipeline_side == displayed_right_side_) right_idx = static_cast<int>(i);
   }
   dock_.set_slot_indices(left_idx, right_idx);
+
+  // If the dock starts visible (default), entries land after the initial
+  // window-resize/layout pass, so the dock rects were last computed with
+  // zero entries. Re-run the visibility-change hook to lay out against the
+  // populated entry list and reserve content-area space for the bar.
+  if (dock_.visible()) {
+    on_dock_visibility_changed();
+  }
 }
 
 std::pair<int, int> Display::dock_thumb_target_size() const {

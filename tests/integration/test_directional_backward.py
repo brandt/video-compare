@@ -70,8 +70,8 @@ def test_each_key_routes_to_expected_mode(video_compare_binary, lg_daylight_pair
     with VideoCompareSession(lg_daylight_pair) as vc:
         vc.seek_wait(timeout=15.0)
 
-        # Symmetric mode (`) — window both sides of master.
-        vc.key("`")
+        # Symmetric mode (\) — window both sides of master.
+        vc.key("\\")
         vc.seek_wait()
 
         # Backward mode ([) — window [-1 s, 0] on master axis.

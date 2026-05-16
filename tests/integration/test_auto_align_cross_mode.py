@@ -35,12 +35,12 @@ def test_symmetric_then_backward_extends_not_resets(video_compare_binary, lg_day
         vc.key("space")
         vc.seek_wait(timeout=5.0)
 
-        # Press 1: `` ` `` — symmetric. searched_window = [-0.5, +0.5]s.
-        vc.key("`")
+        # Press 1: `\` — symmetric. searched_window = [-0.5, +0.5]s.
+        vc.key("\\")
         vc.seek_wait()
 
         # Press 2: `[` — backward. Under cross-mode carry, high end stays
-        # at +0.5 (inherited from `` ` ``), low end extends by 1 s to about
+        # at +0.5 (inherited from `\`), low end extends by 1 s to about
         # -1.5 s (= -0.5 - 1.0). Under the OLD behavior, cache would reset
         # and window would be [-1, 0]s.
         vc.key("[")
@@ -72,7 +72,7 @@ def test_symmetric_then_backward_extends_not_resets(video_compare_binary, lg_day
 
 
 def test_mode_change_does_not_redecode_overlap(video_compare_binary, lg_daylight_pair):
-    """When `` ` `` → `[` carries cache forward, the backward press only
+    """When `\\` → `[` carries cache forward, the backward press only
     decodes its net-new strip (the 1 s that lies beyond the symmetric
     window's low edge). The candidate pool grows but the ring contribution
     stays at 0 because candidates are keyed by PTS and deduped."""
@@ -84,7 +84,7 @@ def test_mode_change_does_not_redecode_overlap(video_compare_binary, lg_daylight
         vc.key("space")
         vc.seek_wait(timeout=5.0)
 
-        vc.key("`")
+        vc.key("\\")
         vc.seek_wait()
         vc.key("[")
         vc.seek_wait()

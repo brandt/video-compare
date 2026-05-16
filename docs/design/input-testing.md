@@ -38,6 +38,7 @@ One command per line. Whitespace-separated tokens. Blank lines and comment lines
 | `modshift`| `on|off`                     | Set/clear the Shift modifier flag for subsequent key events.
 | `modctrl` | `on|off`                     | Set/clear the Ctrl modifier.
 | `modalt`  | `on|off`                     | Set/clear the Alt modifier.
+| `modgui`  | `on|off`                     | Set/clear the GUI / Cmd / Meta / Super modifier (used for macOS-style shortcuts like `Cmd+Enter` fullscreen).
 | `quit`    |                              | Push `SDL_EVENT_QUIT` so the main loop exits cleanly.
 | `log`     | `<message>`                  | Print the remainder of the line to stderr as `[input-script] <message>`.
 
@@ -49,11 +50,11 @@ The script is parsed once at startup and executed top-to-bottom in a detached th
 
 Case-insensitive. Either a single character or a named key:
 
-- **Single char**: `a`–`z`, `0`–`9`, `-`, `=`, `+`, `.`, `,`, `/`, `\`, `;`, `[`, `]`, `` ` ``.
+- **Single char**: `a`–`z`, `0`–`9`, `-`, `=`, `+`, `.`, `,`, `/`, `\`, `;`, `[`, `]`, `` ` ``, `?`, `(`, `)`.
 - **Whitespace/control**: `space` (`spc`), `escape` (`esc`), `return` (`enter`), `tab`, `backspace` (`bsp`), `delete` (`del`), `insert` (`ins`).
 - **Navigation**: `up`, `down`, `left`, `right`, `pageup` (`pgup`), `pagedown` (`pgdn`), `home`, `end`.
 - **Function keys**: `f1` through `f12`.
-- **Named equivalents**: `minus`, `plus`/`equals`, `period`/`dot`, `comma`, `grave`/`backtick`/`backquote`.
+- **Named equivalents**: `minus`, `plus`/`equals`, `period`/`dot`, `comma`, `grave`/`backtick`/`backquote`, `backslash`, `question`/`questionmark`, `leftparen`/`lparen`/`openparen`, `rightparen`/`rparen`/`closeparen`.
 
 To press `+` in video-compare (which maps `+`/`=`/`KP_PLUS` to the same "shift right by 1 frame" action), use any of `+`, `=`, `plus`, `equals`. Don't wrap the key in quotes.
 

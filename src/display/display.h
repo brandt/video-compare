@@ -160,7 +160,7 @@ class Display {
   bool print_mouse_position_and_color_{false};
   bool print_image_similarity_metrics_{false};
   bool mouse_is_inside_window_{false};
-  bool show_fps_{true};
+  bool show_fps_{false};
   float current_video_fps_{0.0f};
   float current_ui_fps_{0.0f};
 
@@ -267,18 +267,19 @@ class Display {
 
   // Key-down cascade: first-match-wins. Each returns true when it consumed the key.
   bool handle_right_video_index_shortcut(SDL_Keycode keycode, bool is_ctrl_down, bool is_shift_down);
-  bool handle_crop_save_keys(SDL_Keycode keycode, bool is_shift_down);
+  bool handle_crop_save_keys(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down, bool is_ctrl_down);
   bool handle_scope_window_keys(SDL_Keycode keycode, bool is_shift_down);
-  bool handle_window_size_keys(SDL_Keycode keycode, bool is_shift_down, bool is_ctrl_down, bool is_alt_down);
-  bool handle_view_mode_keys(SDL_Keycode keycode, bool is_shift_down, bool is_ctrl_down);
-  bool handle_zoom_pan_keys(SDL_Keycode keycode, bool is_shift_down);
-  bool handle_playback_keys(SDL_Keycode keycode, float relative_seek_scale, float playback_speed_scale, bool is_shift_down, bool is_ctrl_down, bool is_alt_down);
+  bool handle_window_size_keys(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down, bool is_ctrl_down);
+  bool handle_view_mode_keys(SDL_Keycode keycode, bool is_shift_down, bool is_ctrl_down, bool is_alt_down);
+  bool handle_zoom_pan_keys(SDL_Keycode keycode, bool is_shift_down, bool is_alt_down);
+  bool handle_playback_keys(SDL_Keycode keycode, float relative_seek_scale, float playback_speed_scale, bool is_shift_down, bool is_alt_down);
   bool handle_diff_keys(SDL_Keycode keycode, bool is_shift_down);
-  bool handle_misc_keys(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down);
+  bool handle_misc_keys(SDL_Keycode keycode, SDL_Keymod keymod, bool is_shift_down, bool is_ctrl_down);
 
   // Input helpers.
   void update_cursor_mode();
   bool is_clipboard_mod_pressed(SDL_Keymod keymod, bool is_ctrl_down) const;
+  bool is_primary_mod_pressed(SDL_Keymod keymod, bool is_ctrl_down) const;
 
   SDL sdl_;
   TTF_Font* small_font_{nullptr};

@@ -577,86 +577,99 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
       }
     }
 
-    // Help and metadata overlays — full-screen panels with multi-line text
-    // honoring the scroll offset. Pushed after all other HUD so they layer
-    // on top.  Because libplacebo draws primitive-overlays before text-
-    // overlays in a single render pass, the full-screen dim rect would end
-    // up UNDER the HUD text (wrong order). Simplest fix: suppress HUD text
-    // while a full-screen panel is visible.  The panel's own background
-    // fully dims the area where HUD would have been, so the result is
-    // visually equivalent to the SDL path.
-    if (overlay_.show_help() || overlay_.show_metadata()) {
-      // Clear previously-accumulated text overlays (HUD labels, positions,
-      // FPS, etc.) so they don't poke through the panel.
+    // Metadata is a full-screen panel layered above HUD and below the dock.
+    // Because libplacebo draws primitive-overlays before text-overlays in a
+    // single render pass, the full-screen dim rect would end up UNDER the
+    // HUD text (wrong order). Simplest fix: suppress HUD text while the
+    // panel is visible. The panel's own background fully dims the area
+    // where HUD would have been, so the result is visually equivalent to
+    // the SDL path.
+    if (overlay_.show_metadata() && !overlay_.show_help()) {
       text_ops.clear();
       for (SDL_Surface* s : text_surfaces) SDL_DestroySurface(s);
       text_surfaces.clear();
       overlays.clear();
 
-      // Full-screen semi-transparent black background.
       push_rect(0, 0, static_cast<float>(drawable_width_), static_cast<float>(drawable_height_),
                 0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 3 / 2));
 
-      if (overlay_.show_help()) {
-        int y = overlay_.help_scroll_offset();
-        for (SDL_Surface* s : overlay_.help_surfaces()) {
-          if (!s) continue;
-          if (y + s->h > 0 && y < drawable_height_) {
-            GpuRenderer::TextOverlayOp t{};
-            t.rgba_data = s->pixels;
-            t.width = s->w;
-            t.height = s->h;
-            t.stride = s->pitch;
-            t.dst_x = static_cast<float>(HELP_TEXT_HORIZONTAL_MARGIN);
-            t.dst_y = static_cast<float>(y);
-            t.alpha = 1.0f;
-            text_ops.push_back(t);
-          }
-          y += s->h + HELP_TEXT_LINE_SPACING;
-        }
-      } else if (overlay_.show_metadata()) {
-        metadata_panel_.ensure_current(swap_left_right_,
-                                       displayed_left_side_.is_left(),
-                                       displayed_right_side_.is_right(),
-                                       small_font_, big_font_, renderer_,
-                                       gpu_renderer_active_, drawable_width_);
+      metadata_panel_.ensure_current(swap_left_right_,
+                                     displayed_left_side_.is_left(),
+                                     displayed_right_side_.is_right(),
+                                     small_font_, big_font_, renderer_,
+                                     gpu_renderer_active_, drawable_width_);
 
-        const int table_width = drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2;
-        const int table_x = HELP_TEXT_HORIZONTAL_MARGIN;
+      const int table_width = drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2;
+      const int table_x = HELP_TEXT_HORIZONTAL_MARGIN;
 
-        int y;
-        const int meta_total_h = metadata_panel_.total_height();
-        if (mode_ == Mode::VStack && meta_total_h < drawable_height_ / 2) {
-          y = (drawable_height_ / 2 - meta_total_h) / 2;
-        } else if (mode_ != Mode::VStack && meta_total_h < drawable_height_) {
-          y = (drawable_height_ - meta_total_h) / 2;
-        } else {
-          y = metadata_panel_.scroll_offset() + 10;
-        }
+      int y;
+      const int meta_total_h = metadata_panel_.total_height();
+      if (mode_ == Mode::VStack && meta_total_h < drawable_height_ / 2) {
+        y = (drawable_height_ / 2 - meta_total_h) / 2;
+      } else if (mode_ != Mode::VStack && meta_total_h < drawable_height_) {
+        y = (drawable_height_ - meta_total_h) / 2;
+      } else {
+        y = metadata_panel_.scroll_offset() + 10;
+      }
 
-        for (SDL_Surface* s : metadata_panel_.surfaces()) {
-          if (!s) continue;
-          const int x_offset = (table_width - s->w) / 2;
-          if (y + s->h > 0 && y < drawable_height_) {
-            GpuRenderer::TextOverlayOp t{};
-            t.rgba_data = s->pixels;
-            t.width = s->w;
-            t.height = s->h;
-            t.stride = s->pitch;
-            t.dst_x = static_cast<float>(table_x + x_offset);
-            t.dst_y = static_cast<float>(y);
-            t.alpha = 1.0f;
-            text_ops.push_back(t);
-          }
-          y += s->h + HELP_TEXT_LINE_SPACING;
+      for (SDL_Surface* s : metadata_panel_.surfaces()) {
+        if (!s) continue;
+        const int x_offset = (table_width - s->w) / 2;
+        if (y + s->h > 0 && y < drawable_height_) {
+          GpuRenderer::TextOverlayOp t{};
+          t.rgba_data = s->pixels;
+          t.width = s->w;
+          t.height = s->h;
+          t.stride = s->pitch;
+          t.dst_x = static_cast<float>(table_x + x_offset);
+          t.dst_y = static_cast<float>(y);
+          t.alpha = 1.0f;
+          text_ops.push_back(t);
         }
+        y += s->h + HELP_TEXT_LINE_SPACING;
       }
     }
 
-    // Append dock overlay/text ops just before submission so the dock sits on
-    // top of the HUD/help/metadata layers. Pixel pointers reference bitmaps
-    // owned by the Dock; they outlive the render call.
+    // When help is shown, clear the HUD overlays/text already accumulated
+    // *before* the dock renders. libplacebo draws primitives before text in
+    // a single render pass, so HUD text would otherwise poke through the
+    // help's semi-transparent dim. The dock is appended afterwards, then
+    // the help layer is pushed on top of everything.
+    if (overlay_.show_help()) {
+      text_ops.clear();
+      for (SDL_Surface* s : text_surfaces) SDL_DestroySurface(s);
+      text_surfaces.clear();
+      overlays.clear();
+    }
+
+    // Dock sits above HUD/metadata but below the help overlay.
     render_dock_gpu(overlays, text_ops);
+
+    // Help is the topmost overlay: rendered after the dock so the controls
+    // table is fully readable while the dock is open. The semi-transparent
+    // black background dims everything underneath (the dock, plus the
+    // cleared HUD area above).
+    if (overlay_.show_help()) {
+      push_rect(0, 0, static_cast<float>(drawable_width_), static_cast<float>(drawable_height_),
+                0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 3 / 2));
+
+      int y = overlay_.help_scroll_offset();
+      for (SDL_Surface* s : overlay_.help_surfaces()) {
+        if (!s) continue;
+        if (y + s->h > 0 && y < drawable_height_) {
+          GpuRenderer::TextOverlayOp t{};
+          t.rgba_data = s->pixels;
+          t.width = s->w;
+          t.height = s->h;
+          t.stride = s->pitch;
+          t.dst_x = static_cast<float>(HELP_TEXT_HORIZONTAL_MARGIN);
+          t.dst_y = static_cast<float>(y);
+          t.alpha = 1.0f;
+          text_ops.push_back(t);
+        }
+        y += s->h + HELP_TEXT_LINE_SPACING;
+      }
+    }
 
     if (gpu_renderer_.render(ops.data(), static_cast<int>(ops.size()),
                               overlays.data(), static_cast<int>(overlays.size()),

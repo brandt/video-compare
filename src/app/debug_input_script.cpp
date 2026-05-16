@@ -145,7 +145,7 @@ void run_script(std::vector<std::string> lines) {
       }
       log(cmd + " " + tokens[1]);
       push_key_event(cmd == "keydown", key, mod.as_keymod());
-    } else if (cmd == "modshift" || cmd == "modctrl" || cmd == "modalt") {
+    } else if (cmd == "modshift" || cmd == "modctrl" || cmd == "modalt" || cmd == "modgui") {
       if (tokens.size() < 2) {
         std::cerr << "[input-script] line " << (lineno + 1) << ": " << cmd << " requires on|off" << std::endl;
         continue;
@@ -157,7 +157,8 @@ void run_script(std::vector<std::string> lines) {
       }
       if (cmd == "modshift")      mod.shift = value;
       else if (cmd == "modctrl")  mod.ctrl  = value;
-      else                        mod.alt   = value;
+      else if (cmd == "modalt")   mod.alt   = value;
+      else                        mod.gui   = value;
       log(cmd + " " + (value ? "on" : "off"));
     } else if (cmd == "quit") {
       log("quit");

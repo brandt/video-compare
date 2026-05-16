@@ -69,6 +69,12 @@ SDL_Keycode name_to_keycode(const std::string& raw) {
         return SDLK_GRAVE;
       case ' ':
         return SDLK_SPACE;
+      case '?':
+        return SDLK_QUESTION;
+      case '(':
+        return SDLK_LEFTPAREN;
+      case ')':
+        return SDLK_RIGHTPAREN;
       default:
         break;
     }
@@ -135,6 +141,18 @@ SDL_Keycode name_to_keycode(const std::string& raw) {
   }
   if (name == "grave" || name == "backtick" || name == "backquote") {
     return SDLK_GRAVE;
+  }
+  if (name == "backslash") {
+    return SDLK_BACKSLASH;
+  }
+  if (name == "question" || name == "questionmark") {
+    return SDLK_QUESTION;
+  }
+  if (name == "leftparen" || name == "lparen" || name == "openparen") {
+    return SDLK_LEFTPAREN;
+  }
+  if (name == "rightparen" || name == "rparen" || name == "closeparen") {
+    return SDLK_RIGHTPAREN;
   }
 
   // F1..F12.

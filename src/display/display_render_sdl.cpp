@@ -89,11 +89,13 @@ void Display::render_frame_sdl(const RenderContext& ctx, const std::string& curr
     metadata_panel_.render_sdl(renderer_, drawable_width_, drawable_height_, mode_);
   }
 
+  render_dock_sdl();
+
+  // Help renders on top of the dock so the table is fully visible while the
+  // dock is open. All other overlays (metadata, quality metrics) sit below it.
   if (overlay_.show_help()) {
     overlay_.render_help_sdl(renderer_);
   }
-
-  render_dock_sdl();
 
   sdl_finalize_deferred(left_frame, right_frame);
 

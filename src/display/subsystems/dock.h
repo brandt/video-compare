@@ -161,7 +161,7 @@ class Dock {
   // Build the lazy procedural bitmaps (L/R badges, ✓/◯/✕ glyphs) once.
   void build_static_bitmaps();
 
-  bool visible_{false};
+  bool visible_{true};
   std::vector<DockEntry> entries_;
 
   // Layout outputs, in drawable pixels. wells_[i] is the per-entry box

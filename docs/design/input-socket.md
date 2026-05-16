@@ -78,9 +78,10 @@ command. See **Commands** below.
 
 - `action`: `"press"` (down + up), `"down"`, or `"up"`.
 - `key`: any name accepted by the script harness — single chars (`a`–`z`,
-  `0`–`9`, `-`, `=`, `,`, `.`, `/`, `\`, `;`, `[`, `]`, `` ` ``, space), named
-  keys (`space`, `escape`, `return`, `tab`, `backspace`, `up`, `down`, `left`,
-  `right`, `pageup`, `pagedown`, `home`, `end`, `delete`, `insert`, `grave`),
+  `0`–`9`, `-`, `=`, `,`, `.`, `/`, `\`, `;`, `[`, `]`, `` ` ``, space,
+  `?`, `(`, `)`), named keys (`space`, `escape`, `return`, `tab`, `backspace`,
+  `up`, `down`, `left`, `right`, `pageup`, `pagedown`, `home`, `end`, `delete`,
+  `insert`, `grave`, `backslash`, `question`, `leftparen`, `rightparen`),
   and `f1`..`f12`. See [app/debug_input_common.cpp](../../app/debug_input_common.cpp).
 - `mods` (optional): array of any subset of `"shift"`, `"ctrl"`, `"alt"`,
   `"gui"` (a.k.a. `cmd`/`super`/`meta`). Also published to SDL's global mod

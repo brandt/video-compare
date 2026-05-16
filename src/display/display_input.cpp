@@ -84,6 +84,18 @@ bool Display::is_clipboard_mod_pressed(SDL_Keymod keymod, bool is_ctrl_down) con
 #endif
 }
 
+// Whether the platform-primary modifier is held (Cmd on macOS, Ctrl elsewhere).
+// Used for shortcuts that should follow the OS convention (fullscreen, screenshot).
+bool Display::is_primary_mod_pressed(SDL_Keymod keymod, bool is_ctrl_down) const {
+#ifdef __APPLE__
+  (void)is_ctrl_down;
+  return (keymod & SDL_KMOD_GUI) != 0;
+#else
+  (void)keymod;
+  return is_ctrl_down;
+#endif
+}
+
 // Window events: close, enter/leave, HDR state change, and resizes.
 void Display::handle_window_event(const SDL_Event& event) {
   switch (event.type) {
@@ -120,7 +132,7 @@ void Display::handle_wheel_event(const SDL_Event& event) {
   if (delta_zoom > 0) {
     delta_zoom /= 2.0F;
   }
-  if (SDL_GetModState() & (SDL_KMOD_SHIFT | SDL_KMOD_CTRL)) {
+  if (SDL_GetModState() & SDL_KMOD_SHIFT) {
     delta_zoom /= ZOOM_SLOWDOWN_RATIO;
   }
 
@@ -244,26 +256,27 @@ void Display::handle_key_down(const SDL_Event& event) {
   const bool is_ctrl_down = (keymod & SDL_KMOD_CTRL) != 0;
   const bool is_alt_down = (keymod & SDL_KMOD_ALT) != 0;
 
-  const float relative_seek_scale = (is_shift_down || is_ctrl_down) ? 1.0F / RELATIVE_SEEK_SLOWDOWN_RATIO : 1.0F;
-  const float playback_speed_scale = (is_shift_down || is_ctrl_down) ? 1.0F / PLAYBACK_SPEED_SLOWDOWN_RATIO : 1.0F;
+  // Slowdown is keyed on Shift only; Ctrl is reserved for OS-style shortcuts
+  // (Ctrl+S, Ctrl+W, etc.) and the platform-primary mod helper.
+  const float relative_seek_scale = is_shift_down ? 1.0F / RELATIVE_SEEK_SLOWDOWN_RATIO : 1.0F;
+  const float playback_speed_scale = is_shift_down ? 1.0F / PLAYBACK_SPEED_SLOWDOWN_RATIO : 1.0F;
 
   if (handle_right_video_index_shortcut(keycode, is_ctrl_down, is_shift_down)) return;
-  if (handle_crop_save_keys(keycode, is_shift_down)) return;
+  if (handle_crop_save_keys(keycode, keymod, is_shift_down, is_ctrl_down)) return;
   if (handle_scope_window_keys(keycode, is_shift_down)) return;
-  if (handle_window_size_keys(keycode, is_shift_down, is_ctrl_down, is_alt_down)) return;
-  if (handle_view_mode_keys(keycode, is_shift_down, is_ctrl_down)) return;
-  if (handle_zoom_pan_keys(keycode, is_shift_down)) return;
-  if (handle_playback_keys(keycode, relative_seek_scale, playback_speed_scale, is_shift_down, is_ctrl_down, is_alt_down)) return;
+  if (handle_window_size_keys(keycode, keymod, is_shift_down, is_ctrl_down)) return;
+  if (handle_view_mode_keys(keycode, is_shift_down, is_ctrl_down, is_alt_down)) return;
+  if (handle_zoom_pan_keys(keycode, is_shift_down, is_alt_down)) return;
+  if (handle_playback_keys(keycode, relative_seek_scale, playback_speed_scale, is_shift_down, is_alt_down)) return;
   if (handle_diff_keys(keycode, is_shift_down)) return;
-  handle_misc_keys(keycode, keymod, is_shift_down);
+  handle_misc_keys(keycode, keymod, is_shift_down, is_ctrl_down);
 }
 
-// Key-up: release the transient zoom-left / zoom-right / show-fps flags.
+// Key-up: release the transient zoom-left / zoom-right magnifier flags.
 void Display::handle_key_up(const SDL_Event& event) {
   switch (event.key.key) {
     case SDLK_Z: view_transform_.set_zoom_left(false); break;
     case SDLK_C: view_transform_.set_zoom_right(false); break;
-    case SDLK_X: show_fps_ = false; break;
     default: break;
   }
 }
@@ -289,14 +302,22 @@ bool Display::handle_right_video_index_shortcut(const SDL_Keycode keycode, const
   return true;
 }
 
-// F, Shift+F (save selected area), Shift+R/L/B (crop per side), Shift+K (auto-crop black borders), BACKSPACE (clear crop).
-bool Display::handle_crop_save_keys(const SDL_Keycode keycode, const bool is_shift_down) {
+// Ctrl/Cmd+S (save frames), Shift+F (save selected area), Shift+R/L/B (crop per side),
+// K (auto-crop black borders), BACKSPACE (clear crop).
+bool Display::handle_crop_save_keys(const SDL_Keycode keycode, const SDL_Keymod keymod, const bool is_shift_down, const bool is_ctrl_down) {
   auto toggle_crop_mode_for_side = [&](const CropTargetSide side) {
     selection_.toggle_crop_for_side(side);
     update_cursor_mode();
   };
 
   switch (keycode) {
+    case SDLK_S:
+      if (is_primary_mod_pressed(keymod, is_ctrl_down) && !is_shift_down) {
+        image_saver_.request_save_frames();
+        return true;
+      }
+      // Plain S / Shift+S belong to handle_view_mode_keys (slot swap / aspect cycle).
+      return false;
     case SDLK_F:
       if (is_shift_down) {
         if (!selection_.save_selected_area_requested()) {
@@ -306,12 +327,11 @@ bool Display::handle_crop_save_keys(const SDL_Keycode keycode, const bool is_shi
           selection_.cancel_save_selected_area();
         }
         update_cursor_mode();
-      } else {
-        image_saver_.request_save_frames();
+        return true;
       }
-      return true;
+      return false;
     case SDLK_K:
-      if (is_shift_down) {
+      if (!is_shift_down) {
         selection_.reset_crop_mode();
         selection_.request_auto_crop_black_borders();
         return true;
@@ -358,8 +378,9 @@ bool Display::handle_scope_window_keys(const SDL_Keycode keycode, const bool is_
   }
 }
 
-// Ctrl+W / Shift+W / Ctrl+Shift+W window-size save/restore, Alt+Enter fullscreen toggle.
-bool Display::handle_window_size_keys(const SDL_Keycode keycode, const bool is_shift_down, const bool is_ctrl_down, const bool is_alt_down) {
+// Ctrl+W / Shift+W / Ctrl+Shift+W window-size save/restore, Cmd+Enter (macOS) /
+// Ctrl+Enter (other) fullscreen toggle.
+bool Display::handle_window_size_keys(const SDL_Keycode keycode, const SDL_Keymod keymod, const bool is_shift_down, const bool is_ctrl_down) {
   auto restore_window_size = [&](const std::array<int, 2>& size) {
     const int target_w = std::max(MIN_WINDOW_WIDTH, size[0]);
     const int target_h = std::max(MIN_WINDOW_HEIGHT, size[1]);
@@ -388,12 +409,16 @@ bool Display::handle_window_size_keys(const SDL_Keycode keycode, const bool is_s
       return true;  // swallow bare W
     case SDLK_RETURN:
     case SDLK_KP_ENTER:
-      if (is_alt_down) {
+      if (is_primary_mod_pressed(keymod, is_ctrl_down)) {
         const bool sdl_fullscreen_now = (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0;
         if (sdl_fullscreen_now) {
           set_fullscreen(false);
         } else if (detect_fullscreen_like_state()) {
-          set_pending_message("Alt+Enter cannot toggle native fullscreen; use window fullscreen button");
+#ifdef __APPLE__
+          set_pending_message("Cmd+Enter cannot toggle native fullscreen; use window fullscreen button");
+#else
+          set_pending_message("Ctrl+Enter cannot toggle native fullscreen; use window fullscreen button");
+#endif
         } else {
           set_fullscreen(true);
         }
@@ -405,19 +430,22 @@ bool Display::handle_window_size_keys(const SDL_Keycode keycode, const bool is_s
   }
 }
 
-// 1/2/3 show toggles, 0 subtraction, M/Shift+M mode cycle, S/Shift+S swap/aspect, T, I.
-bool Display::handle_view_mode_keys(const SDL_Keycode keycode, const bool is_shift_down, const bool is_ctrl_down) {
+// 1/2 hide-show left/right, H HUD, O subtraction, Shift+M mode cycle, S/Shift+S swap/aspect,
+// I metadata overlay, Alt+T video texture filter, Alt+I input-alignment filter.
+bool Display::handle_view_mode_keys(const SDL_Keycode keycode, const bool is_shift_down, const bool is_ctrl_down, const bool is_alt_down) {
+  // Alt+digit zoom presets fall through to handle_zoom_pan_keys.
+  if (is_alt_down) return false;
+
   switch (keycode) {
     case SDLK_1: case SDLK_KP_1:
+      if (is_shift_down) return false;  // Shift+1 handled by handle_scope_window_keys earlier.
       show_left_ = !show_left_;
       return true;
     case SDLK_2: case SDLK_KP_2:
+      if (is_shift_down) return false;
       show_right_ = !show_right_;
       return true;
-    case SDLK_3: case SDLK_KP_3:
-      show_hud_ = !show_hud_;
-      return true;
-    case SDLK_0: case SDLK_KP_0:
+    case SDLK_O:
       diff_processor_.toggle_subtraction_mode();
       return true;
     case SDLK_M:
@@ -429,10 +457,10 @@ bool Display::handle_view_mode_keys(const SDL_Keycode keycode, const bool is_shi
         resize_window_for_mode_switch();
         const std::string mode_name = mode_to_string(mode_);
         notify_user(string_sprintf("Display mode set to '%s'", to_upper_case(mode_name).c_str()));
-      } else {
-        print_image_similarity_metrics_ = true;
+        return true;
       }
-      return true;
+      // Plain M no longer prints metrics; that moved to Shift+Q (handle_misc_keys).
+      return false;
     case SDLK_S:
       if (is_shift_down) {
         constexpr int kModeCount = 5;
@@ -457,29 +485,44 @@ bool Display::handle_view_mode_keys(const SDL_Keycode keycode, const bool is_shi
       }
       return true;
     case SDLK_T:
-      bilinear_texture_filtering_ = !bilinear_texture_filtering_;
-      notify_user(string_sprintf("Video texture filter set to '%s'", bilinear_texture_filtering_ ? "BILINEAR" : "NEAREST NEIGHBOR"));
-      return true;
+      if (is_alt_down) {
+        bilinear_texture_filtering_ = !bilinear_texture_filtering_;
+        notify_user(string_sprintf("Video texture filter set to '%s'", bilinear_texture_filtering_ ? "BILINEAR" : "NEAREST NEIGHBOR"));
+        return true;
+      }
+      return false;
     case SDLK_I:
-      fast_input_alignment_ = !fast_input_alignment_;
-      notify_user(string_sprintf("Input alignment resizing filter set to '%s' (takes effect for the next decoded frame)", fast_input_alignment_ ? "BILINEAR (fast)" : "BICUBIC (high-quality)"));
+      if (is_alt_down) {
+        fast_input_alignment_ = !fast_input_alignment_;
+        notify_user(string_sprintf("Input alignment resizing filter set to '%s' (takes effect for the next decoded frame)", fast_input_alignment_ ? "BILINEAR (fast)" : "BICUBIC (high-quality)"));
+        return true;
+      }
+      // Plain I toggles the metadata overlay (formerly V).
+      overlay_.toggle_metadata();
       return true;
     default:
       return false;
   }
 }
 
-// 4-9 preset zooms, E mouse-centered pan, R reset pan, Z/C transient zoom magnifiers.
-bool Display::handle_zoom_pan_keys(const SDL_Keycode keycode, const bool is_shift_down) {
+// Alt+1..6 preset zooms (1:1, 100%, 200%, 400%, 800%, 50%), E mouse-centered pan,
+// R reset pan/zoom, Shift+Z transient zoom-left magnifier.
+bool Display::handle_zoom_pan_keys(const SDL_Keycode keycode, const bool is_shift_down, const bool is_alt_down) {
+  if (is_alt_down) {
+    switch (keycode) {
+      case SDLK_1: case SDLK_KP_1:
+        view_transform_.update_zoom_factor_and_move_offset(std::min(video_to_window_width_factor_ / drawable_to_window_width_factor_, video_to_window_height_factor_ / drawable_to_window_height_factor_));
+        return true;
+      case SDLK_2: case SDLK_KP_2: view_transform_.update_zoom_factor_and_move_offset(1.0F); return true;
+      case SDLK_3: case SDLK_KP_3: view_transform_.update_zoom_factor_and_move_offset(2.0F); return true;
+      case SDLK_4: case SDLK_KP_4: view_transform_.update_zoom_factor_and_move_offset(4.0F); return true;
+      case SDLK_5: case SDLK_KP_5: view_transform_.update_zoom_factor_and_move_offset(8.0F); return true;
+      case SDLK_6: case SDLK_KP_6: view_transform_.update_zoom_factor_and_move_offset(0.5F); return true;
+      default: break;
+    }
+  }
+
   switch (keycode) {
-    case SDLK_4: case SDLK_KP_4:
-      view_transform_.update_zoom_factor_and_move_offset(std::min(video_to_window_width_factor_ / drawable_to_window_width_factor_, video_to_window_height_factor_ / drawable_to_window_height_factor_));
-      return true;
-    case SDLK_5: case SDLK_KP_5: view_transform_.update_zoom_factor_and_move_offset(0.5F); return true;
-    case SDLK_6: case SDLK_KP_6: view_transform_.update_zoom_factor_and_move_offset(1.0F); return true;
-    case SDLK_7: case SDLK_KP_7: view_transform_.update_zoom_factor_and_move_offset(2.0F); return true;
-    case SDLK_8: case SDLK_KP_8: view_transform_.update_zoom_factor_and_move_offset(4.0F); return true;
-    case SDLK_9: case SDLK_KP_9: view_transform_.update_zoom_factor_and_move_offset(8.0F); return true;
     case SDLK_E: {
       SDL_GetMouseState(&mouse_x_, &mouse_y_);
       const auto zoom_rect = view_transform_.compute_zoom_rect();
@@ -509,17 +552,46 @@ bool Display::handle_zoom_pan_keys(const SDL_Keycode keycode, const bool is_shif
   }
 }
 
-// SPACE play/pause, COMMA/PERIOD loop modes, J/L speed, A/D frame nav, arrows/PAGE seek, PLUS/MINUS shift right, GRAVE auto-align.
-bool Display::handle_playback_keys(const SDL_Keycode keycode, const float relative_seek_scale, const float playback_speed_scale, const bool is_shift_down, const bool is_ctrl_down, const bool is_alt_down) {
+// SPACE play/pause, `(`/`)` loop modes, `,`/`.` frame-nav aliases, J/L speed,
+// A/D frame nav, arrows/PAGE seek, PLUS/MINUS shift right (Shift=×10, Alt=×100),
+// BACKSLASH symmetric auto-align, `[`/`]` directional auto-align.
+bool Display::handle_playback_keys(const SDL_Keycode keycode, const float relative_seek_scale, const float playback_speed_scale, const bool is_shift_down, const bool is_alt_down) {
   switch (keycode) {
     case SDLK_SPACE:
       playback_.toggle_play();
       return true;
-    case SDLK_COMMA: case SDLK_KP_COMMA:
+    case SDLK_9: case SDLK_KP_9:
+      // Shift+9 = `(` toggles the bidirectional in-buffer loop.
+      // The scope-window helper does not claim Shift+9; plain 9 is unbound.
+      if (is_shift_down) {
+        set_buffer_play_loop_mode(playback_.loop_mode() != Loop::PingPong ? Loop::PingPong : Loop::Off);
+        return true;
+      }
+      return false;
+    case SDLK_LEFTPAREN:
+      // Synthetic key delivery (debug harness) may produce the shifted
+      // keycode directly without an SDL_KMOD_SHIFT modifier. Accept it.
       set_buffer_play_loop_mode(playback_.loop_mode() != Loop::PingPong ? Loop::PingPong : Loop::Off);
       return true;
-    case SDLK_PERIOD:
+    case SDLK_0: case SDLK_KP_0:
+      // Shift+0 = `)` toggles the forward-only in-buffer loop.
+      if (is_shift_down) {
+        set_buffer_play_loop_mode(playback_.loop_mode() != Loop::ForwardOnly ? Loop::ForwardOnly : Loop::Off);
+        return true;
+      }
+      return false;
+    case SDLK_RIGHTPAREN:
       set_buffer_play_loop_mode(playback_.loop_mode() != Loop::ForwardOnly ? Loop::ForwardOnly : Loop::Off);
+      return true;
+    case SDLK_COMMA: case SDLK_KP_COMMA:
+      // Plain `,` aliases `A` (previous frame in buffer). Shift+`,` = `<` is unbound.
+      if (is_shift_down) return false;
+      playback_.adjust_frame_buffer_offset_delta(1);
+      return true;
+    case SDLK_PERIOD:
+      // Plain `.` aliases `D` (next frame in buffer). Shift+`.` = `>` is unbound.
+      if (is_shift_down) return false;
+      playback_.adjust_frame_buffer_offset_delta(-1);
       return true;
     case SDLK_A:
       if (is_shift_down) playback_.adjust_frame_navigation_delta(-1);
@@ -551,12 +623,12 @@ bool Display::handle_playback_keys(const SDL_Keycode keycode, const float relati
       // adjustment. The pipeline stays asymmetric; only the input gets
       // reinterpreted. See docs/planning/Swap-seek.md, Phase 1.
       const int direction = (keycode == SDLK_MINUS || keycode == SDLK_KP_MINUS) ? -1 : 1;
-      const int magnitude = is_alt_down ? 100 : (is_ctrl_down ? 10 : 1);
+      const int magnitude = is_alt_down ? 100 : (is_shift_down ? 10 : 1);
       const int swap_sign = swap_left_right_ ? -1 : 1;
       playback_.adjust_shift_right_frames(direction * magnitude * swap_sign);
       return true;
     }
-    case SDLK_GRAVE:
+    case SDLK_BACKSLASH:
       // Symmetric window around left's current position (typically served
       // entirely from the ring; no decode).
       playback_.request_auto_align(AutoAlignMode::Symmetric);
@@ -607,10 +679,10 @@ bool Display::handle_diff_keys(const SDL_Keycode keycode, const bool is_shift_do
   }
 }
 
-// H help, ESCAPE quit, P pixel print, Q quality overlay, X fps, TAB next right video, clipboard C/V, V metadata toggle.
-bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymod, const bool is_shift_down) {
-  const bool is_ctrl_down = (keymod & SDL_KMOD_CTRL) != 0;
-
+// ? help, H HUD toggle, ESCAPE quit, P pixel print, Q quality / Shift+Q metrics print,
+// G fps toggle / Shift+G state print, O subtraction toggle, TAB cycle right slot,
+// Z dock toggle, Shift+C zoom-right magnifier, Cmd/Ctrl+C copy / Cmd/Ctrl+V paste.
+bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymod, const bool is_shift_down, const bool is_ctrl_down) {
   switch (keycode) {
     case SDLK_Z:
       // Plain Z toggles the dock. Shift+Z is the zoom-left magnifier and is
@@ -623,9 +695,26 @@ bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymo
         return true;
       }
       return false;
-    case SDLK_H:
+    case SDLK_SLASH:
+      // `?` (Shift+/) toggles the on-screen help. SDL3 delivers the unshifted
+      // base keycode in event.key.key by default, so we match SDLK_SLASH+Shift.
+      if (is_shift_down) {
+        overlay_.toggle_help();
+        return true;
+      }
+      return false;
+    case SDLK_QUESTION:
+      // Synthetic key delivery may produce the shifted keycode directly
+      // without an SDL_KMOD_SHIFT modifier. Accept it.
       overlay_.toggle_help();
       return true;
+    case SDLK_H:
+      // H now toggles the HUD (formerly bound to plain 3). Help moved to `?`.
+      if (!is_shift_down) {
+        show_hud_ = !show_hud_;
+        return true;
+      }
+      return false;
     case SDLK_ESCAPE:
       quit_ = true;
       return true;
@@ -633,13 +722,19 @@ bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymo
       print_mouse_position_and_color_ = mouse_is_inside_window_;
       return true;
     case SDLK_Q:
-      show_quality_metrics_ = !show_quality_metrics_;
+      if (is_shift_down) {
+        // Print image similarity metrics to console (formerly plain M).
+        print_image_similarity_metrics_ = true;
+      } else {
+        show_quality_metrics_ = !show_quality_metrics_;
+      }
       return true;
-    case SDLK_X:
+    case SDLK_G:
       if (is_shift_down) {
         notify_user(string_sprintf("Display state: window=%dx%d aspect=%s", window_width_, window_height_, aspect_view_mode_to_string(aspect_view_mode_).c_str()));
       } else {
-        show_fps_ = true;
+        // FPS overlay is now a toggle rather than a transient (formerly X held).
+        show_fps_ = !show_fps_;
       }
       return true;
     case SDLK_TAB: {
@@ -674,6 +769,8 @@ bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymo
       }
       return false;
     case SDLK_V:
+      // Cmd/Ctrl+V pastes a clipboard timestamp and seeks. Plain V is unbound
+      // (the metadata overlay moved to plain I in handle_view_mode_keys).
       if (is_clipboard_mod_pressed(keymod, is_ctrl_down)) {
         char* clip_text = SDL_GetClipboardText();
         if (!clip_text) {
@@ -693,10 +790,9 @@ bool Display::handle_misc_keys(const SDL_Keycode keycode, const SDL_Keymod keymo
         } else {
           notify_user("No valid timestamp found in clipboard.");
         }
-      } else {
-        overlay_.toggle_metadata();
+        return true;
       }
-      return true;
+      return false;
     default:
       return false;
   }
