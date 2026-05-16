@@ -485,7 +485,7 @@ void Display::handle_window_resize(const bool reset_forced_size_guard, const boo
 
   rebuild_fonts();
   rebuild_side_ui_textures();
-  overlay_.rebuild_help(small_font_, big_font_, renderer_, gpu_renderer_active_, drawable_width_);
+  overlay_.rebuild_help(small_font_, big_font_, renderer_, gpu_renderer_active_, drawable_width_, drawable_height_);
   metadata_panel_.mark_dirty();
 
   // Clamp overlay scroll positions to the new size and refresh ROI-dependent title.

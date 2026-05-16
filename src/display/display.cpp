@@ -307,7 +307,7 @@ Display::Display(const int display_number,
 
   refresh_display_side_mapping();
 
-  overlay_.rebuild_help(small_font_, big_font_, renderer_, gpu_renderer_active_, drawable_width_);
+  overlay_.rebuild_help(small_font_, big_font_, renderer_, gpu_renderer_active_, drawable_width_, drawable_height_);
 
   if (start_in_fullscreen_) {
     set_fullscreen(true);

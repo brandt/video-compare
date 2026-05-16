@@ -180,11 +180,7 @@ void Display::handle_mouse_motion_event(const SDL_Event& event) {
     metadata_panel_.set_scroll_offset(y);
   }
 
-  if (overlay_.show_help()) {
-    int y = overlay_.help_scroll_offset();
-    apply_scroll(y, overlay_.help_total_height(), overlay_.help_item_count(gpu_renderer_active_));
-    overlay_.set_help_scroll_offset(y);
-  }
+  // The help overlay is laid out to fit on a single page; no scrolling.
 }
 
 // Mouse-button events: start/complete selection, seek on click, update cursor mode.
@@ -430,19 +426,32 @@ bool Display::handle_window_size_keys(const SDL_Keycode keycode, const SDL_Keymo
   }
 }
 
-// 1/2 hide-show left/right, H HUD, O subtraction, Shift+M mode cycle, S/Shift+S swap/aspect,
+// `<`/`>` hide-show left/right, H HUD, O subtraction, Shift+M mode cycle, S/Shift+S swap/aspect,
 // I metadata overlay, Alt+T video texture filter, Alt+I input-alignment filter.
 bool Display::handle_view_mode_keys(const SDL_Keycode keycode, const bool is_shift_down, const bool is_ctrl_down, const bool is_alt_down) {
   // Alt+digit zoom presets fall through to handle_zoom_pan_keys.
   if (is_alt_down) return false;
 
   switch (keycode) {
-    case SDLK_1: case SDLK_KP_1:
-      if (is_shift_down) return false;  // Shift+1 handled by handle_scope_window_keys earlier.
+    case SDLK_COMMA:
+      // Shift+`,` = `<` toggles hide/show left video. Plain `,` is a frame-nav
+      // alias claimed by handle_playback_keys later in the cascade.
+      if (is_shift_down) {
+        show_left_ = !show_left_;
+        return true;
+      }
+      return false;
+    case SDLK_LESS:
+      // Synthetic key delivery may produce the shifted keycode directly.
       show_left_ = !show_left_;
       return true;
-    case SDLK_2: case SDLK_KP_2:
-      if (is_shift_down) return false;
+    case SDLK_PERIOD:
+      if (is_shift_down) {
+        show_right_ = !show_right_;
+        return true;
+      }
+      return false;
+    case SDLK_GREATER:
       show_right_ = !show_right_;
       return true;
     case SDLK_O:

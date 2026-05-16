@@ -1,8 +1,41 @@
 #include "overlay_manager.h"
+
 #include <algorithm>
-#include "display/controls.h"
+#include <limits>
+
 #include "../display_utils.h"
 #include "core/strings/string_utils.h"
+#include "display/controls.h"
+
+namespace {
+
+// Layout knobs for the single-page, multi-column help overlay.
+constexpr int kHelpOuterMargin = 24;     // gap from window edge to first box
+constexpr int kHelpColumnGutter = 16;    // horizontal gap between columns
+constexpr int kHelpBoxPadding = 10;      // inner padding inside each section box
+constexpr int kHelpBoxSpacing = 10;      // vertical gap between sections in the same column
+constexpr int kHelpLineSpacing = 2;      // extra px between text rows
+constexpr int kHelpTitleGap = 4;         // extra px below the section title
+
+// Format a key + description as one row. The key column is right-padded to a
+// monospace alignment so descriptions line up. Keep the key column narrow —
+// the help overlay needs to fit on a single page across all sections.
+std::string format_entry_row(const std::string& key, const std::string& description) {
+  if (key.empty()) {
+    return description;
+  }
+  return string_sprintf("%-13s %s", key.c_str(), description.c_str());
+}
+
+// Choose a column count that lets each column hold ~30 monospace characters.
+int choose_column_count(int drawable_width) {
+  if (drawable_width >= 1500) return 4;
+  if (drawable_width >= 900) return 3;
+  if (drawable_width >= 600) return 2;
+  return 1;
+}
+
+}  // namespace
 
 OverlayManager::~OverlayManager() {
   destroy_help_resources();
@@ -12,69 +45,160 @@ OverlayManager::~OverlayManager() {
 }
 
 void OverlayManager::destroy_help_resources() {
-  for (auto* t : help_textures_) SDL_DestroyTexture(t);
-  help_textures_.clear();
-  for (auto* s : help_surfaces_) SDL_DestroySurface(s);
-  help_surfaces_.clear();
-  help_total_height_ = 0;
+  for (auto& item : help_items_) {
+    if (item.texture != nullptr) {
+      SDL_DestroyTexture(item.texture);
+    }
+    if (item.surface != nullptr) {
+      SDL_DestroySurface(item.surface);
+    }
+  }
+  help_items_.clear();
+  help_boxes_.clear();
 }
 
 void OverlayManager::rebuild_help(TTF_Font* small_font, TTF_Font* big_font,
-                                   SDL_Renderer* renderer, const bool gpu_active, const int drawable_width) {
+                                   SDL_Renderer* renderer, const bool gpu_active,
+                                   const int drawable_width, const int drawable_height) {
   destroy_help_resources();
 
-  bool primary_color = true;
+  const int columns = choose_column_count(drawable_width);
+  const int avail_width = drawable_width - 2 * kHelpOuterMargin - (columns - 1) * kHelpColumnGutter;
+  const int column_w = std::max(120, avail_width / columns);
+  const int text_wrap_w = column_w - 2 * kHelpBoxPadding;
+  const int avail_h = drawable_height - 2 * kHelpOuterMargin;
 
-  auto add_help_texture = [&](TTF_Font* font, const std::string& text) {
-    SDL_Surface* surface = TTF_RenderText_Blended_Wrapped(font, text.c_str(), 0,
-        primary_color ? HELP_TEXT_PRIMARY_COLOR : HELP_TEXT_ALTERNATE_COLOR,
-        drawable_width - HELP_TEXT_HORIZONTAL_MARGIN * 2);
-    if (!surface) return;
-
+  // Render one text fragment to either a texture (SDL path) or an RGBA
+  // surface (GPU path). The caller-supplied wrap_w of 0 disables wrapping;
+  // positive values invoke TTF's wrapping renderer.
+  auto render_fragment = [&](TTF_Font* font, const std::string& text,
+                             const SDL_Color& color, int wrap_w,
+                             HelpItem& out_item) -> bool {
+    SDL_Surface* surface = TTF_RenderText_Blended_Wrapped(font, text.c_str(), 0, color,
+                                                         wrap_w);
+    if (surface == nullptr) {
+      return false;
+    }
+    out_item.w = surface->w;
+    out_item.h = surface->h;
     if (gpu_active) {
       SDL_Surface* rgba = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGBA32);
       SDL_DestroySurface(surface);
-      if (!rgba) return;
-      help_total_height_ += rgba->h;
-      help_surfaces_.push_back(rgba);
+      if (rgba == nullptr) {
+        return false;
+      }
+      out_item.surface = rgba;
     } else {
       SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
       SDL_DestroySurface(surface);
-      float tw, th; SDL_GetTextureSize(texture, &tw, &th);
-      help_total_height_ += static_cast<int>(th);
-      help_textures_.push_back(texture);
+      if (texture == nullptr) {
+        return false;
+      }
+      out_item.texture = texture;
     }
+    return true;
   };
 
-  add_help_texture(small_font, " ");
+  // First pass: render every section's text fragments and compute its total
+  // height. Each entry produces a single rendered fragment. The section's
+  // box is sized to wrap them (plus padding + title).
+  struct RenderedSection {
+    HelpItem title;
+    std::vector<HelpItem> entries;
+    int height{0};  // total box height including padding
+  };
+  std::vector<RenderedSection> rendered;
 
   const auto& sections = get_control_sections();
-  for (size_t i = 0; i < sections.size(); ++i) {
-    const auto& section = sections[i];
+  rendered.reserve(sections.size());
 
-    primary_color = true;
+  for (const auto& section : sections) {
+    RenderedSection rs;
 
-    TTF_SetFontStyle(big_font, TTF_STYLE_BOLD | TTF_STYLE_UNDERLINE);
-    add_help_texture(big_font, to_upper_case(section.title));
+    TTF_SetFontStyle(big_font, TTF_STYLE_BOLD);
+    render_fragment(big_font, to_upper_case(section.title), HELP_TEXT_PRIMARY_COLOR,
+                    text_wrap_w, rs.title);
     TTF_SetFontStyle(big_font, TTF_STYLE_NORMAL);
 
-    primary_color = true;
+    bool alternate = false;
+    for (const auto& entry : section.entries) {
+      HelpItem item;
+      const SDL_Color color = alternate ? HELP_TEXT_ALTERNATE_COLOR : HELP_TEXT_PRIMARY_COLOR;
+      alternate = !alternate;
 
-    for (size_t j = 0; j < section.entries.size(); ++j) {
-      const auto& entry = section.entries[j];
-      primary_color = !primary_color;
+      const std::string row = format_entry_row(entry.key, entry.description);
+      if (!render_fragment(small_font, row, color, text_wrap_w, item)) {
+        continue;
+      }
+      rs.entries.push_back(item);
+    }
 
-      if (entry.key.empty()) {
-        add_help_texture(small_font, entry.description);
-        add_help_texture(small_font, " ");
-      } else {
-        add_help_texture(small_font, string_sprintf(" %-16s %s", entry.key.c_str(), entry.description.c_str()));
+    int h = kHelpBoxPadding;
+    h += rs.title.h + kHelpTitleGap;
+    for (const auto& e : rs.entries) {
+      h += e.h + kHelpLineSpacing;
+    }
+    if (!rs.entries.empty()) {
+      h -= kHelpLineSpacing;  // no trailing spacing after last row
+    }
+    h += kHelpBoxPadding;
+    rs.height = h;
+
+    rendered.push_back(std::move(rs));
+  }
+
+  // Greedy bin-pack: place each section into the shortest column whose
+  // remaining space can still fit it; if none fits, fall back to the
+  // shortest column (the section will overflow, but in practice the layout
+  // has been sized to fit). Ties broken by column index for stable ordering.
+  std::vector<int> column_x(columns, 0);
+  std::vector<int> column_y(columns, kHelpOuterMargin);
+  for (int c = 0; c < columns; ++c) {
+    column_x[c] = kHelpOuterMargin + c * (column_w + kHelpColumnGutter);
+  }
+
+  for (const auto& rs : rendered) {
+    int chosen = 0;
+    bool found_fit = false;
+    int best_y = std::numeric_limits<int>::max();
+    for (int c = 0; c < columns; ++c) {
+      const int after = column_y[c] + rs.height;
+      const bool fits = after <= kHelpOuterMargin + avail_h;
+      if (fits && column_y[c] < best_y) {
+        chosen = c;
+        best_y = column_y[c];
+        found_fit = true;
+      }
+    }
+    if (!found_fit) {
+      // Pick the shortest column to minimize overflow.
+      chosen = 0;
+      for (int c = 1; c < columns; ++c) {
+        if (column_y[c] < column_y[chosen]) chosen = c;
       }
     }
 
-    if (i + 1 < sections.size()) {
-      add_help_texture(small_font, " ");
+    const int box_x = column_x[chosen];
+    const int box_y = column_y[chosen];
+    help_boxes_.push_back({box_x, box_y, column_w, rs.height});
+
+    int y = box_y + kHelpBoxPadding;
+
+    HelpItem title = rs.title;
+    title.x = box_x + kHelpBoxPadding;
+    title.y = y;
+    y += title.h + kHelpTitleGap;
+    help_items_.push_back(title);
+
+    for (const auto& entry_template : rs.entries) {
+      HelpItem entry = entry_template;
+      entry.x = box_x + kHelpBoxPadding;
+      entry.y = y;
+      y += entry.h + kHelpLineSpacing;
+      help_items_.push_back(entry);
     }
+
+    column_y[chosen] = box_y + rs.height + kHelpBoxSpacing;
   }
 }
 
@@ -83,24 +207,20 @@ void OverlayManager::render_help_sdl(SDL_Renderer* renderer) {
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, BACKGROUND_ALPHA * 3 / 2);
   SDL_RenderFillRect(renderer, nullptr);
 
-  int y = help_y_offset_;
-
-  for (size_t i = 0; i < help_textures_.size(); i++) {
-    float fw, fh;
-    SDL_GetTextureSize(help_textures_[i], &fw, &fh);
-
-    SDL_FRect screen_area = {static_cast<float>(HELP_TEXT_HORIZONTAL_MARGIN), static_cast<float>(y), fw, fh};
-    SDL_RenderTexture(renderer, help_textures_[i], nullptr, &screen_area);
-
-    y += static_cast<int>(fh) + HELP_TEXT_LINE_SPACING;
+  // Thin white outlines around each section.
+  SDL_SetRenderDrawColor(renderer, 255, 255, 255, 200);
+  for (const auto& box : help_boxes_) {
+    SDL_FRect r{static_cast<float>(box.x), static_cast<float>(box.y),
+                static_cast<float>(box.w), static_cast<float>(box.h)};
+    SDL_RenderRect(renderer, &r);
   }
-}
 
-void OverlayManager::clamp_help_scroll(const int drawable_height, const bool gpu_active, const int line_spacing) {
-  const size_t count = help_item_count(gpu_active);
-  const int min_offset = drawable_height - help_total_height_ - static_cast<int>(count) * line_spacing;
-  help_y_offset_ = std::max(help_y_offset_, min_offset);
-  help_y_offset_ = std::min(help_y_offset_, 0);
+  for (const auto& item : help_items_) {
+    if (item.texture == nullptr) continue;
+    SDL_FRect dst{static_cast<float>(item.x), static_cast<float>(item.y),
+                  static_cast<float>(item.w), static_cast<float>(item.h)};
+    SDL_RenderTexture(renderer, item.texture, nullptr, &dst);
+  }
 }
 
 void OverlayManager::set_pending_message(const std::string& message) {

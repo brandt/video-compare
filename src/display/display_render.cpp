@@ -16,9 +16,9 @@ extern "C" {
 #include <libavutil/pixfmt.h>
 }
 
-// Clamp the help and metadata panel scroll offsets to their valid ranges.
+// Clamp the metadata panel's scroll offset. The help overlay no longer
+// scrolls — it's laid out to fit on a single page.
 void Display::clamp_overlay_offsets() {
-  overlay_.clamp_help_scroll(drawable_height_, gpu_renderer_active_, HELP_TEXT_LINE_SPACING);
   metadata_panel_.clamp_scroll(drawable_height_, gpu_renderer_active_, HELP_TEXT_LINE_SPACING);
 }
 

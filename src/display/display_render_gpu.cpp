@@ -648,26 +648,36 @@ void Display::render_frame_gpu(const RenderContext& ctx, const std::string& curr
     // Help is the topmost overlay: rendered after the dock so the controls
     // table is fully readable while the dock is open. The semi-transparent
     // black background dims everything underneath (the dock, plus the
-    // cleared HUD area above).
+    // cleared HUD area above). Thin white outlines wrap each section.
     if (overlay_.show_help()) {
       push_rect(0, 0, static_cast<float>(drawable_width_), static_cast<float>(drawable_height_),
                 0, 0, 0, static_cast<uint8_t>(BACKGROUND_ALPHA * 3 / 2));
 
-      int y = overlay_.help_scroll_offset();
-      for (SDL_Surface* s : overlay_.help_surfaces()) {
-        if (!s) continue;
-        if (y + s->h > 0 && y < drawable_height_) {
-          GpuRenderer::TextOverlayOp t{};
-          t.rgba_data = s->pixels;
-          t.width = s->w;
-          t.height = s->h;
-          t.stride = s->pitch;
-          t.dst_x = static_cast<float>(HELP_TEXT_HORIZONTAL_MARGIN);
-          t.dst_y = static_cast<float>(y);
-          t.alpha = 1.0f;
-          text_ops.push_back(t);
-        }
-        y += s->h + HELP_TEXT_LINE_SPACING;
+      // Section outline boxes — drawn as 4 thin rectangles per section.
+      constexpr uint8_t kHelpBoxBorderAlpha = 200;
+      for (const auto& box : overlay_.help_boxes()) {
+        const float x0 = static_cast<float>(box.x);
+        const float y0 = static_cast<float>(box.y);
+        const float x1 = static_cast<float>(box.x + box.w);
+        const float y1 = static_cast<float>(box.y + box.h);
+        push_rect(x0, y0, x1, y0 + 1, 255, 255, 255, kHelpBoxBorderAlpha);       // top
+        push_rect(x0, y1 - 1, x1, y1, 255, 255, 255, kHelpBoxBorderAlpha);       // bottom
+        push_rect(x0, y0, x0 + 1, y1, 255, 255, 255, kHelpBoxBorderAlpha);       // left
+        push_rect(x1 - 1, y0, x1, y1, 255, 255, 255, kHelpBoxBorderAlpha);       // right
+      }
+
+      // Positioned text fragments computed by rebuild_help.
+      for (const auto& item : overlay_.help_items()) {
+        if (item.surface == nullptr) continue;
+        GpuRenderer::TextOverlayOp t{};
+        t.rgba_data = item.surface->pixels;
+        t.width = item.surface->w;
+        t.height = item.surface->h;
+        t.stride = item.surface->pitch;
+        t.dst_x = static_cast<float>(item.x);
+        t.dst_y = static_cast<float>(item.y);
+        t.alpha = 1.0f;
+        text_ops.push_back(t);
       }
     }
 

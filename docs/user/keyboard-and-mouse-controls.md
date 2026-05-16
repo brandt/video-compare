@@ -40,7 +40,7 @@ The "primary" modifier is `Cmd` on macOS and `Ctrl` on Linux/Windows. Where a sh
 
 | Key                   | Action
 |-----------------------|-------
-| 1 / 2                 | Toggle hide-show left / right video
+| `<` / `>`             | Toggle hide-show left / right video
 | H                     | Toggle hide-show HUD
 | I                     | Toggle video info overlay
 | O                     | Toggle subtraction mode
