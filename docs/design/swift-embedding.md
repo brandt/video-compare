@@ -8,6 +8,16 @@ Make the decode / align / compare engine callable in-process from a Swift app, s
 
 The non-negotiable constraint is **performance for multiple 4K HDR videos**. Any design that regresses meaningfully against the current libplacebo path is unacceptable.
 
+## Platform target & constraints
+
+**Deployment target: macOS 14 (Sonoma).** A modern target, which keeps the design straightforward:
+
+- **Apple Silicon first.** macOS 14 still runs on some Intel Macs, but Apple Silicon is the norm. On Apple Silicon, decoded VideoToolbox frames live in unified memory as IOSurface-backed `CVPixelBuffer`s, so wrapping them as Metal textures / `CIImage`s is genuinely zero-copy.
+- **Mature EDR.** System HDR is fully supported: an EDR-enabled `CAMetalLayer` (`wantsExtendedDynamicRangeContent`, `CAEDRMetadata`) lets the OS tone-map HDR to the display's headroom. This is the **primary HDR path** (see below) — we generally do not tone-map ourselves.
+- **Modern Core Image.** `CIContext(mtlCommandQueue:)`, HDR-aware ingestion of tagged BT.2020 PQ/HLG buffers, and the filters we rely on (`CILanczosScaleTransform`, blend modes, `CIAreaHistogram`/`CIHistogramDisplayFilter`, `CIColorMatrix`) are all available. A few HDR specifics (e.g. `CIToneMapHeadroom`, used only for baking SDR) are newer — re-verify exact availability against current docs.
+
+**Use case.** The tool is for **subjective A/B comparison between encoded products**, not reference codec development. We avoid introducing visible degradation, but absolute/bit-exact fidelity is not required — both panes share one pipeline, so *consistency between them* is what protects a comparison. This relaxes where we can lean on Core Image (see below).
+
 ## Background: how the app is built today
 
 The repository currently produces a **single executable**. There is no library target. The entry point parses CLI args into a `VideoCompareConfig` ([config.h](../../src/app/config.h)) and runs `VideoCompare::operator()()` ([video_compare.cpp](../../src/app/video_compare.cpp)) — a blocking, run-to-completion main loop that:
@@ -59,20 +69,25 @@ Core Image is a color-managed, Metal-backed pipeline that maps cleanly onto most
 | Overlays / HUD / text            | Compose `CIImage`s, or draw native AppKit / SwiftUI layers on top                                            | Layout glue
 | Output to display                | `CIContext.render(_:to:…)` into a Metal texture / `CAMetalLayer`                                             | Sync / present plumbing
 
-### The biggest lever: don't tone-map for display at all
+### The biggest lever: defer HDR tone-mapping to the OS
 
-For the display case, defer HDR tone-mapping to the **OS**, not even to Core Image: keep the `CIImage` in an extended-range working space, render into an **EDR-enabled `CAMetalLayer`** (`wantsExtendedDynamicRangeContent = true`, with `CAEDRMetadata`), and let the system map to the screen's headroom. This is the Apple-native equivalent of libplacebo's tone-map and arguably the more correct macOS behavior. An explicit tone-map (`CIToneMapHeadroom`, recent macOS) is only needed when **baking SDR** — e.g. the PNG/JXL export path (`ImageSaver`).
+On macOS 14 the cleanest path is to **not tone-map ourselves**: keep the `CIImage` in an extended-range (HDR) working space, render into an **EDR-enabled `CAMetalLayer`** (`wantsExtendedDynamicRangeContent = true`, with `CAEDRMetadata`), and let the system map HDR to the display's headroom. This is the Apple-native equivalent of what libplacebo does today, runs on the GPU, and preserves the zero-copy decode path. On a display with no headroom the OS simply maps to SDR — still correct, still no work from us.
 
-### Where we shouldn't defer to Core Image
+Explicit tone-mapping is only needed in two cases:
 
-As a tool for inspecting small differences in encoding, users pixel-peep subtle artifacts. Core Image trades control for convenience, so the boundary matters:
+- **Baking SDR output** — e.g. the PNG/JXL export path (`ImageSaver`). Use `CIToneMapHeadroom` (newer macOS — verify availability) or a small fixed curve.
+- **A deliberate SDR-preview mode**, if we want the comparison to match what an SDR viewer would see regardless of the reviewer's display.
 
-- **The difference / measurement path.** `CIDifferenceBlendMode`'s precision and clamping are not under our control. The A−B that a reviewer reads as "the artifact" should be a **custom `CIKernel` or Metal compute** with explicit float format and known semantics, validated against the existing CPU `DifferenceProcessor`.
-- **Chroma upsampling.** When `CIImage` ingests a 4:2:0 YCbCr buffer, Core Image picks the chroma reconstruction; we have less control over siting / filter quality than libplacebo. Chroma reconstruction differences are exactly what codec work cares about — verify it is acceptable, or upsample explicitly before handing Core Image RGB.
-- **Precision and banding.** Set the `CIContext` `workingFormat` to `.RGBAh` (half-float) or `.RGBAf` (full float) with a wide-gamut linear working space to avoid clipping / banding in HDR. Core Image will not do libplacebo's error-diffusion **dithering**, so 8-bit SDR output can band on gradients — add a dither kernel when exporting 8-bit.
-- **Determinism.** Core Image fuses and schedules kernels opaquely. For anything published as a measurement, pin precision and verify rather than trust defaults.
+If we ever do tone-map ourselves, the bar is low: this tool makes **subjective A/B calls between two encodes**, and both panes get the **same** tone-map, so *consistency between the panes* matters far more than absolute accuracy. A simple shared curve (Hable / Reinhard / BT.2390-lite) — in a Metal shader or via the existing FFmpeg `zscale`/`tonemap` path ([video_filterer.cpp](../../src/media/video_filterer.cpp)) — is entirely acceptable. SDR sources skip all of this; Core Image ingests tagged BT.709 buffers directly.
 
-However, none of the above are dealbreakers if there's a big performance win or reduction in complexity to be had by deferring to Core Image.
+### Where to be careful with Core Image (but defer freely when it pays)
+
+Given the subjective-A/B use case, none of the following are dealbreakers. Defer to Core Image whenever it buys a meaningful performance or simplicity win, and only reach for custom code if a problem actually shows up in practice:
+
+- **The difference / subtraction mode.** `CIDifferenceBlendMode` (+ `CIColorMatrix` / `CIGammaAdjust` to amplify) is the easy path and is probably fine. If its clamping / precision looks visibly wrong once amplified, swap in a custom `CIKernel`; otherwise don't bother. Either way both panes get identical treatment, so it doesn't bias the call.
+- **Chroma upsampling.** Letting Core Image reconstruct 4:2:0 chroma is acceptable — again, applied equally to both sides.
+- **Precision and banding.** Use a `.RGBAh` working format and a linear working space to keep headroom. Core Image won't do error-diffusion **dithering**, which can band on 8-bit *export* gradients — add a dither kernel only if exports actually show it.
+- **Determinism.** Core Image schedules kernels opaquely; fine for display. Would only matter if we published numbers, which this tool doesn't.
 
 ## Performance analysis
 
@@ -91,27 +106,30 @@ The GPU→CPU readback after decode and the subsequent CPU→GPU upload are both
 
 The right native handoff keeps frames GPU-resident and lets Apple frameworks do the color work:
 
-- **HW-decode path (default — `hw_accel_spec` is `"auto"`, i.e. VideoToolbox on macOS):** decode straight to a `CVPixelBuffer` (`AV_PIX_FMT_VIDEOTOOLBOX`), tag it with the source color attachments, wrap its IOSurface as a Metal texture / `CIImage` **zero-copy**, and let Core Image / Metal do YUV→RGB + scale + composite, with HDR handed to the EDR layer. **No swscale, and no `av_hwframe_transfer_data` readback.** On Apple Silicon this can _beat_ the current path, because we skip the very readback + upload that limits it today.
-- **SW-decode path (or when CPU filters force a download):** fall back to swscale → `AV_PIX_FMT_P010LE` written directly into a locked, IOSurface-backed `CVPixelBuffer` plane set. `FormatConverter::operator()` already writes into caller-supplied `dst->data` / `dst->linesize` ([format_converter.cpp:160-164](../../src/media/format_converter.cpp#L160-L164)), so this is zero _extra_ copy — one swscale into the IOSurface. This branch pays a per-frame CPU conversion the current GPU path avoids, but it is the same class of cost the SDL fallback already pays, and only on this branch.
+- **HW-decode path (default — `hw_accel_spec` is `"auto"`, i.e. VideoToolbox on macOS):** decode straight to a `CVPixelBuffer` (`AV_PIX_FMT_VIDEOTOOLBOX`), tag it with the source color attachments, wrap its IOSurface as a Metal texture / `CIImage` **zero-copy**, and let Core Image / Metal do YUV→RGB + scale + composite, with HDR handed to the EDR layer. **No swscale, and no `av_hwframe_transfer_data` readback.** On Apple Silicon (unified memory) this can _beat_ the current path, because we skip the very readback + upload that limits it today.
+- **SW-decode path (software-decoded codecs, or the rare CPU-filter case):** fall back to swscale → `AV_PIX_FMT_P010LE` written directly into a locked, IOSurface-backed `CVPixelBuffer` plane set. `FormatConverter::operator()` already writes into caller-supplied `dst->data` / `dst->linesize` ([format_converter.cpp:160-164](../../src/media/format_converter.cpp#L160-L164)), so this is zero _extra_ copy — one swscale into the IOSurface. This branch pays a per-frame CPU conversion the HW path avoids, but it is the same class of cost the SDL fallback already pays, and rare in practice (see filters note).
 
-P010 (FFmpeg `AV_PIX_FMT_P010LE`) is layout-compatible with `kCVPixelFormatType_420YpCbCr10BiPlanar{Video,Full}Range`: 4:2:0, biplanar, 10 bits in the high bits of 16-bit samples. Match the source **range** (most HDR10 is video/limited range → `'x420'`); do not let swscale do range expansion. If 4:2:2/4:4:4 sources must stay unsubsampled, target a non-4:2:0 CV format instead, trading display fast-paths for fidelity.
+P010 (FFmpeg `AV_PIX_FMT_P010LE`) is layout-compatible with `kCVPixelFormatType_420YpCbCr10BiPlanar{Video,Full}Range` (available since 10.13): 4:2:0, biplanar, 10 bits in the high bits of 16-bit samples. Match the source **range** (most HDR10 is video/limited range → `'x420'`); do not let swscale do range expansion. 4:2:0 chroma subsampling for display is acceptable given the use case, so this format is the sensible default.
+
+**Filters and rotation.** Filters are used infrequently — almost always just to rotate an input. Rotation should be applied as a **render-time transform** (`CIAffineTransform` / a Metal sampler), or honored from the container's display-matrix metadata — *not* via an `avfilter` — so the zero-copy HW-decode path survives the common case. The engine should expose any rotation (container metadata or user request) as a frame tag for the renderer to apply. Only genuinely exotic user filters need the `avfilter` graph (and thus an `hwdownload`), and those are rare enough to accept the SW-fallback cost.
 
 ### Regression summary
 
 | #   | Concern                                                                 | Severity (4K HDR ×N)         | Status under Variant 3
 | --- | ----------------------------------------------------------------------- | ---------------------------- | ----------------------
 | 1   | Per-frame CPU swscale that today's GPU path avoids                      | High                         | **Avoided** on the HW path; confined to the SW fallback
-| 2   | CPU↔GPU round trip                                                      | Med–High                     | **Improved** — native path removes the readback the current pipeline pays
-| 3   | Rebuilding libplacebo's color science                                   | Med perf, High fidelity risk | **Mostly absorbed** by Core Image + OS EDR; residue is custom Metal (diff, scopes, dither)
+| 2   | CPU↔GPU round trip                                                      | Med–High                     | **Improved** — native path removes the decode readback the current pipeline pays
+| 3   | Rebuilding libplacebo's color science                                   | Med perf, low fidelity risk  | **Mostly absorbed** by Core Image + OS EDR; residue is custom Metal (scopes, optional diff kernel)
 | 4   | Frame stored in two representations (engine YUV ring + display buffers) | Med (memory)                 | Mitigate: convert/wrap on demand, don't keep a parallel display ring
 | 5   | Multi-pass Core Image vs libplacebo's fused graph                       | Low–Med                      | Implementation quality; Core Image fuses kernels internally
 
 Not regressions: decode (same FFmpeg threads), the filter graph in passthrough, and the absence of any IPC/process boundary (the library is linked in-process). Scopes and subtraction are CPU today and can become GPU wins under Core Image / Metal.
 
-### Mandatory verification gates
+### Verification gates
 
-- **Profile a CPU swscale 4K `yuv420p10le`→P010 on target hardware** at the intended stream count, to bound the SW-fallback cost (#1).
-- **Pixel-parity check**: Core Image / Metal output vs the current libplacebo render, and the custom diff kernel vs the existing CPU `DifferenceProcessor`. Treat divergence as a release blocker, given the audience.
+- **Validate the EDR HDR path** end-to-end (tagged HDR `CVPixelBuffer` → extended-range Core Image → EDR `CAMetalLayer`) on real HDR content, on both a headroom-capable display and a plain SDR display.
+- **Profile a CPU swscale 4K `yuv420p10le`→P010** to bound the SW-fallback cost (#1).
+- **Spot-check render quality** against the current libplacebo output for obvious degradation. Bit-exact parity is *not* required — both panes share one pipeline, so consistency between them is what protects an A/B call.
 
 ## Proposed architecture
 
@@ -162,7 +180,7 @@ int64_t    vc_auto_align(VCEngine*, VCSide master);      // returns discovered o
 3. **Frame contract.** VideoToolbox CVPixelBuffer passthrough as the default; P010-into-IOSurface as the SW fallback. Surface per-frame color tags through the ABI. Document the frame-lifetime contract (borrowed-until-next-call vs. pooled) explicitly.
 4. **C ABI + library target.** Add `libvideocompare` (static `.a` + `extern "C"` header) linking FFmpeg but **not** SDL3 / libplacebo. Confirm `src/media/`, `src/analysis/metrics/`, and the carved engine do not transitively pull in `src/display/`.
 5. **Obj-C++ bridge + Swift package.** CVPixelBufferPool, attachment tagging, module map / xcframework.
-6. **Swift rendering.** Core Image for ingest/scale/layout/composite/histogram + EDR display; custom Metal for waveform/vectorscope, the difference kernel, and dithering. Run the verification gates.
+6. **Swift rendering.** Core Image for ingest / scale / layout / composite / histogram, rendering HDR into an EDR `CAMetalLayer` (the OS tone-maps); custom Metal for waveform / vectorscope and, only if needed, the difference kernel and a dither pass. Rotation as a render-time transform. Run the verification gates.
 
 ## What is reimplemented in Swift (not in the engine)
 
@@ -170,11 +188,10 @@ The library provides decode, filters, CPU tone-map-or-passthrough, PSNR/SSIM/VMA
 
 ## Future work / open questions
 
-- **VideoToolbox decode + filters.** CPU filters on HW frames force an `hwdownload`, collapsing the zero-copy advantage. Quantify which auto-filters / user filters actually run, and whether they can be skipped or expressed in Metal.
-- **4:2:2 / 4:4:4 fidelity** vs. display fast-paths — pick CV formats per source.
-- **Multi-monitor / mixed-headroom EDR** behavior across displays.
+- **Rotation handling.** Confirm container display-matrix rotation and user rotate requests can both be applied as render-time transforms, keeping the zero-copy path for the common case. Exotic filters remain on the SW-fallback branch.
+- **Codec coverage.** Confirm which sources VideoToolbox decodes to `CVPixelBuffer` directly vs. which hit software decode + the swscale fallback (mainly non-HEVC/H.264 codecs, and older Intel Macs still on 14).
 - **Frame-lifetime / pool sizing** for deep scrub history without doubling memory (relates to `frame_buffer_size` and the packet ring).
-- **OS version floor.** HDR-correct Core Image (extended-range working spaces, `CIToneMapHeadroom`) is version-gated; confirm the minimum macOS target.
+- **Mixed-headroom / multi-display EDR.** Behavior when the window spans displays with different headroom, and whether to offer a fixed SDR-preview mode for consistent A/B regardless of the reviewer's display.
 
 ## References
 
