@@ -1,12 +1,12 @@
 # Embedding video-compare as an In-Process API for a Swift App
 
-> **Status (2026-05-29): design proposal, not yet implemented.** This document captures the architecture and rationale for exposing the comparison engine as a library that a native macOS (Swift) app can call in-process — without shelling out to the `video-compare` executable. It records a decision (Variant 3: headless engine + macOS-native rendering, leaning on Core Image) and the reasoning behind it, so the trade-offs are not re-litigated from scratch when the work starts.
+> **Status (2026-05-29): design proposal, not yet implemented.** This document captures the architecture and rationale for exposing the comparison engine as a library that a native macOS (Swift) app can call in-process — without shelling out to the `video-compare` executable. It records a decision (Variant 3: headless engine + macOS-native rendering, leaning on Core Image) and the reasoning behind it, so the trade-offs are not re-litigated from scratch when the work starts. The engine is **copied into a fresh, single-purpose tree** rather than refactored in place.
 
 ## Goal
 
 Make the decode / align / compare engine callable in-process from a Swift app, so a native macOS front-end can own the window, UI chrome, and rendering while reusing this project's FFmpeg pipeline, auto-alignment, time-shift synchronization, and metrics. Shelling out to the CLI is explicitly rejected: it cannot share decoded frames or GPU surfaces, and the per-frame control/inspection a real UI needs is impractical over a process boundary.
 
-The non-negotiable constraint is **performance for multiple 4K HDR videos**. Any design that regresses meaningfully against the current libplacebo path is unacceptable.
+The non-negotiable constraint is **interactive performance on a pair of 4K HDR videos** — snappy random seek, fast *iterative* auto-align, and fluid zoomed inspection of paused frames (see *Intended usage*). Sustained playback is secondary; it happens only in short snippets. No design should regress meaningfully against the current libplacebo path.
 
 ## Platform target & constraints
 
@@ -17,6 +17,27 @@ The non-negotiable constraint is **performance for multiple 4K HDR videos**. Any
 - **Modern Core Image.** `CIContext(mtlCommandQueue:)`, HDR-aware ingestion of tagged BT.2020 PQ/HLG buffers, and the filters we rely on (`CILanczosScaleTransform`, blend modes, `CIAreaHistogram`/`CIHistogramDisplayFilter`, `CIColorMatrix`) are all available. A few HDR specifics (e.g. `CIToneMapHeadroom`, used only for baking SDR) are newer — re-verify exact availability against current docs.
 
 **Use case.** The tool is for **subjective A/B comparison between encoded products**, not reference codec development. We avoid introducing visible degradation, but absolute/bit-exact fidelity is not required — both panes share one pipeline, so *consistency between them* is what protects a comparison. This relaxes where we can lean on Core Image (see below).
+
+## Intended usage & scope
+
+The embedding app drives the **tournament**: it finds candidates, constructs comparison sets, and applies actions from the verdicts. Our component handles the **comparison session** — two videos on screen at a time — over a pool of loaded candidates. The dominant loop is:
+
+1. Load a candidate set; put two on screen and seek to a roughly random point.
+2. **Auto-align**, repeatedly — the user re-triggers until the two sides match.
+3. **Pixel-peep** a paused, aligned frame (zoom / pan to inspect detail).
+4. Play a short snippet.
+5. Seek elsewhere, re-align, pixel-peep again.
+6. Decide — which may mean **re-pairing** (swap one side to a different candidate and compare again, often bouncing back and forth when two are close), and may **keep more than one** candidate.
+
+This shapes the priorities:
+
+- **Seek + iterative align are the hot path, not sustained playback.** Most wall-clock time is spent paused, zoomed, or aligning. Optimize seek latency and per-attempt align latency first.
+- **Two streams are on screen at once,** but the user **revisits pairings non-linearly**, so several candidates should stay **warm** (open, paused at their last position) for instant re-pairing. Warmth is a bounded LRU pool — each warm source costs its ring + packet-buffer memory (the packet ring defaults to 256 MiB), so pool size is a real latency-vs-memory knob.
+- **Arbitrary pairing, not a fixed bracket.** Either side can be re-assigned to any candidate in the pool — "running winner vs. next" is just the common case. The verdict is **multi-keep**: the user may keep several.
+- **Auto-align is a first-class, stateful, iterative operation** — "hit it again" must search wider each time (the existing incremental retry-cache). Converged offsets should be **cached per source-pair** so revisiting a pairing restores alignment instantly instead of re-searching.
+- **Pixel-peeping is where the decision is made**, so zoomed still-frame rendering — including a true-pixel (nearest-neighbor) magnify — matters more than playback smoothness.
+
+Out of scope for our component (owned by the host app): candidate discovery, set construction, the (non-linear, possibly multi-keep) tournament logic, and acting on verdicts. The verdict itself is a human choice captured in the host UI — the engine has no notion of it. We expose the comparison primitives only.
 
 ## Background: how the app is built today
 
@@ -32,7 +53,7 @@ The good news for embedding: the _engine_ below the renderer is already well-dec
 
 ## The decision
 
-We will pursue a **headless engine** (no window, no SDL) exposed through a flat C ABI, with the **Swift app owning all rendering using native Apple frameworks** — Core Image for the convenience layer, hand-written Metal for the fidelity-critical and non-built-in parts. This is "Variant 3" from the design discussion below. libplacebo, Vulkan, and MoltenVK are **dropped from the embedded library**; the standalone executable keeps them.
+We will pursue a **headless engine** (no window, no SDL) exposed through a flat C ABI, with the **Swift app owning all rendering using native Apple frameworks** — Core Image for the convenience layer, hand-written Metal for the fidelity-critical and non-built-in parts. This is "Variant 3" from the design discussion below. libplacebo, Vulkan, and MoltenVK do not appear in the new tree at all; the legacy repo retains them for its CLI (see *Packaging*).
 
 ### Why this over the alternatives
 
@@ -53,6 +74,14 @@ Variant 3's price is that we no longer get libplacebo's GPU color pipeline for f
 - The current app runs libplacebo with `pl_render_fast_params` + `pl_color_map_default_params` and `map_dovi = false` ([gpu_renderer.cpp:182-234](../../src/display/gpu_renderer.cpp#L182-L234)). We are matching libplacebo's **defaults**, not a heavily tuned HDR renderer.
 - Core Image can absorb most of it (next section).
 - The HDR display tone-map can be deferred to the **OS** via an EDR-enabled layer, so for display we may implement no tone-mapping at all.
+
+### Packaging: a fresh tree (copy-then-subtract)
+
+Rather than refactor this repo in place and keep the executable building, the engine will be **copied into a fresh, single-purpose tree** built around the Swift app. The reasoning: we are the sole maintainers, there are no external consumers, and the Swift tool will be the only way we interact with this code — so the usual reason to preserve the CLI (and suffer a behavior-preserving, dual-build refactor) doesn't apply, and the project already grants "free rein, including breaking changes."
+
+The discipline is **copy-then-subtract, not greenfield**: the leaf engine modules and even the orchestrator are *copied*, then the display / input / CLI coupling is *deleted* from them. We do not rewrite the seek / sync / time-shift logic from scratch — that is exactly where undocumented, hard-won fixes live. The payoff over an in-place refactor is a codebase with zero SDL/libplacebo/CLI cruft, shaped around the pull-based Swift use case from the start; the cost is re-establishing the build and tests in the new tree, mitigated by keeping the old repo as a runnable **behavioral oracle** (see the phased plan).
+
+A note on scope: only the *orchestrator* is treated differently from an in-place refactor — the front-end is reimplemented in Swift either way, and the leaf modules are reused either way. So this is a packaging/maintenance choice, not a different amount of engine work.
 
 ## How much defers to Core Image
 
@@ -91,7 +120,7 @@ Given the subjective-A/B use case, none of the following are dealbreakers. Defer
 
 ## Performance analysis
 
-The headline concern is multiple 4K HDR streams. The key realization, from [libplacebo-integration.md:29-41](libplacebo-integration.md#L29-L41), is that **the current pipeline is not zero-copy even with `--hwaccel videotoolbox`**:
+The concern is a **pair** of 4K HDR streams — and, per *Intended usage*, mostly seeked and paused rather than continuously played, so seek and align latency dominate. The key realization, from [libplacebo-integration.md:29-41](libplacebo-integration.md#L29-L41), is that **the current pipeline is not zero-copy even with `--hwaccel videotoolbox`**:
 
 ```
 demux → GPU decode (hardware) → av_hwframe_transfer_data → CPU frame
@@ -127,9 +156,16 @@ Not regressions: decode (same FFmpeg threads), the filter graph in passthrough, 
 
 ### Verification gates
 
+Ordered by how much they shape the experience (hot path first):
+
+- **Seek-to-aligned-frame latency** on a pair of 4K HDR sources — the dominant interaction. Measure random seek → first decoded aligned frame on screen.
+- **Auto-align iteration latency and convergence** — how fast one "align again" attempt returns, and that repeated attempts widen the search and converge.
+- **Zoomed still-frame render** — fluid zoom / pan on a paused aligned pair, including a true-pixel (nearest-neighbor) magnify.
+- **Re-pairing latency** — assigning either side to a *warm* pool source is near-instant; a *cold* source pays one open + seek; revisiting a prior pairing restores the cached alignment without re-searching.
+- **Snippet playback** of a 2-stream 4K HDR pair (secondary to the above).
 - **Validate the EDR HDR path** end-to-end (tagged HDR `CVPixelBuffer` → extended-range Core Image → EDR `CAMetalLayer`) on real HDR content, on both a headroom-capable display and a plain SDR display.
-- **Profile a CPU swscale 4K `yuv420p10le`→P010** to bound the SW-fallback cost (#1).
 - **Spot-check render quality** against the current libplacebo output for obvious degradation. Bit-exact parity is *not* required — both panes share one pipeline, so consistency between them is what protects an A/B call.
+- **Profile a CPU swscale 4K `yuv420p10le`→P010** to bound the SW-fallback cost (#1).
 
 ## Proposed architecture
 
@@ -155,32 +191,50 @@ The C++ engine stays **platform-neutral**: it produces frames (VideoToolbox `CVP
 
 ```c
 typedef struct VCEngine VCEngine;
+typedef uint32_t VCSourceId;
 
-VCEngine*  vc_open(const VCConfig* cfg, VCError* err);   // build pipeline, no window
+VCEngine*  vc_open(const VCConfig* cfg, VCError* err);          // no window
 void       vc_close(VCEngine*);
 
-double     vc_duration(const VCEngine*);
-void       vc_seek(VCEngine*, double seconds);           // drives the seek barrier
-void       vc_set_time_shift(VCEngine*, int64_t offset_ms, int num, int den);
+// Candidate pool. Sources stay warm (open, paused at their last position) up to an
+// LRU cap, so re-pairing is instant.
+VCSourceId vc_add_source(VCEngine*, const VCSource* src);
+void       vc_drop_source(VCEngine*, VCSourceId);
+
+// Put any pool source on either side — arbitrary pairing, warm if already open.
+void       vc_set_side(VCEngine*, VCSide side, VCSourceId src);
+
+double     vc_duration(const VCEngine*);                        // current pair (shorter side)
+void       vc_seek(VCEngine*, double seconds);                  // drives the seek barrier
 
 // Aligned frame for the current cursor. Either reports a VideoToolbox-backed
 // CVPixelBuffer to wrap, or fills caller-supplied P010 planes. Returns color tags.
 VCFrame    vc_frame(VCEngine*, VCSide side);
 
-VCMetrics  vc_metrics(VCEngine*, VCRect roi);            // PSNR/SSIM/VMAF over a region
-int64_t    vc_auto_align(VCEngine*, VCSide master);      // returns discovered offset (µs)
+// Iterative auto-align around the cursor; repeats search wider (incremental retry-cache).
+// Offsets are cached per source-pair, so revisiting a pairing restores alignment for free.
+VCAlign    vc_auto_align(VCEngine*, VCAlignMode mode);          // {converged, offset_us, score}
+void       vc_set_time_shift(VCEngine*, int64_t offset_us, int num, int den);  // manual nudge
+
+VCMetrics  vc_metrics(VCEngine*, VCRect roi);                   // optional PSNR/SSIM/VMAF over a region
 ```
+
+There is deliberately **no verdict call** — the decision is a human choice (and may keep several candidates), captured in the host UI, not the engine. Zoom / pan for pixel-peeping is a pure render-side concern (Swift), so it is not in the ABI either; the engine just holds the two aligned frames steady while paused.
 
 `VideoCompareConfig` / `InputVideo` ([config.h](../../src/app/config.h)) are mostly POD and map directly to `VCConfig`; the `AVDictionary*` and `std::vector` members need flattening. `get_playback_state_snapshot()` and `format_results_json()` already exist as control/inspection seams to model the API on.
 
 ## Phased plan
 
-1. **Carve `vc::Engine` out of `VideoCompare`.** Split `operator()()` into `init() / seek() / pull_frame() / step()` with no `Display` member; turn the loop's display calls into explicit API calls or remove them. Largest file in the repo — budget the most time here. Keep the executable building against the same engine so CLI and library never diverge.
-2. **Pull-based playback.** Replace the timer-paced `advance()` with `seek(t)` / `frame()` over the existing `FrameRing` (`current_frame()`, `at(offset)`, `pivot_*`). The seek barrier stays.
-3. **Frame contract.** VideoToolbox CVPixelBuffer passthrough as the default; P010-into-IOSurface as the SW fallback. Surface per-frame color tags through the ABI. Document the frame-lifetime contract (borrowed-until-next-call vs. pooled) explicitly.
-4. **C ABI + library target.** Add `libvideocompare` (static `.a` + `extern "C"` header) linking FFmpeg but **not** SDL3 / libplacebo. Confirm `src/media/`, `src/analysis/metrics/`, and the carved engine do not transitively pull in `src/display/`.
-5. **Obj-C++ bridge + Swift package.** CVPixelBufferPool, attachment tagging, module map / xcframework.
-6. **Swift rendering.** Core Image for ingest / scale / layout / composite / histogram, rendering HDR into an EDR `CAMetalLayer` (the OS tone-maps); custom Metal for waveform / vectorscope and, only if needed, the difference kernel and a dither pass. Rotation as a render-time transform. Run the verification gates.
+Structured as a **fresh single-purpose tree** that copies the engine out of this repo (see *Packaging*, above), not an in-place refactor. The old repo stays runnable as a behavioral oracle until the new orchestrator is trusted.
+
+0. **New tree + engine closure.** Stand up the new project with a C++ engine library target. Copy the leaf modules **verbatim** — [src/media/](../../src/media/) (demuxer, decoder, filterer, converter, frame_ring, packet_ring, time_shifter), [src/analysis/](../../src/analysis/) (metrics, auto-align), and their [src/core/](../../src/core/) closure (core_types, side_aware, FFmpeg wrappers, logging, exception holder, config). Leave behind `src/display/`, SDL, libplacebo, `argagg`, and the CLI. Get it compiling as a library shell linking FFmpeg only — which also confirms the copied closure has no residual `src/display/` dependency.
+1. **Orchestrator by subtraction.** Copy `VideoCompare`'s pipeline / seek / sync / auto-align logic ([video_compare.cpp](../../src/app/video_compare.cpp)) into an `Engine` class and **delete** the `display_->`, input, CLI, and choices-file / RESULTS-verdict plumbing — do *not* rewrite from scratch. This preserves the undocumented seek-barrier, EOF / loop-mode, time-shift, and incremental-align fixes accreted in the original. The worker threads, queues, and `ReadyToSeek` barrier come over intact. The existing multi-source active-side switching (today: one fixed side + N switchable on the other) is the substrate — to be **generalized so either side draws from a shared warm LRU pool** (arbitrary pairing). The verdict is captured by the host UI, not the engine.
+2. **Pull-based control surface.** Replace the timer-paced `advance()` with `seek(t)` / `frame()` / `step()` over the existing `FrameRing` (`current_frame()`, `at(offset)`, `pivot_*`). The seek barrier stays; the engine no longer owns a playback clock — Swift drives advancement.
+3. **Frame contract.** VideoToolbox `CVPixelBuffer` passthrough as the default; P010-into-IOSurface as the SW fallback. Surface per-frame color tags through the ABI. Document the frame-lifetime contract (borrowed-until-next-call vs. pooled) explicitly.
+4. **C ABI.** `extern "C"` header over the `Engine`; build the static `.a`. Links FFmpeg only — no SDL3, libplacebo, Vulkan, or MoltenVK in the tree at all.
+5. **Obj-C++ bridge + Swift package.** CVPixelBufferPool, attachment tagging, C-struct marshalling, module map / xcframework.
+6. **Swift rendering.** Core Image for ingest / scale / layout / composite / histogram, rendering HDR into an EDR `CAMetalLayer` (the OS tone-maps); custom Metal for waveform / vectorscope and, only if needed, the difference kernel and a dither pass. Rotation as a render-time transform. Pixel-peeping needs a **true-pixel (nearest-neighbor) magnify** mode alongside the quality fit-scaler.
+7. **Validation against the oracle.** Port the pytest integration tests; diff seek / sync / alignment behavior against the old repo (run the legacy CLI as a reference); run the render verification gates. Retire the old repo once parity holds.
 
 ## What is reimplemented in Swift (not in the engine)
 
@@ -190,7 +244,9 @@ The library provides decode, filters, CPU tone-map-or-passthrough, PSNR/SSIM/VMA
 
 - **Rotation handling.** Confirm container display-matrix rotation and user rotate requests can both be applied as render-time transforms, keeping the zero-copy path for the common case. Exotic filters remain on the SW-fallback branch.
 - **Codec coverage.** Confirm which sources VideoToolbox decodes to `CVPixelBuffer` directly vs. which hit software decode + the swscale fallback (mainly non-HEVC/H.264 codecs, and older Intel Macs still on 14).
-- **Frame-lifetime / pool sizing** for deep scrub history without doubling memory (relates to `frame_buffer_size` and the packet ring).
+- **Warm-pool policy.** How many candidate pipelines to keep open (LRU) given packet-ring memory (~256 MiB each by default), and whether to prefetch likely-next candidates to hide open latency.
+- **Alignment caching.** Confirm converged offsets are stable enough to cache per source-pair (and reuse across seek positions), so re-pairing and seek-back can skip re-aligning — the workflow re-aligns after nearly every seek, so this is a meaningful win if offsets hold.
+- **Frame-lifetime / pool sizing** for deep scrub history without doubling memory (relates to `frame_buffer_size` and the per-source packet ring).
 - **Mixed-headroom / multi-display EDR.** Behavior when the window spans displays with different headroom, and whether to offer a fixed SDR-preview mode for consistent A/B regardless of the reviewer's display.
 
 ## References
