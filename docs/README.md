@@ -23,6 +23,7 @@ Directories:
 - [Input socket](design/input-socket.md)
 - [Keyboard](design/keyboard.md)
 - [libplacebo integration](design/libplacebo-integration.md)
+- [Swift embedding (in-process API)](design/swift-embedding.md)
 
 ## User
 
