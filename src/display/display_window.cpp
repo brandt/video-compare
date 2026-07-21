@@ -395,21 +395,54 @@ void Display::handle_window_resize(const bool reset_forced_size_guard, const boo
   bool was_fullscreen = is_fullscreen_;
   is_fullscreen_ = detect_fullscreen_like_state();
 
-  auto force_window_size = [&](int width, int height) {
+  // Ask the window manager to resize the window. Returns true when the request
+  // took effect, in which case the resulting resize event drives the relayout.
+  //
+  // A false return means the window manager refused — macOS does this while the
+  // window is zoomed or tiled against a screen edge. No further resize event is
+  // coming, so the caller must fall through and lay out against the geometry the
+  // window actually has; returning early there would freeze the layout at the
+  // previous size while the swapchain keeps following the real window.
+  auto request_window_size = [&](const int width, const int height) {
     last_forced_window_size_ = {width, height};
     SDL_SetWindowSize(window_, width, height);
+
+    int actual_window_w = 0;
+    int actual_window_h = 0;
+    SDL_GetWindowSize(window_, &actual_window_w, &actual_window_h);
+
+    if (actual_window_w == width && actual_window_h == height) {
+      return true;
+    }
+
+    // Refused: adopt the real geometry, and record it as the forced size so
+    // repeat events for the same size don't retry the request in a loop.
+    new_window_w = actual_window_w;
+    new_window_h = actual_window_h;
+    SDL_GetWindowSizeInPixels(window_, &new_drawable_w, &new_drawable_h);
+    last_forced_window_size_ = {actual_window_w, actual_window_h};
+
+    return false;
   };
 
   const bool skip_forced_size = (last_forced_window_size_[0] == new_window_w && last_forced_window_size_[1] == new_window_h);
 
-  // Enforce minimum window size early to keep downstream math well-defined.
+  // Backstop for the SDL_SetWindowMinimumSize floor, in case a window manager
+  // hands us something smaller anyway; also keeps downstream math well-defined.
   if (!skip_forced_size && (new_window_w < MIN_WINDOW_WIDTH || new_window_h < MIN_WINDOW_HEIGHT)) {
-    force_window_size(std::max(new_window_w, MIN_WINDOW_WIDTH), std::max(new_window_h, MIN_WINDOW_HEIGHT));
-    return;
+    if (request_window_size(std::max(new_window_w, MIN_WINDOW_WIDTH), std::max(new_window_h, MIN_WINDOW_HEIGHT))) {
+      return;
+    }
   }
 
+  // A Content lock has nothing to lock to in Stretch: the painted content fills
+  // whatever shape the window has, so compute_active_content_aspect_ratio()
+  // just echoes the window's own ratio back. Honouring it would pin the window
+  // to the ratio it happened to have at start-up.
+  const bool aspect_lock_applies = (aspect_lock_mode_ == AspectLockMode::Window) || (aspect_lock_mode_ == AspectLockMode::Content && aspect_view_mode_ != AspectViewMode::Stretch);
+
   // If aspect-ratio locking is enabled, snap the resize to the selected ratio.
-  if (!skip_forced_size && !is_fullscreen_ && aspect_lock_mode_ != AspectLockMode::Off) {
+  if (!skip_forced_size && !is_fullscreen_ && aspect_lock_applies) {
     const float target_aspect_ratio = (aspect_lock_mode_ == AspectLockMode::Window) ? window_aspect_ratio_ : compute_active_content_aspect_ratio();
     const float safe_target_aspect_ratio = std::max(target_aspect_ratio, 0.001F);
     const float current_ratio = static_cast<float>(new_window_w) / static_cast<float>(new_window_h);
@@ -432,8 +465,9 @@ void Display::handle_window_resize(const bool reset_forced_size_guard, const boo
       }
 
       if (target_w != new_window_w || target_h != new_window_h) {
-        force_window_size(target_w, target_h);
-        return;
+        if (request_window_size(target_w, target_h)) {
+          return;
+        }
       }
     }
   }

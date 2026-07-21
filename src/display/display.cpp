@@ -168,11 +168,11 @@ Display::Display(const int display_number,
 #endif
   }
 
-  if (window_width < MIN_WINDOW_WIDTH) {
-    throw std::runtime_error{"Window width cannot be less than " + std::to_string(MIN_WINDOW_WIDTH)};
-  }
-  if (window_height < MIN_WINDOW_HEIGHT) {
-    throw std::runtime_error{"Window height cannot be less than " + std::to_string(MIN_WINDOW_HEIGHT)};
+  // Report the effective size, which is what the check actually rejects: with
+  // --high-dpi the requested size is halved above, so quoting the request back
+  // would look like it satisfies the minimum when it doesn't.
+  if (window_width < MIN_WINDOW_WIDTH || window_height < MIN_WINDOW_HEIGHT) {
+    throw std::runtime_error{string_sprintf("Window size %dx%d is below the %dx%d minimum", window_width, window_height, MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)};
   }
 
   // Try creating a Vulkan window for GPU-accelerated rendering.
@@ -200,6 +200,10 @@ Display::Display(const int display_number,
     gpu_renderer_active_ = false;
     std::cerr << "Display: Vulkan unavailable, using SDL_Renderer" << std::endl;
   }
+
+  // Let the window manager enforce the floor during a drag, rather than
+  // correcting an undersized window after the fact.
+  SDL_SetWindowMinimumSize(window_, MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT);
 
   SDL_SetWindowPosition(window_, window_x, window_y);
 

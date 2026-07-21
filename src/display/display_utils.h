@@ -39,8 +39,11 @@ inline constexpr float RELATIVE_SEEK_SLOWDOWN_RATIO = 4.0F;
 inline constexpr int HELP_TEXT_LINE_SPACING = 1;
 inline constexpr int HELP_TEXT_HORIZONTAL_MARGIN = 26;
 
-inline constexpr int MIN_WINDOW_WIDTH = 4;
-inline constexpr int MIN_WINDOW_HEIGHT = 1;
+// Smallest window the UI stays usable at: enough width for the dock's thumbnail
+// wells and enough height for the dock bar plus a meaningful video area. Handed
+// to SDL_SetWindowMinimumSize so the window manager stops the drag itself.
+inline constexpr int MIN_WINDOW_WIDTH = 320;
+inline constexpr int MIN_WINDOW_HEIGHT = 180;
 
 struct FrameDeleter {
   void operator()(AVFrame* frame) const {
